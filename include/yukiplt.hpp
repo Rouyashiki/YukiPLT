@@ -193,6 +193,7 @@ enum class ErrorCode : uint32_t {
   // --- Symbol errors ---
   kSymbolNotFound,
   kNoHashTable,
+  kAmbiguousSymbol,
 
   // --- Hook errors ---
   kSlotOwnershipConflict,
@@ -207,6 +208,10 @@ enum class ErrorCode : uint32_t {
   // --- Internal validation ---
   kIntegerOverflow,
   kOutOfBounds,
+
+  // --- Image lookup ---
+  kImageNotFound,   ///< No loaded image matches the requested name.
+  kAmbiguousImage,  ///< More than one loaded image matches the requested name.
 };
 
 /// Describes an error with a code and optional system errno.
@@ -401,7 +406,10 @@ class Expected<void, E> {
 /// - "Original function address" means the value found in the GOT slot at
 ///   hook time.  It may be another hook's replacement, not the real function.
 ///
-/// - If multiple JUMP_SLOTs match the symbol,  hooks the first one.
+/// - If the symbol name matches more than one distinct GOT slot (e.g. the same
+///   name imported under several symbol versions),  does not choose: hook()
+///   returns kAmbiguousSymbol and modifies nothing.  Multiple relocation
+///   records naming one slot mean a malformed image (kCorruptedElf).
 ///
 /// - Duplicate hook on the same slot returns kAlreadyHooked.
 ///
@@ -443,13 +451,10 @@ class HookHandle {
   HookHandle& operator=(const HookHandle&) = delete;
 
   HookHandle(HookHandle&& o) noexcept : id_(o.id_) { o.id_ = kInvalid; }
-  HookHandle& operator=(HookHandle&& o) noexcept {
-    if (this != &o) {
-      id_ = o.id_;
-      o.id_ = kInvalid;
-    }
-    return *this;
-  }
+
+  /// Move-assigning over a handle that still owns an installed hook drops that
+  /// ownership; like the destructor, this logs a warning and does NOT unhook.
+  HookHandle& operator=(HookHandle&& o) noexcept;
 
   /// Returns true if this handle refers to a valid hook entry.
   [[nodiscard]] bool valid() const noexcept { return id_ != kInvalid; }
@@ -459,6 +464,9 @@ class HookHandle {
   friend Error unhook(HookHandle&&);
 
   explicit HookHandle(size_t id) noexcept : id_(id) {}
+
+  /// Log a warning if this handle still owns an installed hook.
+  void warn_if_installed() const noexcept;
 
   static constexpr size_t kInvalid = ~size_t(0);
   size_t id_;
@@ -480,8 +488,10 @@ Result<ImageView> image_from_soname(const char* soname);
 ///
 /// \return A HookHandle on success, or an Error.
 ///
-/// If multiple JUMP_SLOTs match,  hooks the first and ignores the rest.
-/// Returns kAlreadyHooked if the slot is already hooked by this library.
+/// Returns kSymbolNotFound if no JUMP_SLOT matches, kAmbiguousSymbol if more
+/// than one distinct slot matches ( does not choose), or kAlreadyHooked if
+/// the slot is already hooked by this library.  On any error, nothing is
+/// modified.
 Result<HookHandle> hook(const ImageView& image, const char* symbol_name, void* replacement,
                         void** out_original);
 

@@ -222,14 +222,16 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     }
   }
   // 7. JMPREL table (PLT relocations) + GOT slots.
-  size_t total_relas = jmpslots_.size() + custom_relas_.size();
+  size_t owned_slots = jmpslots_.size() + custom_relas_.size();
+  size_t total_relas = owned_slots + aliased_slots_.size();
   size_t jmprel_offset = 0;
   size_t got_offset = 0;
 
   if (total_relas > 0) {
-    // GOT slots: 8 bytes each, aligned to 8.
+    // GOT slots: 8 bytes each, aligned to 8.  Aliased records reuse an
+    // existing slot, so only owned records get their own slot.
     got_offset = lb.align(8);
-    lb.alloc(total_relas * 8, 8);
+    lb.alloc(owned_slots * 8, 8);
 
     // JMPREL table.
     jmprel_offset = lb.align(8);
@@ -255,6 +257,15 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
       rela.r_addend = cr.addend;
       lb.append(rela, 8);
       ++slot_idx;
+    }
+
+    for (const auto& as : aliased_slots_) {
+      Elf64_Rela rela{};
+      // Reuse the GOT slot of the target jump slot: a duplicate record.
+      rela.r_offset = got_offset + as.target_jmpslot_index * 8;
+      rela.r_info = ELF64_R_INFO(as.sym_index, R_AARCH64_JUMP_SLOT);
+      rela.r_addend = 0;
+      lb.append(rela, 8);
     }
   }
 
@@ -292,7 +303,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   }
 
   // DT_NULL terminator.
-  if (truncate_dyn_ == 0 || dyn_count < truncate_dyn_) add_dyn(DT_NULL, 0);
+  if (!omit_dt_null_ && (truncate_dyn_ == 0 || dyn_count < truncate_dyn_)) add_dyn(DT_NULL, 0);
 
   size_t dyn_size = lb.pos - dyn_offset;
   // 9. Fill in program headers.
@@ -303,7 +314,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   {
     Elf64_Phdr ph{};
     ph.p_type = PT_LOAD;
-    ph.p_flags = PF_R | PF_W;
+    ph.p_flags = load_flags_;
     ph.p_offset = 0;
     ph.p_vaddr = has_load_vaddr_override_ ? load_vaddr_override_ : 0;
     ph.p_paddr = ph.p_vaddr;

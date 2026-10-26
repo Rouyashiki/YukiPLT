@@ -30,6 +30,16 @@ bool InspectedImage::addr_in_load(uintptr_t addr, size_t size) const noexcept {
   return false;
 }
 
+bool InspectedImage::addr_in_writable_load(uintptr_t addr, size_t size) const noexcept {
+  if (size == 0) return false;
+  uintptr_t end;
+  if (!safe_add(addr, static_cast<uintptr_t>(size), end)) return false;
+  for (const auto& seg : load_segments) {
+    if ((seg.flags & PF_W) != 0 && addr >= seg.vaddr_begin && end <= seg.vaddr_end) return true;
+  }
+  return false;
+}
+
 bool InspectedImage::addr_in_relro(uintptr_t addr) const noexcept {
   return relro_begin != relro_end && addr >= relro_begin && addr < relro_end;
 }
@@ -139,9 +149,10 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
     }
   }
 
-  // We don't require DT_NULL if the table exactly fills the segment,
-  // but warn about it through diagnostics in the future.
-  (void)found_null;
+  // The dynamic array must terminate with DT_NULL within its segment bounds.
+  // A table that runs to the end of PT_DYNAMIC without a terminator is either
+  // truncated or malformed; we refuse to guess where it ends.
+  if (!found_null) return Error::Make(ErrorCode::kCorruptedElf);
 
   return info;
 }
@@ -603,8 +614,9 @@ Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& imag
     // Validate 8-byte alignment.
     if (slot_addr % 8 != 0) return Error::Make(ErrorCode::kCorruptedElf);
 
-    // Validate the slot address is within a PT_LOAD segment.
-    if (!image.addr_in_load(slot_addr, 8)) return Error::Make(ErrorCode::kCorruptedElf);
+    // The slot must lie in a writable (PF_W) PT_LOAD segment (AGENTS 5.1).
+    // A JUMP_SLOT target in a read-only or executable segment is malformed.
+    if (!image.addr_in_writable_load(slot_addr, 8)) return Error::Make(ErrorCode::kCorruptedElf);
 
     slots.push_back({slot_addr, rsym});
   }
@@ -612,6 +624,30 @@ Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& imag
   if (slots.empty()) return Error::Make(ErrorCode::kSymbolNotFound);
 
   return slots;
+}
+
+Expected<ResolvedSlot, Error> resolve_unique_slot(const InspectedImage& image,
+                                                  const char* symbol_name) {
+  auto slots = resolve_slots(image, symbol_name);
+  if (!slots) return slots.error();
+
+  const auto& matches = slots.value();
+  // resolve_slots never returns an empty success, but keep the guard explicit.
+  if (matches.empty()) return Error::Make(ErrorCode::kSymbolNotFound);
+
+  // Any two records naming the same GOT slot mean the image is malformed: a
+  // well-formed object has at most one JUMP_SLOT per slot.  Scan the whole set
+  // (it is tiny) so a duplicate is never masked by an earlier distinct match.
+  for (size_t i = 0; i < matches.size(); ++i) {
+    for (size_t j = i + 1; j < matches.size(); ++j) {
+      if (matches[i].address == matches[j].address) return Error::Make(ErrorCode::kCorruptedElf);
+    }
+  }
+
+  // Distinct matching slots are ambiguous even when their values agree.
+  if (matches.size() > 1) return Error::Make(ErrorCode::kAmbiguousSymbol);
+
+  return matches[0];
 }
 
 }  // namespace yukiplt::detail

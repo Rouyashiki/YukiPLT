@@ -27,6 +27,25 @@ inline bool safe_add64(uint64_t a, uint64_t b, uint64_t& result) noexcept {
   return result >= a;
 }
 
+// Inline process state without exit-time destruction; late handles and threads
+// must not access a destroyed Registry or operation mutex.
+template <typename T>
+class NoDestructor {
+ public:
+  template <typename... Args>
+  explicit NoDestructor(Args&&... args) {
+    new (storage_) T(std::forward<Args>(args)...);
+  }
+
+  NoDestructor(const NoDestructor&) = delete;
+  NoDestructor& operator=(const NoDestructor&) = delete;
+
+  [[nodiscard]] T& get() noexcept { return *std::launder(reinterpret_cast<T*>(storage_)); }
+
+ private:
+  alignas(T) unsigned char storage_[sizeof(T)];
+};
+
 /// Fixed-capacity inline storage with heap overflow.
 ///
 /// Stores up to N elements on the stack.  When the count exceeds N, all

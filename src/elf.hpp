@@ -57,6 +57,12 @@ struct InspectedImage {
   /// Returns true if [addr, addr + size) falls entirely within a PT_LOAD segment.
   [[nodiscard]] bool addr_in_load(uintptr_t addr, size_t size) const noexcept;
 
+  /// Returns true if [addr, addr + size) falls entirely within a PT_LOAD
+  /// segment whose p_flags include PF_W.  A relocation target (GOT slot) must
+  /// satisfy this: a slot inside a non-writable segment means a malformed or
+  /// hostile r_offset, and patching it would write into read-only data.
+  [[nodiscard]] bool addr_in_writable_load(uintptr_t addr, size_t size) const noexcept;
+
   /// Returns true if addr falls within the RELRO range.
   [[nodiscard]] bool addr_in_relro(uintptr_t addr) const noexcept;
 
@@ -104,6 +110,11 @@ struct ResolvedSlot {
 // exceptions are translated by the public boundary.
 Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& image,
                                                       const char* symbol_name);
+
+// Resolve one slot: no match is SymbolNotFound, duplicate records are
+// CorruptedElf, and multiple distinct slots are AmbiguousSymbol.
+Expected<ResolvedSlot, Error> resolve_unique_slot(const InspectedImage& image,
+                                                  const char* symbol_name);
 
 }  // namespace yukiplt::detail
 

@@ -63,6 +63,14 @@ class ElfBuilder {
     return *this;
   }
 
+  /// Emit a second JUMP_SLOT record whose r_offset aliases the GOT slot of a
+  /// previously added jump slot (by 0-based index).  Used to build malformed
+  /// images with duplicate relocation records pointing at one slot.
+  ElfBuilder& alias_jump_slot(uint32_t sym_index, size_t target_jmpslot_index) {
+    aliased_slots_.push_back({sym_index, target_jmpslot_index});
+    return *this;
+  }
+
   /// Add a relocation with a custom type (for testing unsupported types).
   ElfBuilder& add_custom_rela(uint32_t sym_index, uint32_t rela_type, int64_t addend = 0) {
     custom_relas_.push_back({sym_index, rela_type, addend});
@@ -135,6 +143,19 @@ class ElfBuilder {
     return *this;
   }
 
+  /// Omit the DT_NULL terminator so the dynamic array runs to the segment end.
+  ElfBuilder& omit_dt_null(bool v = true) {
+    omit_dt_null_ = v;
+    return *this;
+  }
+
+  /// Override the PT_LOAD p_flags (default: PF_R | PF_W).  Used to place the
+  /// GOT in a segment that is not writable.
+  ElfBuilder& set_load_flags(uint32_t flags) {
+    load_flags_ = flags;
+    return *this;
+  }
+
   // --- Build ---
 
   struct BuiltImage {
@@ -164,9 +185,16 @@ class ElfBuilder {
     int64_t addend;
   };
 
+  /// A JUMP_SLOT record whose r_offset aliases another jump slot's GOT slot.
+  struct AliasedSlot {
+    uint32_t sym_index;
+    size_t target_jmpslot_index;
+  };
+
   std::vector<SymEntry> symbols_;
   std::vector<JmpSlotEntry> jmpslots_;
   std::vector<CustomRela> custom_relas_;
+  std::vector<AliasedSlot> aliased_slots_;
   bool use_gnu_hash_ = true;
   bool use_sysv_hash_ = false;
   bool use_relro_ = false;
@@ -178,6 +206,8 @@ class ElfBuilder {
   bool omit_symtab_ = false;
   bool omit_strtab_ = false;
   bool omit_strsz_ = false;
+  bool omit_dt_null_ = false;
+  uint32_t load_flags_ = PF_R | PF_W;
 };
 
 }  // namespace yukiplt::test

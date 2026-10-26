@@ -35,7 +35,8 @@ target_compile_options(yukiplt_regression_core PRIVATE -Wall -Wextra -Wpedantic 
 target_compile_definitions(yukiplt_regression_core PUBLIC YUKIPLT_STATIC=1)
 
 include(GoogleTest)
-foreach(target IN ITEMS )
+add_executable(yukiplt_regressions elf_builder.cpp parser.cpp)
+foreach(target IN ITEMS yukiplt_regressions)
     target_link_libraries(${target} PRIVATE yukiplt_regression_core
         GTest::gtest_main Threads::Threads ${CMAKE_DL_LIBS})
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)

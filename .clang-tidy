@@ -1,0 +1,12 @@
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-*,
+  performance-*,
+  portability-*,
+  modernize-use-nullptr,
+  -bugprone-easily-swappable-parameters,
+  -performance-enum-size,
+  -portability-avoid-pragma-once
+WarningsAsErrors: ''
+HeaderFilterRegex: '(^|/)(include|src|tests)/'

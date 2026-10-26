@@ -200,10 +200,12 @@ enum class ErrorCode : uint32_t {
   kAlreadyHooked,
   kNotInstalled,
   kSlotModifiedExternally,
+  kIndeterminate,  ///< Recovery was partial; per-slot/per-page state is reported.
 
   // --- System errors ---
   kPermissionDenied,
   kImageInvalidated,
+  kOutOfMemory,  ///< An allocation failed; the operation did nothing.
 
   // --- Internal validation ---
   kIntegerOverflow,
@@ -212,13 +214,16 @@ enum class ErrorCode : uint32_t {
   // --- Image lookup ---
   kImageNotFound,   ///< No loaded image matches the requested name.
   kAmbiguousImage,  ///< More than one loaded image matches the requested name.
+
+  // --- Memory map ---
+  kVmaUnavailable,  ///< /proc/self/maps could not be read (errno set) or parsed.
 };
 
 /// Describes an error with a code and optional system errno.
 struct Error {
   ErrorCode code = ErrorCode::kSuccess;
 
-  /// System errno, meaningful only when code == kPermissionDenied.
+  /// System errno, meaningful only for kPermissionDenied and kVmaUnavailable.
   int sys_errno = 0;
 
   /// Returns true when no error.
@@ -389,13 +394,14 @@ class Expected<void, E> {
 /// ## Quick start
 ///
 ///     void* original = nullptr;
-///     auto handle = yukiplt::hook(image, "target_func", (void*)replacement, &original);
-///     if (handle) {
-///         // Hook is active.  Calls through the image's PLT now go to replacement.
-///         // Cast original to the function type to call the original.
+///     auto r = yukiplt::hook(image, "target_func", (void*)replacement, &original);
+///     if (r.handle.valid()) {
+///         // Hook is active.  Calls through the image's PLT now go to
+///         // replacement.  Read `original` with an acquire load (see below)
+///         // and cast it to the function type to call the original.
 ///     }
 ///     // Later:
-///     yukiplt::unhook(std::move(handle.value()));
+///     yukiplt::unhook(r.handle);
 ///
 /// ## Semantics
 ///
@@ -405,18 +411,54 @@ class Expected<void, E> {
 ///
 /// - "Original function address" means the value found in the GOT slot at
 ///   hook time.  It may be another hook's replacement, not the real function.
+///   A replacement that calls through it must read `*out_original` with an
+///   acquire load (e.g. __atomic_load_n(&p, __ATOMIC_ACQUIRE)): the install
+///   publishes the pointer with release, but the PLT branch that reaches the
+///   replacement is not itself an acquire.
 ///
-/// - If the symbol name matches more than one distinct GOT slot (e.g. the same
-///   name imported under several symbol versions),  does not choose: hook()
-///   returns kAmbiguousSymbol and modifies nothing.  Multiple relocation
+/// - If a symbol name matches more than one distinct GOT slot (e.g. the same
+///   name imported under several symbol versions),  do not choose: the
+///   call returns kAmbiguousSymbol and modifies nothing.  Multiple relocation
 ///   records naming one slot mean a malformed image (kCorruptedElf).
 ///
-/// - Duplicate hook on the same slot returns kAlreadyHooked.
+/// - One slot, one owner.  A second hook of a slot this library already owns
+///   returns kAlreadyHooked.  There is no hook stacking, no reference counting.
 ///
-/// - Failure never returns "success".  If hook() fails, the slot is unmodified.
+/// ## Batches and atomicity
 ///
-/// - HookHandle destructor does NOT implicitly unhook.  If a handle is
-///   destroyed while Installed, a warning is logged but the hook stays.
+/// - hook() installs one slot; hook_batch() installs several as one unit over
+///   a single image, rolling back on any conflict so the batch leaves either
+///   every slot installed or none.  A batch never spans two images.
+///
+/// - No cross-slot atomicity is promised: another thread may briefly see some
+///   slots switched and others not.  The guarantee is on commit and failure
+///   recovery, not a simultaneous switch.
+///
+/// ## Lifecycle
+///
+/// - The caller must keep the target image mapped until every handle for it is
+///   released or abandoned.  For a system-linker image, hook/unhook validate
+///   the image under the dynamic linker's lock (dl_iterate_phdr) and never
+///   dereference a stale pointer; if the image is gone, the call returns
+///   kImageInvalidated.  For a custom (e.g. YukiLinker) image, set
+///   instance_token to a value unique to that load and call forget_image()
+///   before unmapping.
+///
+/// - Same-address reload is an ABA hazard: after dlclose + dlopen at the same
+///   address, CAS cannot by itself prove the slot is still the same instance.
+///   The caller's lifecycle contract above is what closes that gap; this
+///   library does not claim to eliminate the unload race.
+///
+/// - Unhook can fail and must be called explicitly; HookHandle's destructor
+///   does NOT unhook.  Destroying or move-overwriting a handle that still owns
+///   an installed hook logs a warning and leaves the hook in place.
+///
+/// - After a successful unhook a thread may still be executing the
+///   replacement.  Do not unload the replacement's code until the caller has
+///   established quiescence.
+///
+/// Failure never returns "success".  On any failure before commit, nothing is
+/// modified.  See kIndeterminate for the one state where recovery is partial.
 
 namespace yukiplt {
 
@@ -436,12 +478,40 @@ struct ImageView {
   uintptr_t load_bias;           ///< Runtime load bias (dlpi_addr).
   const Elf64_Phdr* phdr_table;  ///< Program header table address.
   size_t phdr_count;             ///< Number of program headers.
+  uint64_t instance_token = 0;   ///< 0 = system-linker image; else custom load id.
 };
 
-/// Opaque handle representing an active hook.
+/// What happened to one slot in a hook/unhook/query.
+enum class SlotStatus : uint8_t {
+  kUntouched,       ///< No write was attempted on this slot.
+  kInstalled,       ///< Replacement installed (value_before holds the prior value).
+  kRestored,        ///< Original value put back.
+  kConflict,        ///< Slot did not hold the expected value; left as found.
+  kRolledBack,      ///< Installed, then reverted after another slot conflicted.
+  kRollbackFailed,  ///< Installed, but the revert failed; slot left as observed.
+};
+
+/// Per-slot report, optionally filled by hook/hook_batch/unhook/query.
+struct SlotReport {
+  uintptr_t address = 0;         ///< GOT slot runtime address.
+  uintptr_t value_before = 0;    ///< Value in the slot before this operation.
+  uintptr_t value_observed = 0;  ///< Value seen if the CAS conflicted.
+  SlotStatus status = SlotStatus::kUntouched;
+};
+
+/// One slot to install in a batch.
+struct HookRequest {
+  const char* symbol;   ///< Symbol name to hook (must resolve to one slot).
+  void* replacement;    ///< Replacement function pointer.
+  void** out_original;  ///< Receives the prior slot value; written just before
+                        ///< commit and never cleared once set (may be null).
+};
+
+/// Opaque handle representing a hook group (one slot or a batch).
 ///
-/// Move-only.  Must be explicitly unhook()'d before destruction.
-/// Destroying an Installed handle logs a warning but does NOT unhook.
+/// Move-only.  Must be explicitly unhook()'d or abandon()'d before destruction.
+/// Destroying or move-overwriting a handle that still owns an installed hook
+/// logs a warning but does NOT unhook.
 class HookHandle {
  public:
   HookHandle() noexcept : id_(kInvalid) {}
@@ -451,25 +521,28 @@ class HookHandle {
   HookHandle& operator=(const HookHandle&) = delete;
 
   HookHandle(HookHandle&& o) noexcept : id_(o.id_) { o.id_ = kInvalid; }
-
-  /// Move-assigning over a handle that still owns an installed hook drops that
-  /// ownership; like the destructor, this logs a warning and does NOT unhook.
   HookHandle& operator=(HookHandle&& o) noexcept;
 
-  /// Returns true if this handle refers to a valid hook entry.
+  /// Returns true if this handle refers to a live hook entry.
   [[nodiscard]] bool valid() const noexcept { return id_ != kInvalid; }
 
  private:
-  friend Result<HookHandle> hook(const ImageView&, const char*, void*, void**);
-  friend Error unhook(HookHandle&&);
+  friend class detail_api;
 
-  explicit HookHandle(size_t id) noexcept : id_(id) {}
-
-  /// Log a warning if this handle still owns an installed hook.
+  explicit HookHandle(uint64_t id) noexcept : id_(id) {}
   void warn_if_installed() const noexcept;
 
-  static constexpr size_t kInvalid = ~size_t(0);
-  size_t id_;
+  static constexpr uint64_t kInvalid = ~uint64_t(0);
+  uint64_t id_;
+};
+
+/// Result of a hook/hook_batch: an error and, on success, an owning handle.
+struct HookResult {
+  Error error;
+  HookHandle handle;
+
+  /// Convenience: true when a handle was produced.
+  [[nodiscard]] bool ok() const noexcept { return handle.valid(); }
 };
 
 // Linux/Android loader lookup: null/empty selects the main executable via
@@ -477,33 +550,48 @@ class HookHandle {
 // Return a token-0 view or ImageNotFound/AmbiguousImage; never choose arbitrarily.
 Result<ImageView> image_from_soname(const char* soname);
 
-/// Install a PLT hook.
-///
-/// \param image        Target image (whose GOT to modify).
-/// \param symbol_name  Name of the symbol to hook.
-/// \param replacement  Pointer to the replacement function.
-/// \param out_original On success, set to the value that was in the GOT slot
-///                     before hooking (the "original" function pointer).
-///                     May be another hook's replacement, not the real function.
-///
-/// \return A HookHandle on success, or an Error.
-///
-/// Returns kSymbolNotFound if no JUMP_SLOT matches, kAmbiguousSymbol if more
-/// than one distinct slot matches ( does not choose), or kAlreadyHooked if
-/// the slot is already hooked by this library.  On any error, nothing is
-/// modified.
-Result<HookHandle> hook(const ImageView& image, const char* symbol_name, void* replacement,
-                        void** out_original);
+// Install one uniquely selected JUMP_SLOT with a non-null replacement.
+// out_original is optional, pointer-aligned, and published before replacement
+// becomes reachable. Success owns the slot; Indeterminate retains recovery
+// state. Other failures leave no installed hook or ownership. Check the result
+// and optional SlotReport; published originals are never cleared.
+HookResult hook(const ImageView& image, const char* symbol_name, void* replacement,
+                void** out_original, SlotReport* report = nullptr);
 
-/// Remove a previously installed hook.
-///
-/// Uses CAS to restore the original value.  Fails with kSlotModifiedExternally
-/// if the slot no longer holds our replacement (someone else changed it).
-///
-/// On success, the handle is consumed and the slot is restored.
-/// On failure, the handle remains valid and the hook is still conceptually
-/// "ours" (but the slot may have been overwritten by a third party).
-Error unhook(HookHandle&& handle);
+// Install 1..64 requests in one image. Targets and non-null aligned original
+// outputs must be distinct; all targets must be unowned. Preflight rejects the
+// whole batch. CAS conflicts roll back; failed rollback/protection restoration
+// returns Indeterminate with a recovery handle. reports has count entries.
+HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
+                      SlotReport* reports = nullptr);
+
+// Restore owned replacement values by CAS; already-original values are done.
+// Never-written slots are Untouched with live values. Preserve third-party values
+// as conflicts. Roll back this attempt if any restore CAS loses a race.
+// Success and ImageInvalidated consume the handle; other failures retain it.
+// Maps failure or incomplete coverage does not prove invalidation. Indeterminate
+// retains failed rollback/page residue. Retry uses live maps: accept original
+// protection, restore raised protection, and retain third-party protection conflicts.
+// System identity includes the installation path; mismatch consumes the old handle
+// without accessing the new image. Custom invalidation requires forget_image.
+// reports is an optional array of cap SlotReports. Success does not prove quiescence.
+Error unhook(HookHandle& handle, SlotReport* reports = nullptr, size_t cap = 0);
+
+// Release bookkeeping and consume the handle without changing memory.
+// The caller assumes responsibility for remaining replacements and page residue.
+Error abandon(HookHandle& handle);
+
+// Copy at most cap reports and return the total slot count. address/value_before
+// are recorded; readable live slots report Installed and the observed value.
+// Unreadable or invalidated slots report Untouched/zero, never a fabricated value.
+// System reads require the recorded identity/path under the linker lock. Null out
+// or zero cap requests only the count. No writes or handle consumption.
+Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count);
+
+// Forget a custom image by bias, PHDR identity and nonzero load token without
+// modifying memory. Its handles are consumed as ImageInvalidated on unhook.
+// System images are rejected. Call before unmapping the custom instance.
+Error forget_image(const ImageView& custom_image);
 
 }  // namespace yukiplt
 

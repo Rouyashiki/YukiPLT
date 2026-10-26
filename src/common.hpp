@@ -145,6 +145,12 @@ class SmallVec {
     size_ = 0;
   }
 
+  /// Remove the last element.  Undefined if empty.
+  void pop_back() noexcept {
+    --size_;
+    if constexpr (!std::is_trivially_destructible_v<T>) ptr()[size_].~T();
+  }
+
   void reserve(size_t new_cap) {
     if (new_cap <= capacity()) return;
     grow(new_cap);

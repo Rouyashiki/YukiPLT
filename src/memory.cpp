@@ -11,7 +11,6 @@
 #endif
 
 #include <atomic>
-#include <mutex>
 
 #include "common.hpp"
 
@@ -20,6 +19,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+
+#include <algorithm>
 
 namespace yukiplt::detail {
 
@@ -89,7 +90,121 @@ bool parse_maps_line(const char* line, size_t len, VmaInfo& out) noexcept {
   return true;
 }
 
+MapsCoverage::MapsCoverage(const uintptr_t* pages, size_t count, size_t page_size,
+                           VmaInfo* out) noexcept
+    : pages_(pages), count_(count), page_size_(page_size), out_(out) {
+  if (pages == nullptr || out == nullptr || count == 0 || page_size == 0 ||
+      (page_size & (page_size - 1)) != 0) {
+    fail(ErrorCode::kInvalidArgument);
+    return;
+  }
+  for (size_t i = 0; i < count; ++i) {
+    if ((pages[i] & (page_size - 1)) != 0 || (i > 0 && pages[i] <= pages[i - 1])) {
+      fail(ErrorCode::kInvalidArgument);
+      return;
+    }
+  }
+}
+
+void MapsCoverage::feed_line(const char* line, size_t len) noexcept {
+  if (done()) return;
+
+  VmaInfo vma;
+  if (!parse_maps_line(line, len, vma)) {
+    fail(ErrorCode::kVmaUnavailable);
+    return;
+  }
+  // The kernel lists VMAs in ascending, non-overlapping order.  Anything else
+  // means we are not reading what we think we are; refuse to match against it.
+  if (vma.begin < prev_end_) {
+    fail(ErrorCode::kVmaUnavailable);
+    return;
+  }
+  prev_end_ = vma.end;
+
+  // Merge walk: resolve every pending page that this VMA covers.
+  while (next_ < count_) {
+    const uintptr_t page = pages_[next_];
+    uintptr_t page_end;
+    if (!safe_add(page, static_cast<uintptr_t>(page_size_), page_end)) {
+      fail(ErrorCode::kIntegerOverflow);
+      return;
+    }
+    if (page >= vma.end) return;  // Belongs to a later VMA.
+    if (page < vma.begin || page_end > vma.end) {
+      // The page starts in a gap before this VMA, or straddles its end.  Either
+      // way no single VMA covers it.
+      fail(ErrorCode::kOutOfBounds);
+      return;
+    }
+    out_[next_] = vma;
+    ++next_;
+  }
+}
+
+Error MapsCoverage::finish() const noexcept {
+  if (failure_ != ErrorCode::kSuccess) return Error::Make(failure_);
+  if (next_ != count_) return Error::Make(ErrorCode::kOutOfBounds);
+  return Error::Ok();
+}
+
 #if defined(__linux__) || defined(__ANDROID__)
+
+namespace {
+
+/// Read /proc/self/maps once, passing each line (without its newline) to
+/// on_line until it returns false.  Lines longer than the internal buffer are
+/// truncated; the address range and permission field always fit.  Returns 0
+/// or the errno of the failed open/read.
+template <typename F>
+int for_each_maps_line(F&& on_line) noexcept {
+  int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return errno;
+
+  constexpr size_t kChunk = 8192;
+  char buf[kChunk];
+  char line[512];
+  size_t line_len = 0;
+  int saved_errno = 0;
+  bool stop = false;
+
+  while (!stop) {
+    ssize_t n = read(fd, buf, kChunk);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      saved_errno = errno;
+      break;
+    }
+    if (n == 0) {
+      // A final line without a newline is still a line.
+      if (line_len > 0) on_line(line, line_len);
+      break;
+    }
+    for (ssize_t k = 0; k < n && !stop; ++k) {
+      char c = buf[k];
+      if (c == '\n') {
+        stop = !on_line(line, line_len);
+        line_len = 0;
+      } else if (line_len < sizeof(line)) {
+        line[line_len++] = c;
+      }
+    }
+  }
+
+  close(fd);
+  return saved_errno;
+}
+
+}  // namespace
+
+Error read_maps_into(MapsCoverage& coverage) noexcept {
+  int err = for_each_maps_line([&](const char* line, size_t len) {
+    coverage.feed_line(line, len);
+    return !coverage.done();
+  });
+  if (err != 0) return Error::Sys(ErrorCode::kVmaUnavailable, err);
+  return coverage.finish();
+}
 
 Expected<VmaInfo, Error> probe_vma(uintptr_t addr, size_t size) {
   if (size == 0) return Error::Make(ErrorCode::kInvalidArgument);
@@ -97,56 +212,28 @@ Expected<VmaInfo, Error> probe_vma(uintptr_t addr, size_t size) {
   if (!safe_add(addr, static_cast<uintptr_t>(size), range_end))
     return Error::Make(ErrorCode::kIntegerOverflow);
 
-  int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return Error::Sys(ErrorCode::kPermissionDenied, errno);
-
-  // A process can have thousands of mappings; read in chunks and scan each
-  // completed line.  We keep a rolling buffer so a line split across reads is
-  // reassembled.
-  constexpr size_t kChunk = 8192;
-  char buf[kChunk + 1];
-  char line[1024];
-  size_t line_len = 0;
   bool found = false;
   VmaInfo result;
-  int saved_errno = 0;
-
-  for (;;) {
-    ssize_t n = read(fd, buf, kChunk);
-    if (n < 0) {
-      if (errno == EINTR) continue;
-      saved_errno = errno;
-      break;
+  int err = for_each_maps_line([&](const char* line, size_t len) {
+    VmaInfo info;
+    if (parse_maps_line(line, len, info) && addr >= info.begin && range_end <= info.end) {
+      result = info;
+      found = true;
     }
-    if (n == 0) break;
+    return !found;
+  });
 
-    for (ssize_t k = 0; k < n; ++k) {
-      char c = buf[k];
-      if (c == '\n') {
-        VmaInfo info;
-        if (parse_maps_line(line, line_len, info) && addr >= info.begin && range_end <= info.end) {
-          result = info;
-          found = true;
-        }
-        line_len = 0;
-        if (found) break;
-      } else if (line_len < sizeof(line)) {
-        line[line_len++] = c;
-      }
-      // Lines longer than our buffer are permission-field-complete well before
-      // 1024 bytes; extra bytes (the pathname) are simply dropped.
-    }
-    if (found) break;
-  }
-
-  close(fd);
-
-  if (saved_errno != 0) return Error::Sys(ErrorCode::kPermissionDenied, saved_errno);
+  if (err != 0) return Error::Sys(ErrorCode::kVmaUnavailable, err);
   if (!found) return Error::Make(ErrorCode::kOutOfBounds);
   return result;
 }
 
 #else  // non-Linux host
+
+Error read_maps_into(MapsCoverage& coverage) noexcept {
+  (void)coverage;
+  return Error::Make(ErrorCode::kUnsupportedFormat);
+}
 
 Expected<VmaInfo, Error> probe_vma(uintptr_t addr, size_t size) {
   (void)addr;
@@ -188,121 +275,334 @@ size_t page_size() noexcept {
   cached.store(ps, std::memory_order_relaxed);
   return ps;
 }
+// Operation lock
 
-#if defined(__linux__) || defined(__ANDROID__)
-
-namespace {
-
-/// Serializes page-protection changes made by this library.
-///
-/// Page protection is process-level shared state.  If two operations each flip
-/// the same page to writable and then restore it, the later restore can revoke
-/// write under the earlier operation's feet and fault its CAS.  Holding this
-/// mutex across the mprotect/CAS/restore window makes the whole sequence atomic
-/// with respect to other YukiPLT operations.  It cannot stop a third party's
-/// concurrent mprotect; that race is documented, not solved (AGENTS 5.3).
-std::mutex& patch_mutex() {
+std::mutex& op_mutex() noexcept {
   static NoDestructor<std::mutex> m;
   return m.get();
 }
+// System platform operations
 
-/// Translate VmaInfo permission bits to a POSIX PROT_* mask.
-int prot_from_vma(const VmaInfo& vma) noexcept {
-  int prot = 0;
-  if (vma.readable) prot |= PROT_READ;
-  if (vma.writable) prot |= PROT_WRITE;
-  if (vma.executable) prot |= PROT_EXEC;
-  return prot == 0 ? PROT_NONE : prot;
+namespace {
+
+#if defined(__linux__) || defined(__ANDROID__)
+
+int sys_protect(void* /*ctx*/, uintptr_t page, size_t len, int prot) {
+  int p = PROT_NONE;
+  if (prot & kProtRead) p |= PROT_READ;
+  if (prot & kProtWrite) p |= PROT_WRITE;
+  if (prot & kProtExec) p |= PROT_EXEC;
+  return mprotect(reinterpret_cast<void*>(page), len, p) == 0 ? 0 : errno;
 }
+
+Error sys_read_maps(void* /*ctx*/, MapsCoverage& coverage) { return read_maps_into(coverage); }
+
+uintptr_t sys_load(void* /*ctx*/, uintptr_t slot) {
+  return __atomic_load_n(reinterpret_cast<const uintptr_t*>(slot), __ATOMIC_ACQUIRE);
+}
+
+bool sys_cas(void* /*ctx*/, uintptr_t slot, uintptr_t* expected, uintptr_t desired) {
+  // Release on success: everything the caller wrote before the CAS (notably
+  // the original-function pointer a replacement calls through) is visible to
+  // a thread that acquires the new slot value.
+  return __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(slot), expected, desired,
+                                     /*weak=*/false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
+#else  // non-Linux host: nothing can be patched.
+
+int sys_protect(void* /*ctx*/, uintptr_t /*page*/, size_t /*len*/, int /*prot*/) { return ENOSYS; }
+
+Error sys_read_maps(void* /*ctx*/, MapsCoverage& /*coverage*/) {
+  return Error::Make(ErrorCode::kUnsupportedFormat);
+}
+
+// Unreachable: prepare() fails before any load or CAS without a memory map.
+uintptr_t sys_load(void* /*ctx*/, uintptr_t /*slot*/) { return 0; }
+
+bool sys_cas(void* /*ctx*/, uintptr_t /*slot*/, uintptr_t* /*expected*/, uintptr_t /*desired*/) {
+  return false;
+}
+
+#endif
 
 }  // namespace
 
+const PlatformOps& system_ops() noexcept {
+  static const PlatformOps ops = {sys_protect, sys_read_maps, sys_load, sys_cas, nullptr};
+  return ops;
+}
+// Single-slot patch (wrapper over Txn)
+
 Expected<void, Error> patch_slot(uintptr_t slot_addr, uintptr_t expected_old, uintptr_t desired_new,
                                  const InspectedImage& image) {
-  // Validate alignment.
   if (slot_addr % 8 != 0) return Error::Make(ErrorCode::kInvalidArgument);
 
   // The slot's ELF identity must check out: it lies inside a writable (PF_W)
   // PT_LOAD segment of the image we were asked to patch.  (Page *permission*
-  // comes from the live VMA below, never from this segment's PT_LOAD/RELRO
-  // flags.)
+  // comes from the live VMA, never from this segment's PT_LOAD/RELRO flags.)
   if (!image.addr_in_writable_load(slot_addr, sizeof(uintptr_t)))
     return Error::Make(ErrorCode::kOutOfBounds);
 
   const size_t ps = page_size();
   if (ps == 0) return Error::Make(ErrorCode::kUnsupportedFormat);
-  const uintptr_t page_mask = ~(static_cast<uintptr_t>(ps) - 1);
-  const uintptr_t page_base = slot_addr & page_mask;
 
-  // Everything that touches page protection is serialized against other
-  // YukiPLT operations on any page.
-  std::lock_guard<std::mutex> lock(patch_mutex());
+  std::lock_guard<std::mutex> lock(op_mutex());
 
-  // Query the slot's real current protection from /proc/self/maps.  The whole
-  // 8-byte slot must be covered by one mapping.
-  auto probe = probe_vma(slot_addr, sizeof(uintptr_t));
-  if (!probe) return probe.error();
-  const VmaInfo& vma = probe.value();
+  Txn txn(system_ops(), ps);
+  Error prep = txn.prepare(&slot_addr, 1);
+  if (prep) return prep;
 
-  // Mapping policy: only private, non-executable, readable mappings with
-  // reliable permission information are accepted.
-  if (vma.shared) return Error::Make(ErrorCode::kPermissionDenied);      // r/w-s rejected.
-  if (vma.executable) return Error::Make(ErrorCode::kPermissionDenied);  // any x rejected.
-  if (!vma.readable) return Error::Make(ErrorCode::kPermissionDenied);   // must be readable.
+  SlotOp op;
+  op.slot = slot_addr;
+  op.expected = expected_old;
+  op.desired = desired_new;
+  CommitResult r = txn.commit(&op, 1, CommitMode::kAllOrNothing);
 
-  const int orig_prot = prot_from_vma(vma);
-  const bool needs_mprotect = !vma.writable;
+  if (r.raise_errno != 0) return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
+  if (op.outcome != SlotOutcome::kCommitted) return Error::Make(ErrorCode::kSlotOwnershipConflict);
+  // The write committed but the page could not be put back: report it rather
+  // than claim a clean success.
+  if (!r.pages_restored) return Error::Sys(ErrorCode::kPermissionDenied, r.restore_errno);
+  return Expected<void, Error>();
+}
 
-  // Temporarily add write to the slot's page if the live mapping lacks it.
-  if (needs_mprotect) {
-    if (mprotect(reinterpret_cast<void*>(page_base), ps, orig_prot | PROT_WRITE) != 0) {
-      return Error::Sys(ErrorCode::kPermissionDenied, errno);
+int prot_of(const VmaInfo& vma) noexcept {
+  int prot = kProtNone;
+  if (vma.readable) prot |= kProtRead;
+  if (vma.writable) prot |= kProtWrite;
+  if (vma.executable) prot |= kProtExec;
+  return prot;
+}
+
+Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* extra_pages,
+                   size_t extra_count) {
+  if (prepared_) return Error::Make(ErrorCode::kInvalidArgument);
+  if (page_size_ == 0 || (page_size_ & (page_size_ - 1)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  if (slot_count + extra_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  if ((slot_count > 0 && slots == nullptr) || (extra_count > 0 && extra_pages == nullptr))
+    return Error::Make(ErrorCode::kNullPointer);
+
+  // Slots: 8-byte aligned (so a slot never straddles a page and the CAS is
+  // a single aligned access) and unique.
+  slots_.clear();
+  slots_.reserve(slot_count);
+  for (size_t i = 0; i < slot_count; ++i) {
+    if (slots[i] % 8 != 0) return Error::Make(ErrorCode::kInvalidArgument);
+    slots_.push_back(slots[i]);
+  }
+  std::sort(slots_.begin(), slots_.end());
+  for (size_t i = 1; i < slots_.size(); ++i) {
+    if (slots_[i] == slots_[i - 1]) return Error::Make(ErrorCode::kInvalidArgument);
+  }
+
+  // Pages: every slot's page plus the extra pages, ascending and unique.
+  SmallVec<uintptr_t, 8> bases;
+  bases.reserve(slot_count + extra_count);
+  for (uintptr_t s : slots_) bases.push_back(page_of(s));
+  for (size_t i = 0; i < extra_count; ++i) {
+    if (page_of(extra_pages[i]) != extra_pages[i]) return Error::Make(ErrorCode::kInvalidArgument);
+    bases.push_back(extra_pages[i]);
+  }
+  std::sort(bases.begin(), bases.end());
+  size_t unique = 0;
+  for (size_t i = 0; i < bases.size(); ++i) {
+    if (i == 0 || bases[i] != bases[i - 1]) bases[unique++] = bases[i];
+  }
+
+  // One pass over the memory map resolves every page.
+  SmallVec<VmaInfo, 8> vmas;
+  vmas.reserve(unique);
+  for (size_t i = 0; i < unique; ++i) vmas.push_back(VmaInfo{});
+  MapsCoverage coverage(bases.begin(), unique, page_size_, vmas.begin());
+  Error maps = ops_.read_maps(ops_.ctx, coverage);
+  if (maps) return maps;
+
+  // VMA policy (AGENTS 5.3): only private, non-executable, readable mappings.
+  // r--p is raised to rw-p for the write and restored; rw-p is written as is.
+  for (size_t i = 0; i < unique; ++i) {
+    const VmaInfo& v = vmas[i];
+    if (v.shared || v.executable || !v.readable) return Error::Make(ErrorCode::kPermissionDenied);
+  }
+
+  pages_.clear();
+  pages_.reserve(unique);
+  for (size_t i = 0; i < unique; ++i) {
+    Page p;
+    p.base = bases[i];
+    p.vma = vmas[i];
+    pages_.push_back(p);
+  }
+  slot_seen_.clear();
+  slot_seen_.reserve(slots_.size());
+  for (size_t i = 0; i < slots_.size(); ++i) slot_seen_.push_back(0);
+
+  prepared_ = true;
+  return Error::Ok();
+}
+
+size_t Txn::find_page(uintptr_t addr) const noexcept {
+  const uintptr_t base = page_of(addr);
+  size_t lo = 0;
+  size_t hi = pages_.size();
+  while (lo < hi) {
+    size_t mid = lo + (hi - lo) / 2;
+    if (pages_[mid].base < base) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return (lo < pages_.size() && pages_[lo].base == base) ? lo : pages_.size();
+}
+
+size_t Txn::find_slot(uintptr_t slot) const noexcept {
+  const uintptr_t* begin = slots_.begin();
+  const uintptr_t* end = slots_.end();
+  const uintptr_t* it = std::lower_bound(begin, end, slot);
+  return (it != end && *it == slot) ? static_cast<size_t>(it - begin) : slots_.size();
+}
+
+bool Txn::load(uintptr_t slot, uintptr_t& out) const noexcept {
+  if (!prepared_ || find_slot(slot) == slots_.size()) return false;
+  out = ops_.load(ops_.ctx, slot);
+  return true;
+}
+
+bool Txn::page_vma(uintptr_t page, VmaInfo& out) const noexcept {
+  if (!prepared_) return false;
+  size_t i = find_page(page);
+  if (i == pages_.size() || pages_[i].base != page) return false;
+  out = pages_[i].vma;
+  return true;
+}
+
+int Txn::protect_page(uintptr_t page, int prot) noexcept {
+  if (!prepared_) return EINVAL;
+  size_t i = find_page(page);
+  if (i == pages_.size() || pages_[i].base != page) return EINVAL;
+  return ops_.protect(ops_.ctx, page, page_size_, prot);
+}
+
+void Txn::restore_pages(CommitResult& result) noexcept {
+  for (size_t k = pages_.size(); k-- > 0;) {
+    Page& p = pages_[k];
+    if (!p.raised || p.restore_failed) continue;
+    int err = ops_.protect(ops_.ctx, p.base, page_size_, prot_of(p.vma));
+    if (err == 0) {
+      p.raised = false;
+    } else {
+      p.restore_failed = true;
+      result.pages_restored = false;
+      if (result.restore_errno == 0) result.restore_errno = err;
+    }
+  }
+}
+
+CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode) noexcept {
+  CommitResult result;
+  if (!prepared_ || committed_ || ops == nullptr || count == 0) {
+    result.invalid = true;
+    return result;
+  }
+
+  // Every op must name a distinct prepared slot.
+  for (size_t i = 0; i < slot_seen_.size(); ++i) slot_seen_[i] = 0;
+  for (size_t i = 0; i < count; ++i) {
+    size_t idx = find_slot(ops[i].slot);
+    if (idx == slots_.size() || slot_seen_[idx] != 0) {
+      result.invalid = true;
+      return result;
+    }
+    slot_seen_[idx] = 1;
+  }
+  committed_ = true;
+
+  for (size_t i = 0; i < count; ++i) {
+    ops[i].outcome = SlotOutcome::kUntouched;
+    ops[i].observed = 0;
+    pages_[find_page(ops[i].slot)].used = true;
+  }
+
+  // 1. Raise each used page lacking write, ascending, once.
+  for (size_t k = 0; k < pages_.size(); ++k) {
+    Page& p = pages_[k];
+    if (!p.used || p.vma.writable) continue;
+    int err = ops_.protect(ops_.ctx, p.base, page_size_, prot_of(p.vma) | kProtWrite);
+    if (err != 0) {
+      result.raise_errno = err;
+      restore_pages(result);
+      return result;
+    }
+    p.raised = true;
+  }
+
+  // 2. CAS.
+  if (mode == CommitMode::kAllOrNothing) {
+    for (size_t i = 0; i < count; ++i) {
+      SlotOp& op = ops[i];
+      uintptr_t seen = op.expected;
+      if (ops_.cas(ops_.ctx, op.slot, &seen, op.desired)) {
+        op.outcome = SlotOutcome::kCommitted;
+        op.observed = op.desired;
+        continue;
+      }
+      op.outcome = SlotOutcome::kConflict;
+      op.observed = seen;
+      ++result.conflicts;
+      // Revert what this commit already wrote, newest first.
+      for (size_t j = i; j-- > 0;) {
+        SlotOp& prev = ops[j];
+        uintptr_t found = prev.desired;
+        if (ops_.cas(ops_.ctx, prev.slot, &found, prev.expected)) {
+          prev.outcome = SlotOutcome::kRolledBack;
+          prev.observed = prev.expected;
+        } else {
+          prev.outcome = SlotOutcome::kRollbackFailed;
+          prev.observed = found;
+          result.rollback_failed = true;
+        }
+      }
+      break;
+    }
+  } else {
+    for (size_t i = 0; i < count; ++i) {
+      SlotOp& op = ops[i];
+      uintptr_t seen = op.expected;
+      if (ops_.cas(ops_.ctx, op.slot, &seen, op.desired)) {
+        op.outcome = SlotOutcome::kCommitted;
+        op.observed = op.desired;
+      } else {
+        op.outcome = SlotOutcome::kConflict;
+        op.observed = seen;
+        ++result.conflicts;
+      }
     }
   }
 
-  // CAS with release semantics.  The caller must have published any state the
-  // replacement depends on (notably the original function pointer) before this
-  // point; the release makes those writes visible to a thread that observes the
-  // new slot value.
-  uintptr_t old_val = expected_old;
-  bool cas_ok =
-      __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(slot_addr), &old_val, desired_new,
-                                  /*weak=*/false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+  // 3. Put back every page this commit raised.
+  restore_pages(result);
 
-  // Restore the page to its real original protection — the value read from the
-  // live VMA, not an inference from PT_LOAD/RELRO.
-  bool restore_failed = false;
-  int restore_errno = 0;
-  if (needs_mprotect) {
-    if (mprotect(reinterpret_cast<void*>(page_base), ps, orig_prot) != 0) {
-      restore_failed = true;
-      restore_errno = errno;
-    }
+  result.all_committed = true;
+  for (size_t i = 0; i < count; ++i) {
+    if (ops[i].outcome != SlotOutcome::kCommitted) result.all_committed = false;
   }
-
-  if (!cas_ok) return Error::Make(ErrorCode::kSlotOwnershipConflict);
-
-  // The slot write committed, but we could not put the page's protection back.
-  // Report it rather than claim a clean success: the page is now more permissive
-  // than we found it.
-  if (restore_failed) return Error::Sys(ErrorCode::kPermissionDenied, restore_errno);
-
-  return Expected<void, Error>();  // Success
+  return result;
 }
 
-#else  // non-Linux host
-
-Expected<void, Error> patch_slot(uintptr_t slot_addr, uintptr_t expected_old, uintptr_t desired_new,
-                                 const InspectedImage& image) {
-  if (slot_addr % 8 != 0) return Error::Make(ErrorCode::kInvalidArgument);
-  if (!image.addr_in_writable_load(slot_addr, sizeof(uintptr_t)))
-    return Error::Make(ErrorCode::kOutOfBounds);
-  // Patch operations are not functional on non-Linux hosts.
-  (void)expected_old;
-  (void)desired_new;
-  return Error::Make(ErrorCode::kUnsupportedFormat);
+size_t Txn::residue(PageResidue* out, size_t cap) const noexcept {
+  size_t n = 0;
+  for (const Page& p : pages_) {
+    if (!(p.raised && p.restore_failed)) continue;
+    if (out != nullptr && n < cap) {
+      out[n].page = p.base;
+      out[n].original_prot = prot_of(p.vma);
+      out[n].raised_prot = prot_of(p.vma) | kProtWrite;
+    }
+    ++n;
+  }
+  return n;
 }
-
-#endif
 
 }  // namespace yukiplt::detail

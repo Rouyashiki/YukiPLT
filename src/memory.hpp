@@ -210,10 +210,14 @@ class Txn {
   ///   1. Raise, in ascending order and once each, the pages used by `ops`
   ///      whose VMA lacks write.  If one fails, restore those already raised
   ///      and return with raise_errno set; no slot is written.
-  ///   2. CAS each op in order (see CommitMode).
-  ///   3. Restore, in descending order, every page raised in step 1, even if
+  ///   2. Call `before_cas(ctx)` once, if given.  It runs only after every
+  ///      raise succeeded and before any CAS, so data it publishes is visible
+  ///      before a replacement becomes reachable.  It must not throw.
+  ///   3. CAS each op in order (see CommitMode).
+  ///   4. Restore, in descending order, every page raised in step 1, even if
   ///      an earlier restore failed.
-  CommitResult commit(SlotOp* ops, size_t count, CommitMode mode) noexcept;
+  CommitResult commit(SlotOp* ops, size_t count, CommitMode mode,
+                      void (*before_cas)(void* ctx) = nullptr, void* ctx = nullptr) noexcept;
 
   /// Pages that commit() raised but could not restore.  Writes up to `cap`
   /// entries and returns the total number.

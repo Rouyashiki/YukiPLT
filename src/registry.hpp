@@ -10,6 +10,17 @@
 #include "common.hpp"
 #include "yukiplt.hpp"
 
+namespace yukiplt {
+// Internal access shared by the C++ implementation and the thin C boundary.
+class detail_api {
+ public:
+  static HookHandle make(uint64_t id) noexcept { return HookHandle(id); }
+  static uint64_t id(const HookHandle& h) noexcept { return h.id_; }
+  static void set(HookHandle& h, uint64_t id) noexcept { h.id_ = id; }
+  static constexpr uint64_t invalid() noexcept { return HookHandle::kInvalid; }
+};
+}  // namespace yukiplt
+
 namespace yukiplt::detail {
 
 template <typename T>

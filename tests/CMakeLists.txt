@@ -22,9 +22,12 @@ FetchContent_MakeAvailable(googletest)
 find_package(Threads REQUIRED)
 
 add_library(yukiplt_regression_core STATIC
+    "${YUKIPLT_ROOT}/src/c_api.cpp"
     "${YUKIPLT_ROOT}/src/elf.cpp"
+    "${YUKIPLT_ROOT}/src/imports.cpp"
     "${YUKIPLT_ROOT}/src/memory.cpp"
     "${YUKIPLT_ROOT}/src/registry.cpp"
+    "${YUKIPLT_ROOT}/src/session.cpp"
     "${YUKIPLT_ROOT}/src/yukiplt.cpp"
     "${YUKIPLT_ROOT}/tests/overrides.cpp"
 )
@@ -37,7 +40,8 @@ target_compile_definitions(yukiplt_regression_core PUBLIC YUKIPLT_STATIC=1)
 
 include(GoogleTest)
 add_executable(yukiplt_regressions elf_builder.cpp parser.cpp transaction.cpp lifecycle.cpp)
-foreach(target IN ITEMS yukiplt_regressions)
+add_executable(yukiplt_allocation_regressions elf_builder.cpp allocation.cpp)
+foreach(target IN ITEMS yukiplt_regressions yukiplt_allocation_regressions)
     target_link_libraries(${target} PRIVATE yukiplt_regression_core
         GTest::gtest_main Threads::Threads ${CMAKE_DL_LIBS})
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)

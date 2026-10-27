@@ -47,6 +47,10 @@ struct InspectedImage {
   uintptr_t jmprel = 0;
   size_t jmprel_count = 0;
 
+  /// Validated dynamic array for optional metadata readers.
+  uintptr_t dynamic = 0;
+  size_t dynamic_size = 0;
+
   /// Whether d_ptr values in the dynamic section were already adjusted
   /// to runtime addresses by the dynamic linker (glibc behavior).
   /// When false (bionic), runtime address = d_ptr + load_bias.

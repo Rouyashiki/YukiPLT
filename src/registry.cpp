@@ -52,31 +52,33 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
     if (slot_is_live(slots[i].address)) return kInvalidId;
   }
 
-  uint32_t index;
-  if (!free_list_.empty()) {
-    index = free_list_[free_list_.size() - 1];
-    free_list_.pop_back();
-  } else {
-    index = static_cast<uint32_t>(records_.size());
-    records_.push_back(Record{});
+  if (free_list_.empty()) {
     // Keep the free list able to hold every record without a later allocation,
-    // so freeing a record (finish_restore/release) never throws.
-    free_list_.reserve(records_.size());
+    // so freeing a record (finish_restore/release) never throws. Reserve before
+    // adding the record, so either allocation can fail without losing it.
+    free_list_.reserve(records_.size() + 1);
+    const auto index = static_cast<uint32_t>(records_.size());
+    records_.push_back(Record{});
+    free_list_.push_back(index);
   }
 
+  const uint32_t index = free_list_[free_list_.size() - 1];
   Record& r = records_[index];
-  r.in_use = true;
-  r.state = GroupState::kPrepared;
-  r.image = image;
   // Reserve now, before any memory is modified, so that recording the group's
   // slots and page residue after the commit cannot throw bad_alloc and leave
-  // the record half-updated (AGENTS 4.4 / kOutOfMemory contract).  Every
+  // the record half-updated (kOutOfMemory contract). Every
   // residual page is a slot page, so `count` entries bound the residue too.
-  r.slots.clear();
   r.slots.reserve(count);
-  r.residue.clear();
   r.residue.reserve(count);
+  // Do not consume the free entry or publish ownership until all allocation
+  // has succeeded. An exception leaves this record available for a retry.
+  r.slots.clear();
+  r.residue.clear();
   for (size_t i = 0; i < count; ++i) r.slots.push_back(slots[i]);
+  r.image = image;
+  r.state = GroupState::kPrepared;
+  r.in_use = true;
+  free_list_.pop_back();
   return make_id(r.generation, index);
 }
 
@@ -173,7 +175,7 @@ size_t Registry::forget_custom_image(const ImageIdentity& image) {
     if (!r.in_use) continue;
     if (r.image.instance_token == 0) continue;  // system images are not forgettable
     if (r.image.load_bias == image.load_bias && r.image.phdr_addr == image.phdr_addr &&
-        r.image.instance_token == image.instance_token) {
+        r.image.phdr_count == image.phdr_count && r.image.instance_token == image.instance_token) {
       r.image.invalidated = true;
       ++n;
     }

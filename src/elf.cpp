@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "common.hpp"
+#include "imports.hpp"
 
 namespace yukiplt::detail {
 // Helpers
@@ -224,6 +225,8 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
 
   // PT_DYNAMIC must be within a PT_LOAD segment.
   if (!image.addr_in_load(dyn_begin, dyn_size)) return Error::Make(ErrorCode::kCorruptedElf);
+  image.dynamic = dyn_begin;
+  image.dynamic_size = dyn_size;
 
   // Compute RELRO range.
   if (relro_phdr != nullptr) {
@@ -551,78 +554,21 @@ Expected<uint32_t, Error> lookup_symbol(const InspectedImage& image, const char*
 }
 // Relocation resolver
 
-/// Compare a symbol name by reading it from the symbol table.
-/// Returns true if the symbol at sym_index has the given name.
-static Expected<bool, Error> sym_name_matches(const InspectedImage& image, uint32_t sym_index,
-                                              const char* name) {
-  uintptr_t sym_addr = image.symtab + static_cast<uintptr_t>(sym_index) * sizeof(Elf64_Sym);
-  auto r_sym = read_checked<Elf64_Sym>(image, sym_addr);
-  if (!r_sym) return r_sym.error();
-  const Elf64_Sym& sym = r_sym.value();
-
-  if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
-
-  const char* sym_name = reinterpret_cast<const char*>(image.strtab + sym.st_name);
-  size_t max_len = image.strsz - sym.st_name;
-  if (strnlen(sym_name, max_len) == max_len) return Error::Make(ErrorCode::kCorruptedElf);
-
-  return std::strcmp(sym_name, name) == 0;
-}
-
 Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& image,
                                                       const char* symbol_name) {
   if (symbol_name == nullptr) return Error::Make(ErrorCode::kNullPointer);
 
-  if (image.jmprel == 0 || image.jmprel_count == 0) return Error::Make(ErrorCode::kSymbolNotFound);
+  // Validate all JMPREL metadata and reject duplicate slots before filtering.
+  // Undefined imports require relocation scanning, not hash lookup.
+  auto snapshot = snapshot_imports(image);
+  if (!snapshot) return snapshot.error();
 
-  // Scan the JMPREL table and match by symbol name.
-  //
-  // We do NOT use hash table lookup here because GNU Hash does not index
-  // undefined symbols — and PLT relocations reference undefined (imported)
-  // symbols.  Instead, we iterate all JMPREL entries, read each entry's
-  // symbol index, look up its name from the symbol table, and compare.
   SmallVec<ResolvedSlot> slots;
-
-  for (size_t i = 0; i < image.jmprel_count; ++i) {
-    uintptr_t rela_addr = image.jmprel + i * sizeof(Elf64_Rela);
-    auto r_rela = read_checked<Elf64_Rela>(image, rela_addr);
-    if (!r_rela) return r_rela.error();
-    const Elf64_Rela& rela = r_rela.value();
-
-    uint32_t rtype = static_cast<uint32_t>(ELF64_R_TYPE(rela.r_info));
-    uint32_t rsym = static_cast<uint32_t>(ELF64_R_SYM(rela.r_info));
-
-    // Only process R_AARCH64_JUMP_SLOT.
-    if (rtype != R_AARCH64_JUMP_SLOT) continue;
-
-    // Skip STN_UNDEF (symbol index 0).
-    if (rsym == 0) continue;
-
-    // Compare symbol name.
-    auto name_match = sym_name_matches(image, rsym, symbol_name);
-    if (!name_match) return name_match.error();
-    if (!name_match.value()) continue;
-
-    // Compute GOT slot runtime address.
-    // r_offset is always the link-time virtual address of the GOT slot.
-    // Unlike d_ptr in the dynamic section, r_offset is NOT adjusted by
-    // the dynamic linker on glibc.  Runtime address = r_offset + load_bias.
-    uintptr_t slot_addr;
-    if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), slot_addr))
-      return Error::Make(ErrorCode::kIntegerOverflow);
-
-    // Validate 8-byte alignment.
-    if (slot_addr % 8 != 0) return Error::Make(ErrorCode::kCorruptedElf);
-
-    // The slot must lie in a writable (PF_W) PT_LOAD segment (AGENTS 5.1).
-    // A JUMP_SLOT target in a read-only or executable segment is malformed.
-    if (!image.addr_in_writable_load(slot_addr, 8)) return Error::Make(ErrorCode::kCorruptedElf);
-
-    slots.push_back({slot_addr, rsym});
+  for (const ImportInfo& entry : snapshot.value().imports) {
+    if (entry.symbol != symbol_name) continue;
+    slots.push_back({entry.slot_address, entry.symbol_index});
   }
-
   if (slots.empty()) return Error::Make(ErrorCode::kSymbolNotFound);
-
   return slots;
 }
 
@@ -635,14 +581,8 @@ Expected<ResolvedSlot, Error> resolve_unique_slot(const InspectedImage& image,
   // resolve_slots never returns an empty success, but keep the guard explicit.
   if (matches.empty()) return Error::Make(ErrorCode::kSymbolNotFound);
 
-  // Any two records naming the same GOT slot mean the image is malformed: a
-  // well-formed object has at most one JUMP_SLOT per slot.  Scan the whole set
-  // (it is tiny) so a duplicate is never masked by an earlier distinct match.
-  for (size_t i = 0; i < matches.size(); ++i) {
-    for (size_t j = i + 1; j < matches.size(); ++j) {
-      if (matches[i].address == matches[j].address) return Error::Make(ErrorCode::kCorruptedElf);
-    }
-  }
+  // resolve_slots() already rejected any two records naming one slot, so
+  // several matches are distinct slots.
 
   // Distinct matching slots are ambiguous even when their values agree.
   if (matches.size() > 1) return Error::Make(ErrorCode::kAmbiguousSymbol);

@@ -7,15 +7,19 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 
 #include "common.hpp"
 #include "elf.hpp"
+#include "imports.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <link.h>
 #include <sys/auxv.h>
+
+#include <exception>
 #endif
 
 namespace yukiplt {
@@ -31,16 +35,6 @@ using detail::SlotOp;
 using detail::SlotOutcome;
 using detail::SlotRecord;
 using detail::Txn;
-
-/// Grants the API functions access to HookHandle's private id.  (Named as a
-/// friend in the header.)
-class detail_api {
- public:
-  static HookHandle make(uint64_t id) noexcept { return HookHandle(id); }
-  static uint64_t id(const HookHandle& h) noexcept { return h.id_; }
-  static void set(HookHandle& h, uint64_t id) noexcept { h.id_ = id; }
-  static constexpr uint64_t invalid() noexcept { return HookHandle::kInvalid; }
-};
 
 namespace {
 
@@ -77,9 +71,10 @@ ImageIdentity identity_of(const ImageView& v) noexcept {
 ///
 /// Lock order is linker -> op, never the reverse: the op lock is only ever
 /// taken inside this callback for an image operation, or standalone for a
-/// registry-only operation that never calls dl_*.  dl_iterate_phdr is C, so an
-/// exception must not escape `fn`; callers make `fn` catch its own allocation
-/// failures.  Returns true if the image was found (and `fn` ran).
+/// registry-only operation that never calls dl_*.  dl_iterate_phdr is C, so no
+/// exception may unwind through it: one thrown by the lock or by `fn` is
+/// captured and rethrown after the iteration returns.  Returns true if the
+/// image was found (and `fn` ran).
 template <typename Fn>
 bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
 #if defined(__linux__) || defined(__ANDROID__)
@@ -87,7 +82,8 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
     const ImageIdentity* want;
     Fn* fn;
     bool matched;
-  } ctx{&want, &fn, false};
+    std::exception_ptr error;
+  } ctx{&want, &fn, false, nullptr};
 
   dl_iterate_phdr(
       [](struct dl_phdr_info* info, size_t /*size*/, void* p) -> int {
@@ -102,12 +98,17 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
         live.phdr_table = info->dlpi_phdr;
         live.phdr_count = info->dlpi_phnum;
         live.instance_token = 0;
-        std::lock_guard<std::mutex> lock(detail::op_mutex());  // linker -> op
-        (*c->fn)(live);
         c->matched = true;
+        try {
+          std::lock_guard<std::mutex> lock(detail::op_mutex());  // linker -> op
+          (*c->fn)(live);
+        } catch (...) {
+          c->error = std::current_exception();
+        }
         return 1;
       },
       &ctx);
+  if (ctx.error) std::rethrow_exception(ctx.error);
   return ctx.matched;
 #else
   (void)want;
@@ -124,6 +125,24 @@ struct PlannedSlot {
   void** out_original;
   size_t report_index;  ///< Index into the caller's reports array.
 };
+
+/// Every non-null original-pointer output must be pointer-aligned (the release
+/// store is an atomic access) and distinct within one transaction, so one
+/// target's original can never overwrite another's.  Checked before any lock
+/// or write.
+template <typename Request>
+Error validate_outputs(const Request* reqs, size_t count) noexcept {
+  for (size_t i = 0; i < count; ++i) {
+    void** out = reqs[i].out_original;
+    if (out == nullptr) continue;
+    if (reinterpret_cast<uintptr_t>(out) % alignof(void*) != 0)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    for (size_t j = 0; j < i; ++j) {
+      if (reqs[j].out_original == out) return Error::Make(ErrorCode::kInvalidArgument);
+    }
+  }
+  return Error::Ok();
+}
 
 /// Resolve every request against `img` to a unique slot, enforcing one-slot
 /// uniqueness and no duplicate targets within the batch.
@@ -151,6 +170,42 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
   return Error::Ok();
 }
 
+Error plan_selected_requests(const InspectedImage& img, const SelectedHookRequest* reqs,
+                             size_t count, detail::SmallVec<PlannedSlot, 4>& out) {
+  auto snapshot = detail::snapshot_versioned_imports(img);
+  if (!snapshot) return snapshot.error();
+  for (size_t i = 0; i < count; ++i) {
+    if (reqs[i].replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
+    auto selected = detail::select_import(snapshot.value(), reqs[i].target);
+    if (!selected) return selected.error();
+    const auto address = snapshot.value().imports[selected.value()].import.slot_address;
+    for (const auto& previous : out) {
+      if (previous.address == address) return Error::Make(ErrorCode::kInvalidArgument);
+    }
+    out.push_back(
+        {address, 0, reinterpret_cast<uintptr_t>(reqs[i].replacement), reqs[i].out_original, i});
+  }
+  return Error::Ok();
+}
+
+/// Publish each planned original before the commit makes a replacement
+/// reachable.  Runs from Txn::commit only after every page raise succeeded.
+struct Publication {
+  const detail::SmallVec<PlannedSlot, 4>* planned;
+};
+
+void publish_originals(void* context) noexcept {
+  const auto& planned = *static_cast<Publication*>(context)->planned;
+  for (const PlannedSlot& slot : planned) {
+    if (slot.out_original == nullptr) continue;
+    // Release store: the replacement reads *out_original with an acquire load
+    // (documented), and the commit's release CAS publishes this write.  Using
+    // an atomic store (not a plain store) keeps it race-free under the C++
+    // model when a replacement on another thread is already reading it.
+    __atomic_store_n(slot.out_original, reinterpret_cast<void*>(slot.original), __ATOMIC_RELEASE);
+  }
+}
+
 void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<PlannedSlot, 4>& planned,
                    const SlotOp* ops, size_t count) {
   if (reports == nullptr) return;
@@ -167,9 +222,11 @@ void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<Plann
 /// Core install path for one image, run under the op lock.  `img` must be a
 /// freshly inspected, currently-valid image.
 HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
-                   size_t count, SlotReport* reports, size_t report_cap) {
+                   size_t count, SlotReport* reports, size_t report_cap,
+                   const SelectedHookRequest* selected = nullptr) {
   detail::SmallVec<PlannedSlot, 4> planned;
-  Error plan = plan_requests(img, reqs, count, planned);
+  Error plan = selected != nullptr ? plan_selected_requests(img, selected, count, planned)
+                                   : plan_requests(img, reqs, count, planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
 
   const size_t ps = detail::page_size();
@@ -189,43 +246,43 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
   if (id == Registry::kInvalidId)
     return {Error::Make(ErrorCode::kAlreadyHooked), detail_api::make(detail_api::invalid())};
 
+  struct ClaimGuard {
+    Registry& registry;
+    uint64_t id;
+    bool retained = false;
+    ~ClaimGuard() {
+      if (!retained) registry.drop(id);
+    }
+  } claim{reg, id};
+
   Txn txn(detail::active_ops(), ps);
   Error prep = txn.prepare(slot_addrs, planned.size());
   if (prep) {
-    reg.drop(id);
     return {prep, detail_api::make(detail_api::invalid())};
   }
 
-  // Read current slot values (now confirmed mapped and readable), fill the
-  // ops, and publish each out_original before the commit makes a replacement
-  // reachable.  out_original is never cleared once set.
+  // Read current slot values (now confirmed mapped and readable) and fill the
+  // ops.  The originals are published from inside the commit, after every page
+  // raise succeeded and before the first CAS makes a replacement reachable.
+  // out_original is never cleared once set.
   SlotOp ops[kMaxBatch];
   for (size_t i = 0; i < planned.size(); ++i) {
     uintptr_t cur = 0;
     txn.load(planned[i].address, cur);
     planned[i].original = cur;
     if (cur == planned[i].replacement) {  // replacement == current value: ambiguous ownership
-      reg.drop(id);
       return {Error::Make(ErrorCode::kInvalidArgument), detail_api::make(detail_api::invalid())};
     }
     ops[i].slot = planned[i].address;
     ops[i].expected = cur;
     ops[i].desired = planned[i].replacement;
-  }
-  for (size_t i = 0; i < planned.size(); ++i) {
-    if (planned[i].out_original != nullptr) {
-      // Release store: the replacement reads *out_original with an acquire load
-      // (documented), and the commit's release CAS publishes this write.  Using
-      // an atomic store (not a plain store) keeps it race-free under the C++
-      // model when a replacement on another thread is already reading it.
-      __atomic_store_n(planned[i].out_original, reinterpret_cast<void*>(planned[i].original),
-                       __ATOMIC_RELEASE);
-    }
     // Update the registry's recorded original now that it is known.
     recs[i].original = planned[i].original;
   }
 
-  CommitResult r = txn.commit(ops, planned.size(), CommitMode::kAllOrNothing);
+  Publication publication{&planned};
+  CommitResult r =
+      txn.commit(ops, planned.size(), CommitMode::kAllOrNothing, publish_originals, &publication);
   write_reports(reports, report_cap, planned, ops, planned.size());
 
   // Pages this commit raised but could not restore.  While any such page
@@ -257,6 +314,7 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
     reg.finish_restore(id, /*released=*/false, GroupState::kPrepared, recs, planned.size(), nullptr,
                        0);
     reg.mark_installed(id);
+    claim.retained = true;
     return {Error::Ok(), detail_api::make(id)};
   }
 
@@ -264,12 +322,12 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
   // state must be kept: Indeterminate with a valid handle.
   if (pn > 0 || r.rollback_failed) {
     reg.mark_indeterminate(id, recs, planned.size(), pr, pn);
+    claim.retained = true;
     return {Error::Make(ErrorCode::kIndeterminate), detail_api::make(id)};
   }
 
   // Every raised page was restored and no rollback failed, so nothing is left
   // modified: free the group and report the first cause.
-  reg.drop(id);
   if (r.raise_errno != 0)
     return {Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
             detail_api::make(detail_api::invalid())};
@@ -377,37 +435,90 @@ HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t co
   auto fail = [](ErrorCode c) {
     return HookResult{Error::Make(c), detail_api::make(detail_api::invalid())};
   };
-  if (reqs == nullptr || count == 0) return fail(ErrorCode::kNullPointer);
-  if (count > kMaxBatch) return fail(ErrorCode::kInvalidArgument);
+  if (reqs == nullptr) return fail(ErrorCode::kNullPointer);
+  if (count == 0 || count > kMaxBatch) return fail(ErrorCode::kInvalidArgument);
+  // Reject unusable outputs before taking any lock or touching the image.
+  Error outputs = validate_outputs(reqs, count);
+  if (outputs) return {outputs, detail_api::make(detail_api::invalid())};
 
-  if (image.instance_token == 0) {
-    // Keep inspection and installation inside the linker callback, taking op
-    // after linker so unloading cannot invalidate the image during access.
-    HookResult result = fail(ErrorCode::kImageNotFound);
-    bool matched = run_on_system_image(identity_of(image), [&](const ImageView& live) {
-      try {
-        auto insp = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
-        if (!insp) {
-          result = {insp.error(), detail_api::make(detail_api::invalid())};
-          return;
-        }
-        result = install(image, insp.value(), reqs, count, reports, count);
-      } catch (const std::bad_alloc&) {
-        result = fail(ErrorCode::kOutOfMemory);
-      }
-    });
-    if (!matched) return fail(ErrorCode::kImageNotFound);
-    return result;
-  }
-
-  // Custom image: the caller guarantees it stays mapped (contract).
+  auto apply = [&](const ImageView& live) -> HookResult {
+    try {
+      auto insp = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
+      if (!insp) return {insp.error(), detail_api::make(detail_api::invalid())};
+      return install(image, insp.value(), reqs, count, reports, count);
+    } catch (const std::bad_alloc&) {
+      return fail(ErrorCode::kOutOfMemory);
+    } catch (const std::length_error&) {
+      return fail(ErrorCode::kIntegerOverflow);
+    } catch (...) {
+      return fail(ErrorCode::kUnsupportedFormat);
+    }
+  };
   try {
+    if (image.instance_token == 0) {
+      // Keep inspection and installation inside the linker callback, taking op
+      // after linker so unloading cannot invalidate the image during access.
+      HookResult result = fail(ErrorCode::kImageInvalidated);
+      run_on_system_image(identity_of(image), [&](const ImageView& live) { result = apply(live); });
+      return result;
+    }
+
+    // Custom image: the caller guarantees it stays mapped (contract).
     std::lock_guard<std::mutex> lock(detail::op_mutex());
-    auto insp = detail::inspect(image.load_bias, image.phdr_table, image.phdr_count);
-    if (!insp) return {insp.error(), detail_api::make(detail_api::invalid())};
-    return install(image, insp.value(), reqs, count, reports, count);
+    return apply(image);
   } catch (const std::bad_alloc&) {
     return fail(ErrorCode::kOutOfMemory);
+  } catch (...) {
+    return fail(ErrorCode::kUnsupportedFormat);
+  }
+}
+// Precisely selected imports
+
+HookResult hook_import(const ImageView& image, const ImportSelector& selector, void* replacement,
+                       void** out_original, SlotReport* report) {
+  SelectedHookRequest request{selector, replacement, out_original};
+  return hook_imports(image, &request, 1, report);
+}
+
+HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
+                        SlotReport* reports) {
+  auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
+  if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
+  if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
+  for (size_t i = 0; i < count; ++i) {
+    auto error = detail::validate_selector(reqs[i].target);
+    if (error) return fail(error);
+    if (reqs[i].replacement == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
+  }
+  // Reject unusable outputs before taking any lock or touching the image.
+  Error outputs = validate_outputs(reqs, count);
+  if (outputs) return fail(outputs);
+  auto apply = [&](const ImageView& live) -> HookResult {
+    try {
+      auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
+      if (!inspected) return fail(inspected.error());
+      return install(live, inspected.value(), nullptr, count, reports, count, reqs);
+    } catch (const std::bad_alloc&) {
+      return fail(Error::Make(ErrorCode::kOutOfMemory));
+    } catch (const std::length_error&) {
+      return fail(Error::Make(ErrorCode::kIntegerOverflow));
+    } catch (...) {
+      // Never unwind through the loader's C callback frame.
+      return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+    }
+  };
+  try {
+    if (image.instance_token == 0) {
+      auto result = fail(Error::Make(ErrorCode::kImageInvalidated));
+      run_on_system_image(identity_of(image), [&](const ImageView& live) { result = apply(live); });
+      return result;
+    }
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return apply(image);
+  } catch (const std::bad_alloc&) {
+    return fail(Error::Make(ErrorCode::kOutOfMemory));
+  } catch (...) {
+    return fail(Error::Make(ErrorCode::kUnsupportedFormat));
   }
 }
 // unhook
@@ -421,6 +532,8 @@ namespace {
 Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* reports,
                  size_t cap) {
   Registry& reg = Registry::instance();
+  const auto previous_state =
+      reg.is_installed(id) ? GroupState::kInstalled : GroupState::kIndeterminate;
 
   ImageIdentity image;
   SlotRecord recs[kMaxBatch];
@@ -448,7 +561,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
 
   const size_t ps = detail::page_size();
   if (ps == 0) {
-    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, pages, page_count);
+    reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
     return Error::Make(ErrorCode::kUnsupportedFormat);
   }
 
@@ -459,25 +572,20 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   for (size_t i = 0; i < page_count; ++i) extra_pages[i] = pages[i].page;
 
   Txn txn(detail::active_ops(), ps);
-  Error prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
-                           page_count > 0 ? extra_pages : nullptr, page_count);
+  Error prep;
+  try {
+    prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
+                       page_count > 0 ? extra_pages : nullptr, page_count);
+  } catch (...) {
+    // prepare has not changed any slot or page. Restore the exact prior state
+    // before the public boundary translates the allocation exception.
+    reg.finish_restore(id, false, previous_state, nullptr, 0, nullptr, 0);
+    throw;
+  }
   if (prep) {
-    // A maps read that failed (kVmaUnavailable) is always transient — a failed
-    // open() or an inconsistent multi-read snapshot never proves the image is
-    // gone — so keep the handle and every recorded slot/page for a retry.
-    //
-    // kOutOfBounds (a slot page no longer mapped) means different things by
-    // image kind.  For a system image we are inside the linker lock, so the
-    // image is present and this too is transient.  For a CUSTOM image the
-    // caller's contract is "keep it mapped until released"; an unmapped page
-    // means that contract is broken / the image was discarded, so we treat it
-    // as invalidated and consume the handle without touching memory.
-    if (image.instance_token != 0 && prep.code == ErrorCode::kOutOfBounds) {
-      reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
-      detail_api::set(handle, detail_api::invalid());
-      return Error::Make(ErrorCode::kImageInvalidated);
-    }
-    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, pages, page_count);
+    // A failed/incomplete maps read does not prove unload. Preserve recovery
+    // state; custom-image invalidation requires forget_image().
+    reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
     return prep;
   }
 
@@ -510,8 +618,15 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   PageResidueRecord leftover[kMaxBatch];
   size_t leftover_count = 0;
   for (size_t i = 0; i < page_count; ++i) {
-    int e = txn.protect_page(pages[i].page, pages[i].original_prot);
-    if (e != 0) {
+    detail::VmaInfo live{};
+    if (!txn.page_vma(pages[i].page, live)) {
+      leftover[leftover_count++] = pages[i];
+      continue;
+    }
+    const int live_prot = detail::prot_of(live);
+    if (live_prot == pages[i].original_prot) continue;
+    if (live_prot != (pages[i].original_prot | detail::kProtWrite) ||
+        txn.protect_page(pages[i].page, pages[i].original_prot) != 0) {
       leftover[leftover_count++] = pages[i];
     }
   }
@@ -646,11 +761,7 @@ Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
       // System image: restore inside the linker callback (linker -> op order).
       Error result = Error::Make(ErrorCode::kImageInvalidated);
       bool matched = run_on_system_image(image, [&](const ImageView&) {
-        try {
-          result = do_restore(id, handle, /*image_live=*/true, reports, cap);
-        } catch (const std::bad_alloc&) {
-          result = Error::Make(ErrorCode::kOutOfMemory);
-        }
+        result = do_restore(id, handle, /*image_live=*/true, reports, cap);
       });
       if (!matched) {
         // The image is gone: consume the handle without touching memory.
@@ -665,64 +776,165 @@ Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
     return do_restore(id, handle, /*image_live=*/true, reports, cap);
   } catch (const std::bad_alloc&) {
     return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
   }
 }
-// abandon / query / forget_image
+// Import snapshots / abandon / query / forget_image
+
+namespace {
+template <typename Snapshot, typename Collect>
+Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metadata) {
+  if (image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  if (image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  // Catch allocation failures inside the callable as well: it runs inside a
+  // C loader callback for system images. Publish only a complete owning result.
+  auto collect = [&](const ImageView& live) -> Result<Snapshot> {
+    try {
+      auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
+      if (!inspected) return inspected.error();
+      return collect_metadata(inspected.value());
+    } catch (const std::bad_alloc&) {
+      return Error::Make(ErrorCode::kOutOfMemory);
+    } catch (const std::length_error&) {
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    }
+  };
+  try {
+    if (image.instance_token == 0) {
+      Result<Snapshot> result = Error::Make(ErrorCode::kImageInvalidated);
+      run_on_system_image(identity_of(image),
+                          [&](const ImageView& live) { result = collect(live); });
+      return result;
+    }
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return collect(image);
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  }
+}
+}  // namespace
+
+Result<ImportSnapshot> inspect_imports(const ImageView& image) {
+  return inspect_metadata<ImportSnapshot>(image, detail::snapshot_imports);
+}
+
+Result<VersionedImportSnapshot> inspect_versioned_imports(const ImageView& image) {
+  return inspect_metadata<VersionedImportSnapshot>(image, detail::snapshot_versioned_imports);
+}
+
+Result<VersionedImport> find_import(const ImageView& image, const ImportSelector& selector) {
+  auto invalid = detail::validate_selector(selector);
+  if (invalid) return invalid;
+  return inspect_metadata<VersionedImport>(
+      image, [&](const InspectedImage& inspected) -> Result<VersionedImport> {
+        auto snapshot = detail::snapshot_versioned_imports(inspected);
+        if (!snapshot) return snapshot.error();
+        auto selected = detail::select_import(snapshot.value(), selector);
+        if (!selected) return selected.error();
+        return std::move(snapshot.value().imports[selected.value()]);
+      });
+}
 
 Error abandon(HookHandle& handle) {
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
-  std::lock_guard<std::mutex> lock(detail::op_mutex());
-  Error e = Registry::instance().release(detail_api::id(handle));
-  if (!e) detail_api::set(handle, detail_api::invalid());
-  return e;
+  try {
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    Error e = Registry::instance().release(detail_api::id(handle));
+    if (!e) detail_api::set(handle, detail_api::invalid());
+    return e;
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  }
 }
+
+namespace {
+/// Fill `out` from the recorded slots, reading each live value only when
+/// `live_image` says the mapping can be trusted for this call.  Runs under the
+/// op lock (and, for a system image, inside the linker callback).
+void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* out, size_t cap) {
+  const size_t ps = detail::page_size();
+  for (size_t i = 0; i < n && i < cap && out != nullptr; ++i) {
+    out[i].address = recs[i].address;
+    out[i].value_before = recs[i].original;
+    out[i].value_observed = 0;
+    // kUntouched here means "the live value could not be read"; kInstalled
+    // means value_observed holds a genuine live read.  We never invent an
+    // observed value from the recorded replacement.
+    out[i].status = SlotStatus::kUntouched;
+    if (ps == 0 || !live_image) continue;
+    Txn txn(detail::active_ops(), ps);
+    uintptr_t one = recs[i].address;
+    if (!txn.prepare(&one, 1)) {
+      uintptr_t cur = 0;
+      if (txn.load(recs[i].address, cur)) {
+        out[i].value_observed = cur;
+        out[i].status = SlotStatus::kInstalled;
+      }
+    }
+  }
+}
+}  // namespace
 
 Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count) {
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
+  const uint64_t id = detail_api::id(handle);
   try {
-    std::lock_guard<std::mutex> lock(detail::op_mutex());
-    Registry& reg = Registry::instance();
-
+    // Snapshot the recorded slots, then read live values.  A system image's
+    // slots are read only inside the linker callback, so a concurrent dlclose
+    // cannot unmap them mid-read; an image no longer loaded reports only the
+    // recorded values.
     ImageIdentity image;
     SlotRecord recs[kMaxBatch];
     size_t n = 0;
-    Error snap = reg.snapshot(detail_api::id(handle), image, recs, kMaxBatch, &n);
-    if (snap) return snap;
-    if (n > kMaxBatch) n = kMaxBatch;
-    if (count != nullptr) *count = n;
-
-    const size_t ps = detail::page_size();
-    for (size_t i = 0; i < n && i < cap && out != nullptr; ++i) {
-      out[i].address = recs[i].address;
-      out[i].value_before = recs[i].original;
-      out[i].value_observed = 0;
-      // kUntouched here means "the live value could not be read"; kInstalled
-      // means value_observed holds a genuine live read.  We never invent an
-      // observed value from the recorded replacement.
-      out[i].status = SlotStatus::kUntouched;
-      if (ps != 0 && !image.invalidated) {
-        Txn txn(detail::active_ops(), ps);
-        uintptr_t one = recs[i].address;
-        if (!txn.prepare(&one, 1)) {
-          uintptr_t cur = 0;
-          if (txn.load(recs[i].address, cur)) {
-            out[i].value_observed = cur;
-            out[i].status = SlotStatus::kInstalled;
-          }
-        }
-      }
+    {
+      std::lock_guard<std::mutex> lock(detail::op_mutex());
+      Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
+      if (snap) return snap;
     }
+    if (n > kMaxBatch) n = kMaxBatch;
+
+    if (out == nullptr || cap == 0) {
+      // Count-only: no live read, so no image access or transaction pages.
+    } else if (image.instance_token == 0 && !image.invalidated) {
+      Error result = Error::Ok();
+      bool matched = run_on_system_image(image, [&](const ImageView&) {
+        // Re-snapshot under the op lock: the group may have changed or been
+        // released between the two lock acquisitions.
+        result = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
+        if (result) return;
+        if (n > kMaxBatch) n = kMaxBatch;
+        fill_query(recs, n, /*live_image=*/true, out, cap);
+      });
+      if (!matched) fill_query(recs, n, /*live_image=*/false, out, cap);
+      if (result) return result;
+    } else {
+      std::lock_guard<std::mutex> lock(detail::op_mutex());
+      Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
+      if (snap) return snap;
+      if (n > kMaxBatch) n = kMaxBatch;
+      fill_query(recs, n, !image.invalidated, out, cap);
+    }
+    if (count != nullptr) *count = n;
     return Error::Ok();
   } catch (const std::bad_alloc&) {
     return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
   }
 }
 
 Error forget_image(const ImageView& custom_image) {
   if (custom_image.instance_token == 0) return Error::Make(ErrorCode::kInvalidArgument);
-  std::lock_guard<std::mutex> lock(detail::op_mutex());
-  Registry::instance().forget_custom_image(identity_of(custom_image));
-  return Error::Ok();
+  try {
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    Registry::instance().forget_custom_image(identity_of(custom_image));
+    return Error::Ok();
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  }
 }
 
 }  // namespace yukiplt

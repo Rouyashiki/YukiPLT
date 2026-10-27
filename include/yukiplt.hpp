@@ -8,8 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <new>
+#include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
+
+#include "yukiplt.h"
 
 /// \brief Portable ELF type definitions for YukiPLT.
 ///
@@ -144,6 +148,39 @@ struct Elf64_Rela {
 
 // GNU extensions
 #define DT_GNU_HASH 0x6ffffef5
+#define DT_VERSYM 0x6ffffff0
+#define DT_VERDEF 0x6ffffffc
+#define DT_VERDEFNUM 0x6ffffffd
+#define DT_VERNEED 0x6ffffffe
+#define DT_VERNEEDNUM 0x6fffffff
+
+struct Elf64_Verneed {
+  Elf64_Half vn_version;
+  Elf64_Half vn_cnt;
+  Elf64_Word vn_file;
+  Elf64_Word vn_aux;
+  Elf64_Word vn_next;
+};
+struct Elf64_Vernaux {
+  Elf64_Word vna_hash;
+  Elf64_Half vna_flags;
+  Elf64_Half vna_other;
+  Elf64_Word vna_name;
+  Elf64_Word vna_next;
+};
+struct Elf64_Verdef {
+  Elf64_Half vd_version;
+  Elf64_Half vd_flags;
+  Elf64_Half vd_ndx;
+  Elf64_Half vd_cnt;
+  Elf64_Word vd_hash;
+  Elf64_Word vd_aux;
+  Elf64_Word vd_next;
+};
+struct Elf64_Verdaux {
+  Elf64_Word vda_name;
+  Elf64_Word vda_next;
+};
 
 // --- Relocation info macros ---
 #define ELF64_R_SYM(info) ((info) >> 32)
@@ -279,12 +316,14 @@ class Expected {
 
   Expected& operator=(const Expected& o) {
     if (this != &o) {
-      destroy();
-      has_value_ = o.has_value_;
-      if (has_value_)
-        new (&storage_.value) T(o.storage_.value);
-      else
-        new (&storage_.error) E(o.storage_.error);
+      // Copy first: an owning value (e.g. ImportSnapshot) can throw while
+      // copying. Destroying the old union member first would leave this
+      // object claiming a value whose construction never completed.
+      static_assert(
+          std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_constructible_v<E>,
+          "Expected copy assignment needs a non-throwing commit");
+      Expected copy(o);
+      *this = std::move(copy);
     }
     return *this;
   }
@@ -400,12 +439,16 @@ class Expected<void, E> {
 ///         // replacement.  Read `original` with an acquire load (see below)
 ///         // and cast it to the function type to call the original.
 ///     } else if (r.handle.valid()) {
-///         // kIndeterminate: not active, but recover with unhook()/abandon().
+///         // kIndeterminate: not cleanly installed; recover with
+///         // unhook()/abandon().
 ///     }
 ///     // Later:
 ///     yukiplt::unhook(r.handle);
 ///
 /// ## Semantics
+///
+/// - Android runtime support starts at API 23 (Android 6.0), ARM64 only.
+///   Android API 21 and 22 are not supported.
 ///
 /// - PLT hooks only intercept calls that go through the target image's GOT.
 ///   Direct calls within the defining library, dlsym-obtained pointers,
@@ -439,12 +482,14 @@ class Expected<void, E> {
 /// ## Lifecycle
 ///
 /// - The caller must keep the target image mapped until every handle for it is
-///   released or abandoned.  For a system-linker image, hook/unhook validate
+///   released or abandoned.  For a system-linker image, every call validates
 ///   the image under the dynamic linker's lock (dl_iterate_phdr) and never
-///   dereference a stale pointer; if the image is gone, the call returns
-///   kImageInvalidated.  For a custom (e.g. YukiLinker) image, set
-///   instance_token to a value unique to that load and call forget_image()
-///   before unmapping.
+///   dereferences a stale pointer; a view whose image is no longer loaded
+///   returns kImageInvalidated (kImageNotFound is only for name lookup that
+///   finds nothing).  For a custom (e.g. YukiLinker) image, set instance_token
+///   to a value unique to that load and call forget_image() before unmapping.
+///   A missing page in /proc/self/maps never invalidates a custom image by
+///   itself: the maps file is not an atomic snapshot.
 ///
 /// - Same-address reload is an ABA hazard: after dlclose + dlopen at the same
 ///   address, CAS cannot by itself prove the slot is still the same instance.
@@ -459,8 +504,24 @@ class Expected<void, E> {
 ///   replacement.  Do not unload the replacement's code until the caller has
 ///   established quiescence.
 ///
-/// Failure never returns "success".  On any failure before commit, nothing is
-/// modified.  See kIndeterminate for the one state where recovery is partial.
+/// ## Original-pointer outputs
+///
+/// - Every non-null out_original must be aligned for void* and distinct within
+///   one call; otherwise the call returns kInvalidArgument before taking any
+///   lock or writing anything.
+///
+/// - The library publishes each prior slot value to its out_original after all
+///   validation and page-protection raises have succeeded and before the first
+///   slot CAS, so a replacement can never run before its original is readable.
+///   A failure after that point (a CAS conflict that rolled back) may therefore
+///   leave a candidate original in *out_original.  That value does not mean the
+///   hook is installed and is never cleared.
+///
+/// Failure never returns "success".  A clean failure modifies nothing: no net
+/// GOT change, every page protection restored and no Registry ownership left.
+/// This guarantee covers neither out_original (see above) nor the transient
+/// protection change made during the attempt.  See kIndeterminate for the one
+/// state where recovery is partial.
 
 namespace yukiplt {
 
@@ -481,6 +542,82 @@ struct ImageView {
   const Elf64_Phdr* phdr_table;  ///< Program header table address.
   size_t phdr_count;             ///< Number of program headers.
   uint64_t instance_token = 0;   ///< 0 = system-linker image; else custom load id.
+};
+
+/// One named R_AARCH64_JUMP_SLOT record, copied from DT_JMPREL.
+/// Addresses and indices are diagnostic metadata, not an installation token.
+struct ImportInfo {
+  std::string symbol;
+  uint32_t symbol_index = 0;
+  size_t relocation_index = 0;
+  uintptr_t slot_address = 0;
+};
+
+/// Owning, read-only metadata snapshot. Strings survive image unloading;
+/// addresses do not. The snapshot neither pins the image nor owns any slots.
+struct ImportSnapshot {
+  std::vector<ImportInfo> imports;  ///< In DT_JMPREL order, including duplicate names.
+  size_t skipped_relocations = 0;   ///< Non-JUMP_SLOT or symbol-index-zero records.
+};
+
+// Copy owning JUMP_SLOT metadata without GOT access, permission changes or
+// ownership. No GLOB_DAT/APS2 scan; use inspect_versioned_imports for versions.
+// The three PLT tags must be unique and complete. Empty tables succeed; duplicate
+// non-NONE destinations or malformed metadata reject the entire snapshot.
+// Unsupported records are counted. This path is bounded by JMPREL size, without
+// the function-scan budget. System copying stays under the linker lock; callers
+// keep custom metadata stable. Allocation/size failures return errors, never exceptions.
+Result<ImportSnapshot> inspect_imports(const ImageView& image);
+
+enum class VersionSource : uint8_t { kNone, kNeeded, kDefined };
+
+/// Version metadata declared by this image, not proof of the bound provider.
+struct SymbolVersion {
+  std::string name;
+  std::string dependency;  ///< VERNEED's file; empty for definitions/no version.
+  uint16_t index = 1;      ///< Low 15 bits of VERSYM; 0/1 have no version name.
+  bool table_present = false;
+  bool hidden = false;  ///< VERSYM's high bit, not ELF symbol visibility.
+  VersionSource source = VersionSource::kNone;
+};
+
+struct VersionedImport {
+  ImportInfo import;
+  SymbolVersion version;
+};
+
+struct VersionedImportSnapshot {
+  std::vector<VersionedImport> imports;
+  size_t skipped_relocations = 0;
+};
+
+/// Like inspect_imports(), also validates/copies VERSYM, VERNEED and VERDEF.
+/// Missing version metadata is represented explicitly, not guessed from names.
+Result<VersionedImportSnapshot> inspect_versioned_imports(const ImageView& image);
+
+enum class VersionMatch : uint8_t { kAny, kUnversioned, kExact };
+enum class HiddenMatch : uint8_t { kAny, kNonHidden, kHidden };
+
+/// All supplied filters must match ONE slot. No fallback to another version.
+/// Strings are borrowed only during the API call. An empty version/dependency
+/// filter is invalid; nullptr means no dependency filter. kUnversioned matches
+/// absent VERSYM or indices 0/1. kAny never resolves ambiguity automatically.
+struct ImportSelector {
+  const char* symbol = nullptr;
+  VersionMatch version_match = VersionMatch::kAny;
+  const char* version = nullptr;  ///< Required only for kExact; otherwise null.
+  const char* dependency = nullptr;
+  HiddenMatch hidden = HiddenMatch::kAny;
+  size_t relocation_index = ~size_t{0};  ///< ~0: any DT_JMPREL index.
+};
+
+/// Read-only unique selection. Result addresses remain diagnostic snapshots.
+Result<VersionedImport> find_import(const ImageView& image, const ImportSelector& selector);
+
+struct SelectedHookRequest {
+  ImportSelector target;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
 };
 
 /// What happened to one slot in a hook/unhook/query.
@@ -574,6 +711,15 @@ HookResult hook(const ImageView& image, const char* symbol_name, void* replaceme
 HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
                       SlotReport* reports = nullptr);
 
+/// Exact selection with the same transaction/ownership/recovery and
+/// original-pointer output contract as hook()/hook_batch(). Re-inspects
+/// metadata under the lifetime lock; never accepts a raw snapshot address. A
+/// batch is limited to 64 distinct slots in one image.
+HookResult hook_import(const ImageView& image, const ImportSelector& selector, void* replacement,
+                       void** out_original, SlotReport* report = nullptr);
+HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
+                        SlotReport* reports = nullptr);
+
 // Restore owned replacement values by CAS; already-original values are done.
 // Never-written slots are Untouched with live values. Preserve third-party values
 // as conflicts. Roll back this attempt if any restore CAS loses a race.
@@ -601,6 +747,125 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
 // modifying memory. Its handles are consumed as ImageInvalidated on unhook.
 // System images are rejected. Call before unmapping the custom instance.
 Error forget_image(const ImageView& custom_image);
+
+enum class ImageMatch : uint8_t { kMainExecutable, kExactPath, kBasename, kLoadBias };
+struct ImageSelector {
+  ImageMatch match = ImageMatch::kMainExecutable;
+  const char* name = nullptr;
+  uintptr_t load_bias = 0;
+};
+struct NamedImage {
+  ImageView image;
+  std::string path;
+};
+
+/// Explicit matching of publicly enumerable system images, never implicit
+/// match-all. Empty matches return kImageNotFound. Paths are owned; ImageViews
+/// are not pinned. No promise of visibility into every linker namespace.
+Result<std::vector<NamedImage>> find_images(const ImageSelector& selector);
+
+struct HookTarget {
+  ImageView image;
+  ImportSelector import;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
+};
+struct PlannedTarget {
+  ImageView image;
+  VersionedImport selected;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
+};
+
+class HookSession;
+class HookPlan {
+ public:
+  const std::vector<PlannedTarget>& targets() const noexcept { return targets_; }
+
+ private:
+  friend Result<HookPlan> build_hook_plan(const HookTarget*, size_t, size_t*);
+  std::vector<PlannedTarget> targets_;
+};
+
+/// Resolve every target without writing GOT, outputs, permissions or Registry.
+/// Failure reports the first target index (~0 for an error not tied to one).
+/// Strings are copied. Same-slot targets and shared non-null outputs fail.
+/// At most 64 targets per identical ImageView; no cross-image atomicity.
+/// Caller keeps images, headers, replacements and output storage alive through
+/// installation/recovery; planning does not pin images or freeze GOT values.
+Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count,
+                                 size_t* failed_target = nullptr);
+
+enum class SessionState : uint8_t {
+  kPrepared,
+  kInstalled,
+  kInstallFailed,
+  kIndeterminate,
+  kRestoreFailed,
+  kReleased,
+  kInvalidated,
+  kAbandoned,
+};
+struct SessionTargetResult {
+  PlannedTarget target;
+  /// Prior slot value reported by the last install attempt, not a lifetime
+  /// guarantee.  After a failed attempt it may be a candidate original even
+  /// though nothing is installed; check the group's state.
+  void* original = nullptr;
+  SlotReport install_report;
+  SlotReport restore_report;
+};
+struct SessionImageResult {
+  ImageView image;
+  std::vector<size_t> target_indices;
+  HookHandle handle;
+  SessionState state = SessionState::kPrepared;
+  Error install_error;
+  Error restore_error;
+};
+struct SessionSummary {
+  size_t attempted = 0;
+  size_t succeeded = 0;
+  size_t failed = 0;
+  size_t retained = 0;  ///< Groups still holding ownership/recovery handles.
+  bool ok() const noexcept { return failed == 0; }
+};
+
+/// Caller serializes all operations AND result access on one session. Storage
+/// is allocated before any install. Destruction/move-overwrite does not unhook;
+/// live handles retain the core's warning behavior. Explicit unhook or abandon
+/// is required. Original outputs are caller-owned and distinct for each target.
+class HookSession {
+ public:
+  HookSession() = default;
+  HookSession(const HookSession&) = delete;
+  HookSession& operator=(const HookSession&) = delete;
+  HookSession(HookSession&&) noexcept = default;
+  HookSession& operator=(HookSession&&) noexcept = default;
+
+  const std::vector<SessionTargetResult>& targets() const noexcept { return targets_; }
+  const std::vector<SessionImageResult>& images() const noexcept { return images_; }
+
+  /// One transaction per image in first-appearance order. Continue after group
+  /// errors; no rollback across images. Retry only Prepared/InstallFailed.
+  /// A remaining Indeterminate/RestoreFailed group counts as failed and is
+  /// never overwritten: explicitly unhook/abandon it first.
+  SessionSummary install();
+  /// Reverse image order, attempt every valid handle despite earlier errors.
+  /// Failed handles remain retryable; invalidated images consume their handle.
+  SessionSummary unhook();
+  /// Drop all remaining ownership without touching slots or page protections.
+  SessionSummary abandon();
+
+ private:
+  friend Result<HookSession> prepare_session(const HookPlan&);
+  std::vector<SessionTargetResult> targets_;
+  std::vector<SessionImageResult> images_;
+};
+
+/// Copy a validated plan and preallocate every report/group before any write.
+/// Failure never leaves a partial session or any installed hook.
+Result<HookSession> prepare_session(const HookPlan& plan);
 
 }  // namespace yukiplt
 

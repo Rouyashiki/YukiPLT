@@ -2,9 +2,12 @@
 # Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
 set(YUKIPLT_SOURCES
+    c_api.cpp
     elf.cpp
+    imports.cpp
     memory.cpp
     registry.cpp
+    session.cpp
     yukiplt.cpp
 )
 
@@ -12,7 +15,8 @@ if(CMAKE_CROSSCOMPILING)
     add_library(yukiplt SHARED ${YUKIPLT_SOURCES})
     target_link_options(yukiplt PRIVATE -Wl,-z,max-page-size=16384 -Wl,-z,nodelete)
     install(TARGETS yukiplt LIBRARY DESTINATION lib COMPONENT production)
-    install(FILES "${PROJECT_SOURCE_DIR}/include/yukiplt.hpp"
+    install(FILES "${PROJECT_SOURCE_DIR}/include/yukiplt.h"
+    "${PROJECT_SOURCE_DIR}/include/yukiplt.hpp"
     DESTINATION include COMPONENT production)
     install(FILES "${PROJECT_SOURCE_DIR}/LICENSE" DESTINATION share/licenses/YukiPLT COMPONENT production)
 else()

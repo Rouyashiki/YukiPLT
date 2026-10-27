@@ -4,12 +4,163 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <thread>
 #include <vector>
 
+#include "elf_builder.hpp"
+#include "overrides.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
+#include "yukiplt.h"
+#include "yukiplt.hpp"
+
+namespace contracts_checks {
+using namespace yukiplt;
+
+namespace {
+
+struct ContractFixture : testing::Test {
+  test::ElfBuilder::BuiltImage image;
+  uintptr_t first_page = 0;
+  uintptr_t end_page = 0;
+
+  bool writable = false;
+
+  bool hide_image = false;
+  int fail_raise = 0;
+  int fail_restore = 0;
+  size_t protect_calls = 0;
+  size_t maps_calls = 0;
+  size_t cas_calls = 0;
+
+  size_t race_before_cas = 0;
+  uintptr_t race_value = 0;
+  void* outputs[2]{};
+
+  void* output_at_first_cas = nullptr;
+  detail::PlatformOps ops{
+      [](void* p, uintptr_t, size_t, int prot) {
+        auto& self = *static_cast<ContractFixture*>(p);
+        ++self.protect_calls;
+        const bool raise = (prot & detail::kProtWrite) != 0;
+        if (raise && self.fail_raise != 0) return self.fail_raise;
+        if (!raise && self.fail_restore != 0) return self.fail_restore;
+        self.writable = raise;
+        return 0;
+      },
+      [](void* p, detail::MapsCoverage& coverage) {
+        auto& self = *static_cast<ContractFixture*>(p);
+        ++self.maps_calls;
+        char line[128];
+        if (!self.hide_image) {
+          std::snprintf(line, sizeof(line), "%zx-%zx %s 00000000 00:00 0",
+                        static_cast<size_t>(self.first_page), static_cast<size_t>(self.end_page),
+                        self.writable ? "rw-p" : "r--p");
+          coverage.feed_line(line, std::strlen(line));
+        }
+        return coverage.finish();
+      },
+      [](void*, uintptr_t address) {
+        return __atomic_load_n(reinterpret_cast<uintptr_t*>(address), __ATOMIC_ACQUIRE);
+      },
+      [](void* p, uintptr_t address, uintptr_t* expected, uintptr_t desired) {
+        auto& self = *static_cast<ContractFixture*>(p);
+        if (self.cas_calls == 0)
+          self.output_at_first_cas = __atomic_load_n(&self.outputs[0], __ATOMIC_ACQUIRE);
+        if (++self.cas_calls == self.race_before_cas)
+          __atomic_store_n(reinterpret_cast<uintptr_t*>(self.image.got_slot_addr(1)),
+                           self.race_value, __ATOMIC_RELEASE);
+        return __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(address), expected, desired,
+                                           false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      },
+      this};
+
+  void SetUp() override {
+    test::ElfBuilder builder;
+    builder.add_symbol("alpha", 1).add_symbol("beta", 2).add_jump_slot(1).add_jump_slot(2);
+    image = builder.build();
+    const size_t ps = detail::page_size();
+    ASSERT_NE(ps, 0u);
+    first_page = image.load_bias() & ~(ps - 1);
+    end_page = (image.load_bias() + image.buffer.size() + ps - 1) & ~(ps - 1);
+    set_slot(0, 0x1000);
+    set_slot(1, 0x2000);
+    detail::set_active_ops(&ops);
+  }
+  void TearDown() override { detail::set_active_ops(nullptr); }
+
+  ImageView view(uint64_t token = 0x51) const {
+    return {image.load_bias(), image.phdr_table(), image.phdr_count, token};
+  }
+  uintptr_t slot(size_t i) const {
+    return __atomic_load_n(reinterpret_cast<uintptr_t*>(image.got_slot_addr(i)), __ATOMIC_ACQUIRE);
+  }
+  void set_slot(size_t i, uintptr_t value) {
+    __atomic_store_n(reinterpret_cast<uintptr_t*>(image.got_slot_addr(i)), value, __ATOMIC_RELEASE);
+  }
+  void reset_counts() { protect_calls = maps_calls = cas_calls = 0; }
+};
+
+void* const kReplA = reinterpret_cast<void*>(uintptr_t{0xA000});
+void* const kReplB = reinterpret_cast<void*>(uintptr_t{0xB000});
+
+}  // namespace
+
+TEST_F(ContractFixture, SuccessPublishesBeforeTheReplacementIsReachable) {
+  output_at_first_cas = reinterpret_cast<void*>(uintptr_t{1});
+  auto result = hook_import(view(), {"alpha"}, kReplA, &outputs[0]);
+  ASSERT_TRUE(result.ok());
+
+  EXPECT_EQ(output_at_first_cas, reinterpret_cast<void*>(uintptr_t{0x1000}));
+  EXPECT_EQ(slot(0), reinterpret_cast<uintptr_t>(kReplA));
+  EXPECT_TRUE(unhook(result.handle).ok());
+  EXPECT_EQ(slot(0), 0x1000u);
+}
+
+TEST_F(ContractFixture, CustomImageMissingFromMapsKeepsHandleUntilForgotten) {
+  auto result = hook_import(view(0x61), {"alpha"}, kReplA, &outputs[0]);
+  ASSERT_TRUE(result.ok());
+  hide_image = true;
+  EXPECT_EQ(unhook(result.handle).code, ErrorCode::kOutOfBounds);
+  ASSERT_TRUE(result.handle.valid());
+  EXPECT_EQ(slot(0), reinterpret_cast<uintptr_t>(kReplA));
+
+  hide_image = false;
+  EXPECT_EQ(hook_import(view(0x61), {"alpha"}, kReplB, nullptr).error.code,
+            ErrorCode::kAlreadyHooked);
+
+  EXPECT_TRUE(forget_image(view(0x62)).ok());
+  hide_image = true;
+  EXPECT_EQ(unhook(result.handle).code, ErrorCode::kOutOfBounds);
+  ASSERT_TRUE(result.handle.valid());
+
+  EXPECT_TRUE(forget_image(view(0x61)).ok());
+  EXPECT_EQ(unhook(result.handle).code, ErrorCode::kImageInvalidated);
+  EXPECT_FALSE(result.handle.valid());
+  EXPECT_EQ(slot(0), reinterpret_cast<uintptr_t>(kReplA));
+}
+
+TEST_F(ContractFixture, ResidueAlreadyRestoredByThirdPartyNeedsNoProtectCall) {
+  fail_restore = EPERM;
+  auto result = hook_import(view(0x81), {"alpha"}, kReplA, &outputs[0]);
+  ASSERT_EQ(result.error.code, ErrorCode::kIndeterminate);
+  ASSERT_TRUE(result.handle.valid());
+  ASSERT_TRUE(writable);
+
+  writable = false;
+  set_slot(0, 0x1000);
+  fail_restore = 0;
+  reset_counts();
+  EXPECT_TRUE(unhook(result.handle).ok());
+  EXPECT_EQ(protect_calls, 0u);
+  EXPECT_FALSE(result.handle.valid());
+}
+
+}  // namespace contracts_checks
 
 namespace concurrency_checks {
 using namespace yukiplt;

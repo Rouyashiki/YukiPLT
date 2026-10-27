@@ -419,7 +419,7 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   Error maps = ops_.read_maps(ops_.ctx, coverage);
   if (maps) return maps;
 
-  // VMA policy (AGENTS 5.3): only private, non-executable, readable mappings.
+  // VMA policy: only private, non-executable, readable mappings.
   // r--p is raised to rw-p for the write and restored; rw-p is written as is.
   for (size_t i = 0; i < unique; ++i) {
     const VmaInfo& v = vmas[i];
@@ -500,7 +500,8 @@ void Txn::restore_pages(CommitResult& result) noexcept {
   }
 }
 
-CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode) noexcept {
+CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode, void (*before_cas)(void*),
+                         void* ctx) noexcept {
   CommitResult result;
   if (!prepared_ || committed_ || ops == nullptr || count == 0) {
     result.invalid = true;
@@ -538,7 +539,10 @@ CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode) noexcept {
     p.raised = true;
   }
 
-  // 2. CAS.
+  // 2. Publish caller data now that no raise can fail any more.
+  if (before_cas != nullptr) before_cas(ctx);
+
+  // 3. CAS.
   if (mode == CommitMode::kAllOrNothing) {
     for (size_t i = 0; i < count; ++i) {
       SlotOp& op = ops[i];
@@ -581,7 +585,7 @@ CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode) noexcept {
     }
   }
 
-  // 3. Put back every page this commit raised.
+  // 4. Put back every page this commit raised.
   restore_pages(result);
 
   result.all_committed = true;

@@ -31,6 +31,10 @@ const Registry::Record* Registry::resolve(uint64_t id) const noexcept {
 bool Registry::slot_is_live(uintptr_t addr) const noexcept {
   for (const Record& r : records_) {
     if (!r.in_use) continue;
+    // An invalidated group (its image was forgotten) no longer owns its slots:
+    // the caller has relinquished them, so a new instance may be hooked at the
+    // same address.  The old group's handle still unhooks to kImageInvalidated.
+    if (r.image.invalidated) continue;
     for (const SlotRecord& s : r.slots) {
       if (s.address == addr) return true;
     }
@@ -55,15 +59,24 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
   } else {
     index = static_cast<uint32_t>(records_.size());
     records_.push_back(Record{});
+    // Keep the free list able to hold every record without a later allocation,
+    // so freeing a record (finish_restore/release) never throws.
+    free_list_.reserve(records_.size());
   }
 
   Record& r = records_[index];
   r.in_use = true;
   r.state = GroupState::kPrepared;
   r.image = image;
+  // Reserve now, before any memory is modified, so that recording the group's
+  // slots and page residue after the commit cannot throw bad_alloc and leave
+  // the record half-updated (AGENTS 4.4 / kOutOfMemory contract).  Every
+  // residual page is a slot page, so `count` entries bound the residue too.
   r.slots.clear();
-  for (size_t i = 0; i < count; ++i) r.slots.push_back(slots[i]);
+  r.slots.reserve(count);
   r.residue.clear();
+  r.residue.reserve(count);
+  for (size_t i = 0; i < count; ++i) r.slots.push_back(slots[i]);
   return make_id(r.generation, index);
 }
 
@@ -171,6 +184,18 @@ size_t Registry::forget_custom_image(const ImageIdentity& image) {
 bool Registry::is_installed(uint64_t id) const {
   const Record* r = resolve(id);
   return r != nullptr && r->state == GroupState::kInstalled;
+}
+
+bool Registry::owns_live_replacement(uint64_t id) const {
+  const Record* r = resolve(id);
+  if (r == nullptr) return false;
+  if (r->state == GroupState::kInstalled) return true;
+  if (r->state == GroupState::kIndeterminate) {
+    for (const SlotRecord& s : r->slots) {
+      if (s.ever_written) return true;
+    }
+  }
+  return false;
 }
 
 uintptr_t Registry::first_slot_of(uint64_t id) const {

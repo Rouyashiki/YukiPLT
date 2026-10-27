@@ -26,6 +26,7 @@ add_library(yukiplt_regression_core STATIC
     "${YUKIPLT_ROOT}/src/memory.cpp"
     "${YUKIPLT_ROOT}/src/registry.cpp"
     "${YUKIPLT_ROOT}/src/yukiplt.cpp"
+    "${YUKIPLT_ROOT}/tests/overrides.cpp"
 )
 target_compile_features(yukiplt_regression_core PUBLIC cxx_std_17)
 set_target_properties(yukiplt_regression_core PROPERTIES CXX_EXTENSIONS OFF)
@@ -43,3 +44,8 @@ foreach(target IN ITEMS yukiplt_regressions)
     set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
     gtest_discover_tests(${target} PROPERTIES TIMEOUT 60)
 endforeach()
+
+# Fault injection wraps cross-unit runtime calls without production switches.
+target_link_options(yukiplt_regression_core INTERFACE
+    -Wl,--wrap=_ZN7yukiplt6detail10active_opsEv
+    -Wl,--wrap=_ZN7yukiplt6detail23active_image_enumeratorEv)

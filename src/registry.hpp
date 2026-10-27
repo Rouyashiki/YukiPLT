@@ -39,6 +39,11 @@ struct SlotRecord {
   uintptr_t address = 0;
   uintptr_t original = 0;     ///< Value before we installed (what unhook restores).
   uintptr_t replacement = 0;  ///< Value we installed.
+  /// Whether our replacement was ever actually written to this slot (the CAS
+  /// committed, even if later rolled back or left by a failed rollback).  False
+  /// means the slot still holds whatever it held before us — we never owned its
+  /// contents — so a restore has nothing to undo for it.
+  bool ever_written = false;
 };
 
 /// A page a group left raised to writable but could not restore.
@@ -101,6 +106,10 @@ class Registry {
 
   /// Diagnostics.
   bool is_installed(uint64_t id) const;
+  /// True if the group is Installed, or Indeterminate with a slot whose
+  /// contents are still our replacement (ever_written) — i.e. dropping the
+  /// handle would strand a live replacement.
+  bool owns_live_replacement(uint64_t id) const;
   uintptr_t first_slot_of(uint64_t id) const;
   size_t live_count() const;
 

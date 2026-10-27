@@ -395,10 +395,12 @@ class Expected<void, E> {
 ///
 ///     void* original = nullptr;
 ///     auto r = yukiplt::hook(image, "target_func", (void*)replacement, &original);
-///     if (r.handle.valid()) {
+///     if (r.ok()) {
 ///         // Hook is active.  Calls through the image's PLT now go to
 ///         // replacement.  Read `original` with an acquire load (see below)
 ///         // and cast it to the function type to call the original.
+///     } else if (r.handle.valid()) {
+///         // kIndeterminate: not active, but recover with unhook()/abandon().
 ///     }
 ///     // Later:
 ///     yukiplt::unhook(r.handle);
@@ -537,12 +539,19 @@ class HookHandle {
 };
 
 /// Result of a hook/hook_batch: an error and, on success, an owning handle.
+///
+/// `error.ok()` is the single source of truth for success.  A valid handle is
+/// returned on success (the hook is active) and, exceptionally, on
+/// kIndeterminate — where the hook is NOT fully active but the handle must be
+/// kept so the caller can recover (unhook) or relinquish (abandon) the
+/// partially-applied state.  On every other error the handle is invalid.
 struct HookResult {
   Error error;
   HookHandle handle;
 
-  /// Convenience: true when a handle was produced.
-  [[nodiscard]] bool ok() const noexcept { return handle.valid(); }
+  /// True only on a clean install (error.ok()).  kIndeterminate is not ok(),
+  /// even though it carries a valid handle.
+  [[nodiscard]] bool ok() const noexcept { return error.ok(); }
 };
 
 // Linux/Android loader lookup: null/empty selects the main executable via

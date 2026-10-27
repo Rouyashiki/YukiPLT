@@ -605,4 +605,5 @@ size_t Txn::residue(PageResidue* out, size_t cap) const noexcept {
   return n;
 }
 
+const PlatformOps& active_ops() noexcept { return system_ops(); }
 }  // namespace yukiplt::detail

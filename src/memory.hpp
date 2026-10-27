@@ -259,6 +259,9 @@ size_t page_size() noexcept;
 /// transaction can reach a write.
 const PlatformOps& system_ops() noexcept;
 
+/// Platform operations used by public entry points.
+const PlatformOps& active_ops() noexcept;
+
 // Per-copy operation lock serializing maps, permissions, slots and Registry.
 // Lock order is linker -> op; never enter the loader while holding op.
 // Other library copies and third-party writers remain independent. Never destroyed.

@@ -189,7 +189,7 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
   if (id == Registry::kInvalidId)
     return {Error::Make(ErrorCode::kAlreadyHooked), detail_api::make(detail_api::invalid())};
 
-  Txn txn(detail::system_ops(), ps);
+  Txn txn(detail::active_ops(), ps);
   Error prep = txn.prepare(slot_addrs, planned.size());
   if (prep) {
     reg.drop(id);
@@ -213,8 +213,14 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
     ops[i].desired = planned[i].replacement;
   }
   for (size_t i = 0; i < planned.size(); ++i) {
-    if (planned[i].out_original != nullptr)
-      *planned[i].out_original = reinterpret_cast<void*>(planned[i].original);
+    if (planned[i].out_original != nullptr) {
+      // Release store: the replacement reads *out_original with an acquire load
+      // (documented), and the commit's release CAS publishes this write.  Using
+      // an atomic store (not a plain store) keeps it race-free under the C++
+      // model when a replacement on another thread is already reading it.
+      __atomic_store_n(planned[i].out_original, reinterpret_cast<void*>(planned[i].original),
+                       __ATOMIC_RELEASE);
+    }
     // Update the registry's recorded original now that it is known.
     recs[i].original = planned[i].original;
   }
@@ -222,40 +228,51 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
   CommitResult r = txn.commit(ops, planned.size(), CommitMode::kAllOrNothing);
   write_reports(reports, report_cap, planned, ops, planned.size());
 
-  if (r.raise_errno != 0) {
-    reg.drop(id);
-    return {Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
-            detail_api::make(detail_api::invalid())};
+  // Pages this commit raised but could not restore.  While any such page
+  // exists, the process has a page that is more permissive than we found it, so
+  // we must keep a record of it and hand back a handle to recover it — never
+  // "drop and claim nothing was modified".
+  PageResidueRecord pr[kMaxBatch];
+  detail::PageResidue res[kMaxBatch];
+  size_t pn = 0;
+  {
+    size_t raised = txn.residue(res, kMaxBatch);
+    for (size_t i = 0; i < raised && pn < kMaxBatch; ++i) {
+      pr[pn].page = res[i].page;
+      pr[pn].original_prot = res[i].original_prot;
+      ++pn;
+    }
+  }
+  for (size_t i = 0; i < planned.size(); ++i) {
+    recs[i].original = planned[i].original;
+    // The slot's contents are ours only if the CAS committed (kCommitted) or
+    // committed and then failed to roll back (kRollbackFailed).  A conflict or a
+    // clean rollback means the slot never held our replacement.
+    SlotOutcome o = ops[i].outcome;
+    recs[i].ever_written = (o == SlotOutcome::kCommitted || o == SlotOutcome::kRollbackFailed);
   }
 
-  if (r.all_committed && r.pages_restored) {
-    // Record the final originals and mark installed.
+  const bool clean_success = r.all_committed && r.pages_restored && pn == 0;
+  if (clean_success) {
     reg.finish_restore(id, /*released=*/false, GroupState::kPrepared, recs, planned.size(), nullptr,
                        0);
     reg.mark_installed(id);
     return {Error::Ok(), detail_api::make(id)};
   }
 
-  if (r.rollback_failed || !r.pages_restored) {
-    // Partial recovery: keep the group, record actual values and page residue.
-    for (size_t i = 0; i < planned.size(); ++i) {
-      recs[i].original = planned[i].original;
-      // The slot currently holds observed; replacement stays what we tried.
-    }
-    PageResidueRecord pr[kMaxBatch];
-    detail::PageResidue res[kMaxBatch];
-    size_t pn = txn.residue(res, kMaxBatch);
-    if (pn > kMaxBatch) pn = kMaxBatch;
-    for (size_t i = 0; i < pn; ++i) {
-      pr[i].page = res[i].page;
-      pr[i].original_prot = res[i].original_prot;
-    }
+  // Not a clean success.  If a page is stuck or a rollback failed, recovery
+  // state must be kept: Indeterminate with a valid handle.
+  if (pn > 0 || r.rollback_failed) {
     reg.mark_indeterminate(id, recs, planned.size(), pr, pn);
     return {Error::Make(ErrorCode::kIndeterminate), detail_api::make(id)};
   }
 
-  // A clean conflict: everything rolled back, pages restored, nothing installed.
+  // Every raised page was restored and no rollback failed, so nothing is left
+  // modified: free the group and report the first cause.
   reg.drop(id);
+  if (r.raise_errno != 0)
+    return {Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
+            detail_api::make(detail_api::invalid())};
   return {Error::Make(ErrorCode::kSlotOwnershipConflict), detail_api::make(detail_api::invalid())};
 }
 
@@ -277,7 +294,9 @@ void HookHandle::warn_if_installed() const noexcept {
   if (id_ == kInvalid) return;
   std::lock_guard<std::mutex> lock(detail::op_mutex());
   auto& reg = Registry::instance();
-  if (reg.is_installed(id_)) {
+  // Warn whenever a dropped handle still owns a live replacement — Installed, or
+  // Indeterminate with a slot whose contents are ours — not just Installed.
+  if (reg.owns_live_replacement(id_)) {
     std::fprintf(stderr,
                  "[YukiPLT] WARNING: HookHandle dropped while hook is still "
                  "installed (slot 0x%zx)\n",
@@ -418,6 +437,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     return begin;
   }
   if (slot_count > kMaxBatch) slot_count = kMaxBatch;
+  if (page_count > kMaxBatch) page_count = kMaxBatch;
 
   // A system image that we could not find under the linker lock is gone.
   if (!image_live) {
@@ -438,13 +458,21 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   for (size_t i = 0; i < slot_count; ++i) slot_addrs[i] = recs[i].address;
   for (size_t i = 0; i < page_count; ++i) extra_pages[i] = pages[i].page;
 
-  Txn txn(detail::system_ops(), ps);
+  Txn txn(detail::active_ops(), ps);
   Error prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
                            page_count > 0 ? extra_pages : nullptr, page_count);
   if (prep) {
-    // Could not even map the slots.  If the whole image page is gone, treat it
-    // as invalidated; otherwise keep the handle for a retry.
-    if (prep.code == ErrorCode::kOutOfBounds || prep.code == ErrorCode::kVmaUnavailable) {
+    // A maps read that failed (kVmaUnavailable) is always transient — a failed
+    // open() or an inconsistent multi-read snapshot never proves the image is
+    // gone — so keep the handle and every recorded slot/page for a retry.
+    //
+    // kOutOfBounds (a slot page no longer mapped) means different things by
+    // image kind.  For a system image we are inside the linker lock, so the
+    // image is present and this too is transient.  For a CUSTOM image the
+    // caller's contract is "keep it mapped until released"; an unmapped page
+    // means that contract is broken / the image was discarded, so we treat it
+    // as invalidated and consume the handle without touching memory.
+    if (image.instance_token != 0 && prep.code == ErrorCode::kOutOfBounds) {
       reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
       detail_api::set(handle, detail_api::invalid());
       return Error::Make(ErrorCode::kImageInvalidated);
@@ -459,6 +487,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   size_t op_count = 0;
   bool any_foreign = false;
   for (size_t i = 0; i < slot_count; ++i) {
+    if (!recs[i].ever_written) continue;
     uintptr_t cur = 0;
     txn.load(recs[i].address, cur);
     if (cur == recs[i].replacement) {
@@ -471,20 +500,20 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     }
   }
 
-  // Put back any residual raised page even if no slot needs a CAS.
-  bool restore_ok = true;
-  int restore_errno = 0;
-  for (size_t i = 0; i < page_count; ++i) {
-    int e = txn.protect_page(pages[i].page, pages[i].original_prot);
-    if (e != 0) {
-      restore_ok = false;
-      if (restore_errno == 0) restore_errno = e;
-    }
-  }
-
   CommitResult r{};
   if (op_count > 0) {
     r = txn.commit(ops, op_count, CommitMode::kAllOrNothing);
+  }
+
+  // Restore residual pages after CAS using live maps: accept original protection,
+  // restore raised protection, and retain conflicts with third-party protection.
+  PageResidueRecord leftover[kMaxBatch];
+  size_t leftover_count = 0;
+  for (size_t i = 0; i < page_count; ++i) {
+    int e = txn.protect_page(pages[i].page, pages[i].original_prot);
+    if (e != 0) {
+      leftover[leftover_count++] = pages[i];
+    }
   }
 
   // Unhook CAS: Committed restores original; RolledBack reinstalls replacement;
@@ -501,12 +530,22 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     }
     // Was this slot part of the CAS set?
     bool was_op = oi < op_count && ops[oi].slot == recs[i].address;
-    if (was_op) {
+    if (!recs[i].ever_written) {
+      // We never owned this slot's contents, so there is nothing to restore and
+      // it cannot be a conflict that keeps the group alive.
+      st = SlotStatus::kRestored;
+    } else if (was_op) {
       SlotOutcome o = ops[oi].outcome;
       observed = ops[oi].observed;
-      st = (o == SlotOutcome::kCommitted || o == SlotOutcome::kRolledBack) ? SlotStatus::kRestored
-                                                                           : to_status(o);
-      if (o != SlotOutcome::kCommitted && o != SlotOutcome::kRolledBack) all_restored = false;
+      if (o == SlotOutcome::kCommitted) {
+        st = SlotStatus::kRestored;
+      } else if (o == SlotOutcome::kRolledBack) {
+        st = SlotStatus::kRolledBack;  // our replacement is back in the slot
+        all_restored = false;
+      } else {
+        st = to_status(o);
+        all_restored = false;
+      }
       ++oi;
     } else {
       // Not CAS'd: either already original (restored) or foreign (conflict).
@@ -526,21 +565,28 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     }
   }
 
-  if (r.raise_errno != 0) {
-    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, pages, page_count);
-    return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
-  }
-
-  // Recompute remaining residue after this attempt.
+  // Merge any still-unrestored carried-in page with the pages this attempt
+  // raised but could not restore, so a page is never dropped from the record.
   PageResidueRecord new_pages[kMaxBatch];
+  size_t pn = 0;
   detail::PageResidue res[kMaxBatch];
-  size_t pn = txn.residue(res, kMaxBatch);
-  if (pn > kMaxBatch) pn = kMaxBatch;
-  for (size_t i = 0; i < pn; ++i) {
-    new_pages[i].page = res[i].page;
-    new_pages[i].original_prot = res[i].original_prot;
+  size_t raised = txn.residue(res, kMaxBatch);
+  for (size_t i = 0; i < raised && pn < kMaxBatch; ++i) {
+    new_pages[pn].page = res[i].page;
+    new_pages[pn].original_prot = res[i].original_prot;
+    ++pn;
   }
-  bool pages_clean = r.pages_restored && restore_ok && pn == 0;
+  for (size_t i = 0; i < leftover_count && pn < kMaxBatch; ++i) {
+    bool dup = false;
+    for (size_t j = 0; j < pn; ++j) {
+      if (new_pages[j].page == leftover[i].page) {
+        dup = true;
+        break;
+      }
+    }
+    if (!dup) new_pages[pn++] = leftover[i];
+  }
+  const bool pages_clean = r.pages_restored && pn == 0;
 
   if (all_restored && pages_clean && !rollback_failed) {
     reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
@@ -548,11 +594,19 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     return Error::Ok();
   }
 
+  // A page left writable (pn > 0) or a failed rollback is partial recovery:
+  // kIndeterminate, consistent with install().  This takes precedence over a
+  // raise errno, since a stuck page is the more serious residual state.
   if (rollback_failed || !pages_clean) {
     reg.finish_restore(id, false, GroupState::kIndeterminate, recs, slot_count, new_pages, pn);
-    if (!restore_ok && restore_errno != 0)
-      return Error::Sys(ErrorCode::kIndeterminate, restore_errno);
     return Error::Make(ErrorCode::kIndeterminate);
+  }
+
+  if (r.raise_errno != 0) {
+    // A page could not be raised, but every page we did raise was restored, so
+    // nothing is left writable.  No slot was written; keep the handle to retry.
+    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, nullptr, 0);
+    return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
   }
 
   // Slots left as a third party's value: keep ownership for a later retry.
@@ -641,15 +695,20 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
     for (size_t i = 0; i < n && i < cap && out != nullptr; ++i) {
       out[i].address = recs[i].address;
       out[i].value_before = recs[i].original;
-      out[i].value_observed = recs[i].replacement;
+      out[i].value_observed = 0;
+      // kUntouched here means "the live value could not be read"; kInstalled
+      // means value_observed holds a genuine live read.  We never invent an
+      // observed value from the recorded replacement.
       out[i].status = SlotStatus::kUntouched;
-      // Best-effort live read of the slot via a one-page transaction.
       if (ps != 0 && !image.invalidated) {
-        Txn txn(detail::system_ops(), ps);
+        Txn txn(detail::active_ops(), ps);
         uintptr_t one = recs[i].address;
         if (!txn.prepare(&one, 1)) {
           uintptr_t cur = 0;
-          if (txn.load(recs[i].address, cur)) out[i].value_observed = cur;
+          if (txn.load(recs[i].address, cur)) {
+            out[i].value_observed = cur;
+            out[i].status = SlotStatus::kInstalled;
+          }
         }
       }
     }

@@ -9,7 +9,6 @@
 #include <mutex>
 
 #include "common.hpp"
-#include "elf.hpp"
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail {
@@ -272,21 +271,6 @@ const PlatformOps& active_ops() noexcept;
 // Lock order is linker -> op; never enter the loader while holding op.
 // Other library copies and third-party writers remain independent. Never destroyed.
 std::mutex& op_mutex() noexcept;
-
-/// Atomically replace a GOT slot value using CAS with page permission handling.
-/// Single-slot wrapper over Txn; acquires op_mutex().
-///
-/// Errors:
-///   - kInvalidArgument      slot not native-pointer aligned.
-///   - kOutOfBounds          slot not inside a writable PT_LOAD segment of
-///                           `image`, or no single VMA covers its page.
-///   - kVmaUnavailable       /proc/self/maps could not be read or parsed.
-///   - kSlotOwnershipConflict  the slot did not hold expected_old (CAS failed).
-///   - kPermissionDenied     mapping refused by policy, or mprotect failed
-///                           (with errno); also returned if the write committed
-///                           but the page protection could not be restored.
-Expected<void, Error> patch_slot(uintptr_t slot_addr, uintptr_t expected_old, uintptr_t desired_new,
-                                 const InspectedImage& image);
 
 }  // namespace yukiplt::detail
 

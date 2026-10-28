@@ -197,6 +197,7 @@ yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle* handle, yukiplt_c_slot_r
     size_t count = 0;
     const size_t cap = std::min(capacity, kLimit);
     Error result = query(borrowed.value, output ? reports : nullptr, cap, &count);
+    if (result) return result;
     if (total) *total = count;
     copy_reports(output, reports, std::min(cap, count));
     return result;

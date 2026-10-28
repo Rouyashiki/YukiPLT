@@ -303,6 +303,7 @@ struct FuncInstallFixture : testing::Test {
   uintptr_t end_page = 0;
   bool writable = false;
   size_t protect_calls = 0;
+  size_t fail_protect_at = 0;
   size_t maps_calls = 0;
   size_t cas_calls = 0;
 
@@ -315,6 +316,7 @@ struct FuncInstallFixture : testing::Test {
       [](void* p, uintptr_t, size_t, int prot) {
         auto& self = *static_cast<FuncInstallFixture*>(p);
         ++self.protect_calls;
+        if (self.protect_calls == self.fail_protect_at) return EACCES;
         self.writable = (prot & detail::kProtWrite) != 0;
         return 0;
       },
@@ -405,6 +407,22 @@ TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
   EXPECT_EQ(cas_calls, 0u);
   EXPECT_EQ(maps_calls, 0u);
   EXPECT_EQ(live_groups(), baseline);
+}
+
+TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
+  ElfBuilder b;
+  b.add_symbol("weak", 1)
+      .set_symbol_type(1, STT_FUNC, STB_WEAK)
+      .set_symbol_undefined(1)
+      .add_jump_slot(1);
+  set_backing(b.build());
+  wr(image.got_slot_addr(0), 0);
+  auto result =
+      hook_function_import(view(), sel("weak", kSourceJmprel, kTypeJumpSlot), kReplA, &outputs[0]);
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(outputs[0], nullptr);
+  EXPECT_FALSE(unhook(result.handle));
+  EXPECT_EQ(rd(image.got_slot_addr(0)), 0u);
 }
 
 }  // namespace function_imports_checks

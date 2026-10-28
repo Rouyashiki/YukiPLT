@@ -141,6 +141,8 @@ TEST(ImportAllocation, FailedInstallNeverStrandsOwnershipOrPublishesOriginals) {
 
 namespace {
 struct RuleOomFixture {
+  bool fail_second_cache = false;
+  size_t enumerate_calls = 0;
   test::ElfBuilder::BuiltImage image;
   std::string path = "liboom.so";
   char maps[128]{};
@@ -195,6 +197,7 @@ struct RuleOomFixture {
     try {
       std::vector<yukiplt::NamedImage> out;
       out.push_back({current->view(), current->path});
+      if (++current->enumerate_calls == 2 && current->fail_second_cache) fail_after = 0;
       return out;
     } catch (const std::bad_alloc&) {
       return yukiplt::Error::Make(yukiplt::ErrorCode::kOutOfMemory);
@@ -203,3 +206,29 @@ struct RuleOomFixture {
 };
 RuleOomFixture* RuleOomFixture::current = nullptr;
 }  // namespace
+
+TEST(ImportAllocation, RefreshCachePreparationFailureNeverPartiallyInstallsEitherOverload) {
+  for (bool detailed : {false, true}) {
+    RuleOomFixture fixture;
+    RuleSet rules;
+    void* originals[3]{};
+    size_t i = 0;
+    for (const char* name : {"a.so", "b.so", "c.so"}) {
+      ASSERT_TRUE(rules.add_rule({ImageMatch::kBasename, name}, ImportSelector{"target"},
+                                 reinterpret_cast<void*>(uintptr_t{0xa000}), &originals[i++], 1));
+    }
+    fixture.fail_second_cache = true;
+    RuleOperationReport report;
+    auto result = detailed ? rules.refresh(report) : rules.refresh();
+    fail_after = -1;
+    EXPECT_EQ(result.attempted, 0u);
+    EXPECT_EQ(result.failed, 1u);
+    EXPECT_EQ(result.retained, 0u);
+    EXPECT_TRUE(rules.bindings().empty());
+    EXPECT_EQ(fixture.enumerate_calls, 2u);
+    for (void* original : originals) EXPECT_EQ(original, nullptr);
+    EXPECT_EQ(__atomic_load_n(reinterpret_cast<uintptr_t*>(fixture.slot()), __ATOMIC_ACQUIRE),
+              0x1000u);
+    if (detailed) EXPECT_EQ(report.preparation_error.code, ErrorCode::kOutOfMemory);
+  }
+}

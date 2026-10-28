@@ -332,40 +332,6 @@ const PlatformOps& system_ops() noexcept {
   static const PlatformOps ops = {sys_protect, sys_read_maps, sys_load, sys_cas, nullptr};
   return ops;
 }
-// Single-slot patch (wrapper over Txn)
-
-Expected<void, Error> patch_slot(uintptr_t slot_addr, uintptr_t expected_old, uintptr_t desired_new,
-                                 const InspectedImage& image) {
-  if (slot_addr % sizeof(uintptr_t) != 0) return Error::Make(ErrorCode::kInvalidArgument);
-
-  // The slot's ELF identity must check out: it lies inside a writable (PF_W)
-  // PT_LOAD segment of the image we were asked to patch.  (Page *permission*
-  // comes from the live VMA, never from this segment's PT_LOAD/RELRO flags.)
-  if (!image.addr_in_writable_load(slot_addr, sizeof(uintptr_t)))
-    return Error::Make(ErrorCode::kOutOfBounds);
-
-  const size_t ps = page_size();
-  if (ps == 0) return Error::Make(ErrorCode::kUnsupportedFormat);
-
-  std::lock_guard<std::mutex> lock(op_mutex());
-
-  Txn txn(system_ops(), ps);
-  Error prep = txn.prepare(&slot_addr, 1);
-  if (prep) return prep;
-
-  SlotOp op;
-  op.slot = slot_addr;
-  op.expected = expected_old;
-  op.desired = desired_new;
-  CommitResult r = txn.commit(&op, 1, CommitMode::kAllOrNothing);
-
-  if (r.raise_errno != 0) return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
-  if (op.outcome != SlotOutcome::kCommitted) return Error::Make(ErrorCode::kSlotOwnershipConflict);
-  // The write committed but the page could not be put back: report it rather
-  // than claim a clean success.
-  if (!r.pages_restored) return Error::Sys(ErrorCode::kPermissionDenied, r.restore_errno);
-  return Expected<void, Error>();
-}
 
 int prot_of(const VmaInfo& vma) noexcept {
   int prot = kProtNone;

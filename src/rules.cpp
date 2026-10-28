@@ -6,6 +6,7 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <unordered_set>
 #include <utility>
 
 #include "imports.hpp"
@@ -172,6 +173,8 @@ namespace {
 // Translate a core HookResult/unhook outcome into a RuleState.
 RuleState install_state(const HookResult& result) noexcept {
   if (result.ok()) return RuleState::kInstalled;
+  if (!result.handle.valid() && result.error.code == ErrorCode::kImageInvalidated)
+    return RuleState::kInvalidated;
   return result.handle.valid() ? RuleState::kIndeterminate : RuleState::kInstallFailed;
 }
 
@@ -323,6 +326,8 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     event->state = bindings_[idx].state;
     event->binding_index = idx;
     event->recovery = {};
+    event->recovery.error = result.error;
+    event->recovery.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
     if (handles_[idx].valid()) read_recovery(handles_[idx], event->recovery);
   }
   if (result.ok())
@@ -333,33 +338,8 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
 }
 
 RuleSummary RuleSet::refresh() {
-  RuleSummary summary;
-  try {
-    RefreshImages cache;
-    for (auto& rule : rules_) {
-      if (rule.removed) continue;
-      rebind_selector(rule);
-      const auto& images = cache.get(rule.filter);
-      if (!images) {
-        // Enumeration failure is not an unload and not an install attempt: leave
-        // existing bindings untouched.  "No matching image" is the normal empty
-        // case; any other enumeration error (e.g. OOM) is reported as a failure.
-        if (images.error().code != ErrorCode::kImageNotFound) ++summary.failed;
-        continue;
-      }
-      // A system image is re-found under the linker lock by bias/phdr/phnum AND
-      // by the name enumeration reported, so an image replaced at the same
-      // address between enumeration and install is not hooked by mistake.
-      for (const auto& named : images.value())
-        apply_rule_to_image(rule, named.image, named.path.c_str(), named.path.c_str(), summary);
-    }
-  } catch (const std::bad_alloc&) {
-    ++summary.failed;
-  } catch (const std::length_error&) {
-    ++summary.failed;
-  }
-  summary.retained = retained_for(0, nullptr, true);
-  return summary;
+  RuleOperationReport report;
+  return refresh(report);
 }
 
 namespace {
@@ -518,6 +498,7 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
     // Finish enumeration and all diagnostic string allocation before the first
     // installation. An enumeration error belongs to its rule, not to an unload.
     RefreshImages cache;
+    std::unordered_set<BindingKey, BindingKeyHash> targets;
     for (auto& rule : rules_) {
       if (rule.removed) continue;
       rebind_selector(rule);
@@ -530,6 +511,7 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
         report.events.push_back(std::move(event));
       } else {
         for (const auto& named : images.value()) {
+          if (!targets.insert(key_of(rule.id, named.image)).second) continue;
           RuleOperationEvent event;
           event.rule_id = rule.id;
           event.image = named.image;
@@ -540,11 +522,9 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
       }
     }
   } catch (const std::bad_alloc&) {
-    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory),
-                          retained_for(0, nullptr, true));
+    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory), 0);
   } catch (const std::length_error&) {
-    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow),
-                          retained_for(0, nullptr, true));
+    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow), 0);
   }
   RuleSummary summary;
   for (auto& event : report.events) {
@@ -555,7 +535,10 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
     Rule& rule = *rule_by_id(event.rule_id);
     apply_rule_to_image(rule, event.image, event.path.c_str(), event.path.c_str(), summary, &event);
   }
-  summary.retained = retained_for(0, nullptr, true);
+  summary.retained = 0;
+  for (const auto& event : report.events)
+    if (event.binding_index < handles_.size() && handles_[event.binding_index].valid())
+      ++summary.retained;
   return summary;
 }
 

@@ -702,6 +702,18 @@ class [[nodiscard]] Expected<void, E> {
 /// - One slot, one owner.  A second hook of a slot this library already owns
 ///   returns kAlreadyHooked.  There is no hook stacking, no reference counting.
 ///
+/// - Imports must already be eagerly bound before installation. For custom
+///   loaders, finish relocation before exposing the image. A lazy resolver
+///   could overwrite the hook or be mistaken for an original function. NOW
+///   flags are not used as proof: Android's loader binds PLT relocations eagerly.
+///
+/// - Installing into the image containing this copy of YukiPLT is rejected
+///   with kInvalidArgument before ownership or original-pointer publication.
+///   Do not arrange synchronous API reentry through functions the library may
+///   call while holding its linker/operation locks (including interposition,
+///   allocator hooks and destructors). A replacement reached outside those
+///   operations may call the API subject to the ordinary threading contract.
+///
 /// ## Batches and atomicity
 ///
 /// - hook() installs one slot; hook_batch() installs several as one unit over

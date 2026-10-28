@@ -18,7 +18,17 @@ YK_STATIC_ASSERT(YUKIPLT_C_RELOC_SOURCE_REL == 3 && YUKIPLT_C_RELOC_SOURCE_ANDRO
 YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_REL_IMPORTS == 6);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_error) == 8 && sizeof(yukiplt_c_handle) == 8);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, base) == 16);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, error) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, image_invalidated) == 24);
 #if YUKIPLT_ELF_BITS == 64
+YK_STATIC_ASSERT(sizeof(yukiplt_c_recovery_diagnostic) == 40);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, residual_page_count) == 32);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_residual_page) == 24);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_residual_page, original_protection) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_residual_page, sys_errno) == 16);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_function_request_ex) == 104);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, base) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, expected_current) == 96);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_image) == 32);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, instance_token) == 24);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_selector) == 48);
@@ -27,6 +37,14 @@ YK_STATIC_ASSERT(sizeof(yukiplt_c_function_selector) == 64);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_function_request) == 80);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_slot_report) == 32);
 #else
+YK_STATIC_ASSERT(sizeof(yukiplt_c_recovery_diagnostic) == 32);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, residual_page_count) == 28);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_residual_page) == 16);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_residual_page, original_protection) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_residual_page, sys_errno) == 12);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_function_request_ex) == 60);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, base) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, expected_current) == 56);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_selector) == 24);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_request) == 32);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_function_selector) == 40);

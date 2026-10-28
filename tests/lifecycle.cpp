@@ -383,6 +383,8 @@ struct RulesFixture : testing::Test {
 
   static Result<std::vector<NamedImage>> enumerate(const ImageSelector& selector) {
     ++current->enumeration_calls;
+    if (selector.name && current->failed_filter == selector.name)
+      return Error::Make(ErrorCode::kOutOfMemory);
     if (current->enumeration_error != ErrorCode::kSuccess)
       return Error::Make(current->enumeration_error);
     std::vector<NamedImage> out;
@@ -404,6 +406,7 @@ struct RulesFixture : testing::Test {
   }
 
   ErrorCode enumeration_error = ErrorCode::kSuccess;
+  std::string failed_filter;
 };
 
 RulesFixture* RulesFixture::current = nullptr;

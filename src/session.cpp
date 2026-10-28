@@ -366,7 +366,9 @@ SessionSummary HookSession::install() {
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled
                     : group.handle.valid() ? SessionState::kIndeterminate
-                                           : SessionState::kInstallFailed;
+                    : result.error.code == ErrorCode::kImageInvalidated
+                        ? SessionState::kInvalidated
+                        : SessionState::kInstallFailed;
       if (result.ok())
         ++summary.succeeded;
       else
@@ -576,7 +578,9 @@ SessionSummary FunctionHookSession::install() {
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled
                     : group.handle.valid() ? SessionState::kIndeterminate
-                                           : SessionState::kInstallFailed;
+                    : result.error.code == ErrorCode::kImageInvalidated
+                        ? SessionState::kInvalidated
+                        : SessionState::kInstallFailed;
       if (result.ok())
         ++summary.succeeded;
       else

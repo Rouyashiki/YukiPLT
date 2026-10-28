@@ -279,6 +279,13 @@ yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle*, yukiplt_c_slot_report* repor
                                  size_t capacity) YUKIPLT_C_NOEXCEPT;
 // Only relinquishes ownership; never changes slots or permissions.
 yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle*) YUKIPLT_C_NOEXCEPT;
+// Slot status is operation-specific: hook reports commit/rollback outcomes;
+// unhook reports RESTORED only for slots previously written by this owner and
+// UNTOUCHED for never-written slots, with actual before/observed values. Query
+// uses INSTALLED for readable registered slots, not as a value/ownership proof;
+// its value_before is the recorded original and observed is the current value.
+// Unreadable query slots are UNTOUCHED. On query failure all outputs, including
+// count, remain unchanged.
 // count receives total slots; at most capacity reports are filled. Reports may
 // be NULL (count-only). A copied token here is a borrowed view, not a new owner.
 yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle*, yukiplt_c_slot_report* reports,

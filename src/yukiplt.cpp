@@ -41,6 +41,12 @@ namespace {
 
 constexpr size_t kMaxBatch = 64;  // Upper bound on slots in one transaction.
 
+// A local code address identifies this copy even when statically linked or
+// loaded in a separate namespace. Function addresses are not HWASan data tags.
+bool is_own_image(const InspectedImage& image) noexcept {
+  return image.addr_in_load(reinterpret_cast<uintptr_t>(&is_own_image), 1);
+}
+
 SlotStatus to_status(SlotOutcome o) noexcept {
   switch (o) {
     case SlotOutcome::kCommitted:
@@ -580,6 +586,7 @@ HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t co
     try {
       auto insp = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!insp) return {insp.error(), detail_api::make(detail_api::invalid())};
+      if (is_own_image(insp.value())) return fail(ErrorCode::kInvalidArgument);
       return install(image, insp.value(), reqs, count, reports, count);
     } catch (const std::bad_alloc&) {
       return fail(ErrorCode::kOutOfMemory);
@@ -632,6 +639,7 @@ HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
+      if (is_own_image(inspected.value())) return fail(Error::Make(ErrorCode::kInvalidArgument));
       return install(live, inspected.value(), reqs, count, reports, count);
     } catch (const std::bad_alloc&) {
       return fail(Error::Make(ErrorCode::kOutOfMemory));
@@ -694,6 +702,7 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
+      if (is_own_image(inspected.value())) return fail(Error::Make(ErrorCode::kInvalidArgument));
       if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
         return install_planned(
             live, reports, count,
@@ -752,6 +761,7 @@ HookResult hook_function_imports_ex(const ImageView& image, const FunctionHookRe
   value.stage = OperationStage::kPrepare;
   auto result = hook_functions_impl(image, nullptr, reqs, count, reports, &value);
   value.error = result.error;
+  value.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
   if (diagnostic) *diagnostic = value;
   return result;
 }
@@ -838,10 +848,11 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   SlotOp ops[kMaxBatch];
   size_t op_count = 0;
   bool any_foreign = false;
+  uintptr_t before_values[kMaxBatch]{};
   for (size_t i = 0; i < slot_count; ++i) {
+    txn.load(recs[i].address, before_values[i]);
     if (!recs[i].ever_written) continue;
-    uintptr_t cur = 0;
-    txn.load(recs[i].address, cur);
+    const uintptr_t cur = before_values[i];
     if (cur == recs[i].replacement) {
       ops[op_count].slot = recs[i].address;
       ops[op_count].expected = recs[i].replacement;
@@ -890,14 +901,15 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     uintptr_t observed = recs[i].original;
     if (i < cap && reports != nullptr) {
       reports[i].address = recs[i].address;
-      reports[i].value_before = recs[i].replacement;
+      reports[i].value_before = before_values[i];
     }
     // Was this slot part of the CAS set?
     bool was_op = oi < op_count && ops[oi].slot == recs[i].address;
     if (!recs[i].ever_written) {
       // We never owned this slot's contents, so there is nothing to restore and
       // it cannot be a conflict that keeps the group alive.
-      st = SlotStatus::kRestored;
+      st = SlotStatus::kUntouched;
+      observed = before_values[i];
     } else if (was_op) {
       SlotOutcome o = ops[oi].outcome;
       observed = ops[oi].observed;

@@ -10,6 +10,7 @@
 #include <new>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -719,6 +720,87 @@ HookResult hook_import(const ImageView& image, const ImportSelector& selector, v
                        void** out_original, SlotReport* report = nullptr);
 HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
                         SlotReport* reports = nullptr);
+// Explicit function sources/types extend the JUMP_SLOT APIs with GLOB_DAT.
+// Every match must be an undefined STT_FUNC with zero effective addend; only
+// GLOB_DAT also requires a nonzero current value. Any ineligible match rejects
+// the whole operation. RELA uses r_addend; Android REL binding uses no addend.
+// Scanned function records validate versions; legacy name-only APIs do not.
+// Import STT_FUNC cannot exclude an IFUNC provider. Cached pointers remain valid
+// caller responsibilities; out_original is the pre-install slot value.
+
+/// Which relocation tables to scan (a bitmask over these bits).
+enum RelocationSourceBit : uint32_t {
+  kSourceJmprel = 1u << 0,       ///< DT_JMPREL (PLT relocations).
+  kSourceRela = 1u << 1,         ///< DT_RELA (.rela.dyn).
+  kSourceAndroidRela = 1u << 2,  ///< DT_ANDROID_RELA (APS2 packed).
+};
+
+/// Which relocation types to accept (a bitmask over these bits).
+enum RelocationTypeBit : uint32_t {
+  kTypeJumpSlot = 1u << 0,  ///< R_AARCH64_JUMP_SLOT.
+  kTypeGlobDat = 1u << 1,   ///< R_AARCH64_GLOB_DAT (function, addend 0, UND FUNC).
+};
+
+/// The table a decoded function import came from.
+enum class RelocationSource : uint8_t { kJmprel, kRela, kAndroidRela };
+
+/// One function import, with its relocation source and type.  `base` carries the
+/// name, symbol index, version metadata and slot address; `base.import`'s
+/// relocation_index is the index within `source`'s own table.
+struct FunctionImport {
+  VersionedImport base;
+  RelocationSource source = RelocationSource::kJmprel;
+  uint32_t relocation_type = 0;  ///< R_AARCH64_* value as found.
+  uint8_t symbol_type = 0;       ///< ELF symbol type (STT_*).
+};
+
+struct FunctionImportSnapshot {
+  std::vector<FunctionImport> imports;
+  /// Records in a scanned source that are neither JUMP_SLOT nor GLOB_DAT, or
+  /// have symbol index 0.  A JUMP_SLOT or GLOB_DAT is listed in `imports`
+  /// whichever scanned table holds it (labelled with its real source and type),
+  /// so a GLOB_DAT inside DT_JMPREL is listed, not skipped.  This differs from
+  /// inspect_imports(), which counts such a record as skipped.
+  size_t skipped_relocations = 0;
+};
+
+/// Selector for a function import.  `sources` and `types` are bitmasks that must
+/// both be non-zero — naming them is the explicit opt-in.  `index_source` scopes
+/// `base.relocation_index` (when not ~0) to one table.
+struct FunctionImportSelector {
+  ImportSelector base;
+  uint32_t sources = 0;
+  uint32_t types = 0;
+  RelocationSource index_source = RelocationSource::kJmprel;
+};
+
+struct FunctionHookRequest {
+  FunctionImportSelector target;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
+};
+
+// Copy owning function-import metadata from a nonzero valid source mask.
+// No GOT access, permissions or ownership; optional tables are validated only
+// when selected. All scanned non-NONE records participate in duplicate-slot
+// checks, including skipped types. Share a 2^22-record and 64 MiB logical
+// materialization budget, including indexes, copied text and temporaries;
+// excess returns OutOfBounds before allocation. This is not an RSS limit.
+Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, uint32_t sources);
+
+/// Read-only unique selection over the scanned sources/types.
+Result<FunctionImport> find_function_import(const ImageView& image,
+                                            const FunctionImportSelector& selector);
+
+/// Install one / several function hooks on one image, same transaction,
+/// ownership, recovery and original-pointer contract as hook_import()/
+/// hook_imports().  A batch mixing JUMP_SLOT and GLOB_DAT slots on one image
+/// runs as a single transaction and is limited to 64 distinct slots.
+HookResult hook_function_import(const ImageView& image, const FunctionImportSelector& selector,
+                                void* replacement, void** out_original,
+                                SlotReport* report = nullptr);
+HookResult hook_function_imports(const ImageView& image, const FunctionHookRequest* reqs,
+                                 size_t count, SlotReport* reports = nullptr);
 
 // Restore owned replacement values by CAS; already-original values are done.
 // Never-written slots are Untouched with live values. Preserve third-party values
@@ -866,6 +948,159 @@ class HookSession {
 /// Copy a validated plan and preallocate every report/group before any write.
 /// Failure never leaves a partial session or any installed hook.
 Result<HookSession> prepare_session(const HookPlan& plan);
+
+// Explicit rule refresh; no background tracking. Each (rule, image instance)
+// owns one single-slot group. Serialize all operations and result reads per
+// RuleSet; different RuleSets share the core Registry/op lock. No user callback
+// runs under internal locks. bindings() references expire at the next mutation.
+
+/// State of one (rule, image instance) binding.
+enum class RuleState : uint8_t {
+  kPending,        ///< Matched but not yet installed (e.g. a prior conflict/OOM).
+  kInstalled,      ///< Installed and owned.
+  kInstallFailed,  ///< A clean install failure (conflict, capacity, OOM); retryable.
+  kIndeterminate,  ///< Partial install; handle retained, must unhook/abandon.
+  kReleased,       ///< Cleanly unhooked (by remove_rule/release_image/unhook).
+  kInvalidated,    ///< Image no longer loaded; handle consumed by the core.
+  kRestoreFailed,  ///< Unhook failed; handle retained, retryable.
+  kAbandoned,      ///< Ownership relinquished without touching memory.
+};
+
+/// One (rule, image instance) binding and its last result.  A read-only view;
+/// valid until the next mutation of the owning RuleSet.
+struct RuleBinding {
+  uint64_t rule_id = 0;
+  ImageView image{};          ///< Instance identity (bias/phdr/phnum/token).
+  std::string path;           ///< Diagnostic, from the image enumerator.
+  size_t original_index = 0;  ///< Slot in the rule's out_originals array.
+  RuleState state = RuleState::kPending;
+  Error error;
+  SlotReport install_report;
+  SlotReport restore_report;
+};
+
+/// Summary of a RuleSet operation, same shape as SessionSummary.
+struct RuleSummary {
+  size_t attempted = 0;
+  size_t succeeded = 0;
+  size_t failed = 0;
+  size_t retained = 0;  ///< Bindings still holding ownership/recovery handles.
+  [[nodiscard]] bool ok() const noexcept { return failed == 0; }
+};
+
+/// Move-only, like HookSession.  Destruction/move-overwrite does NOT unhook;
+/// live handles retain the core's warning behavior.  The caller must explicitly
+/// unhook() or abandon() before destruction.
+class RuleSet {
+ public:
+  RuleSet() = default;
+  ~RuleSet();
+  RuleSet(const RuleSet&) = delete;
+  RuleSet& operator=(const RuleSet&) = delete;
+  RuleSet(RuleSet&&) noexcept = default;
+  RuleSet& operator=(RuleSet&&) noexcept = default;
+
+  // Copy the selector and return a nonzero rule id. Caller-owned original slots
+  // must be aligned, stable and disjoint; published slots are never cleared or reused.
+  // Capacity zero disables original output. Exhaustion fails before writes and is
+  // terminal for that binding; remove and re-register with larger storage to recover.
+  // A null/empty symbol returns NullPointer/InvalidArgument.
+  Result<uint64_t> add_rule(const ImageSelector& filter, const FunctionImportSelector& selector,
+                            void* replacement, void** out_originals, size_t capacity);
+
+  /// Convenience overload for a plain JUMP_SLOT name/version selector.
+  Result<uint64_t> add_rule(const ImageSelector& filter, const ImportSelector& selector,
+                            void* replacement, void** out_originals, size_t capacity);
+
+  // Prepare all enumeration caches/reports before any install; preparation failure
+  // returns failed=1, attempted=retained=0. Use the report overload for its error.
+  // Then install one slot per (rule, instance), allowing partial success. Clean
+  // failures retry with the same original slot; released/invalidated bindings take
+  // a fresh slot. Indeterminate, restore-failed, abandoned and exhausted bindings
+  // are not reinstalled. Retained system bindings revalidate path/identity/value
+  // under linker -> op locks; mismatch preserves ownership and reports failure.
+  // Reuse one maps read per verified image, discard it before later installations.
+  // Only core-confirmed invalidation ends ownership; callers prevent reload ABA.
+  // retained counts unique targets enumerated this call, including skipped live
+  // bindings. statistics().active_handles counts the entire outstanding population.
+  RuleSummary refresh();
+
+  /// Undo this RuleSet's hooks on one image instance before the caller unloads
+  /// it.  Failure keeps the handle and ownership and is reported.  This does not
+  /// disable the rules: a later refresh()/notify_loaded() that still finds the
+  /// instance applies them again (see refresh()); remove_rule() stops a rule.
+  RuleSummary release_image(const ImageView& image);
+
+  // Custom-loader notifications run synchronously after relocation/final
+  // protections and before unmapping, respectively. Keep the instance stable,
+  // serialize RuleSet access, and hold no loader lock or dl_iterate_phdr callback.
+  // path supplies diagnostics and matching. Token-0 system images are rejected.
+  RuleSummary notify_loaded(const ImageView& image, const char* path);
+  RuleSummary notify_unloading(const ImageView& image);
+
+  /// Remove a rule: undo all its bindings (reverse order), keep failures, and
+  /// stop it participating in future refreshes.
+  RuleSummary remove_rule(uint64_t rule_id);
+
+  /// Undo all of this RuleSet's hooks (reverse order), keeping failures.  The
+  /// rules stay registered; a later refresh() applies them again.
+  RuleSummary unhook();
+
+  /// Relinquish all registrations without touching memory.  Abandoned bindings
+  /// are never re-applied by refresh()/notify_loaded().
+  RuleSummary abandon();
+
+  /// Per-(rule, image instance) results.  Valid until the next mutation.
+  [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
+
+ private:
+  struct Rule {
+    uint64_t id = 0;
+    ImageSelector filter{};
+    std::string filter_name;                  ///< Owns filter.name.
+    FunctionImportSelector selector{};        ///< Points into the owned strings below.
+    std::string symbol, version, dependency;  ///< Owned selector strings.
+    void* replacement = nullptr;
+    void** out_originals = nullptr;
+    size_t capacity = 0;
+    size_t next_slot = 0;  ///< Next free out_originals index (grow-only).
+    bool removed = false;
+  };
+
+  // Internal helpers (rules.cpp).
+  Rule* find_rule(uint64_t id) noexcept;
+  size_t find_binding(uint64_t rule_id, const ImageView& image) const noexcept;
+  static void rebind_selector(Rule& rule) noexcept;
+  // Apply one rule to one already-matched image instance, updating bindings.
+  void apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
+                           const char* expected_path, RuleSummary& summary);
+
+  std::vector<Rule> rules_;
+  std::vector<RuleBinding> bindings_;
+  std::vector<HookHandle> handles_;  ///< Parallel to bindings_ (HookHandle is move-only).
+  /// (rule id, image instance) -> index of that pair's current binding in
+  /// bindings_, so refresh() looks it up in O(1).  A binding superseded
+  /// by a re-application stays in bindings_ but leaves the index.
+  struct BindingKey {
+    uint64_t rule_id;
+    uintptr_t load_bias;
+    const void* phdr_table;
+    size_t phdr_count;
+    uint64_t instance_token;
+    bool operator==(const BindingKey& o) const noexcept {
+      return rule_id == o.rule_id && load_bias == o.load_bias && phdr_table == o.phdr_table &&
+             phdr_count == o.phdr_count && instance_token == o.instance_token;
+    }
+  };
+  struct BindingKeyHash {
+    size_t operator()(const BindingKey& k) const noexcept;
+  };
+  static BindingKey key_of(uint64_t rule_id, const ImageView& image) noexcept {
+    return {rule_id, image.load_bias, image.phdr_table, image.phdr_count, image.instance_token};
+  }
+  std::unordered_map<BindingKey, size_t, BindingKeyHash> binding_index_;
+  uint64_t next_rule_id_ = 1;
+};
 
 }  // namespace yukiplt
 

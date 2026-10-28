@@ -29,6 +29,31 @@ bool valid_enums(const yukiplt_c_selector& source) noexcept {
   // Check before narrowing to the C++ uint8 enums; 256 must not become kAny.
   return source.version_match <= YUKIPLT_C_VERSION_EXACT && source.hidden <= YUKIPLT_C_HIDDEN;
 }
+RelocationSource reloc_source(uint32_t index_source) noexcept {
+  switch (index_source) {
+    case YUKIPLT_C_RELOC_SOURCE_RELA:
+      return RelocationSource::kRela;
+    case YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA:
+      return RelocationSource::kAndroidRela;
+    case YUKIPLT_C_RELOC_SOURCE_JMPREL:
+    default:
+      return RelocationSource::kJmprel;
+  }
+}
+// Translate a C function selector, validating the struct_size tag, the index
+// source enum and the base selector enums before narrowing.  The source/type
+// masks are validated by the C++ core (non-zero, in range).
+bool function_selector(const yukiplt_c_function_selector& source,
+                       FunctionImportSelector& out) noexcept {
+  if (source.struct_size != sizeof(yukiplt_c_function_selector)) return false;
+  if (source.index_source > YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA) return false;
+  if (!valid_enums(source.base)) return false;
+  out.base = selector(source.base);
+  out.sources = source.sources;
+  out.types = source.types;
+  out.index_source = reloc_source(source.index_source);
+  return true;
+}
 void copy_reports(yukiplt_c_slot_report* out, const SlotReport* reports, size_t count) noexcept {
   if (!out) return;
   for (size_t i = 0; i < count; ++i)
@@ -145,6 +170,41 @@ yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
   return guarded([&] {
     if (!image) return Error::Make(ErrorCode::kNullPointer);
     return forget_image(view(*image));
+  });
+}
+int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
+  return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ? 1 : 0;
+}
+yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
+                                        const yukiplt_c_function_selector* target,
+                                        void* replacement, void** original,
+                                        yukiplt_c_handle* handle,
+                                        yukiplt_c_slot_report* report) noexcept {
+  if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
+  const yukiplt_c_function_request request{*target, replacement, original};
+  return yukiplt_c_hook_functions(image, &request, 1, handle, report);
+}
+yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image* image,
+                                         const yukiplt_c_function_request* requests, size_t count,
+                                         yukiplt_c_handle* handle,
+                                         yukiplt_c_slot_report* output) noexcept {
+  return guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    FunctionHookRequest converted_requests[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      FunctionImportSelector sel;
+      if (!function_selector(requests[i].target, sel))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      converted_requests[i] = {sel, requests[i].replacement, requests[i].out_original};
+    }
+    auto result = hook_function_imports(view(*image), converted_requests, count, reports);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());  // transfer, do not abandon
+    copy_reports(output, reports, count);
+    return result.error;
   });
 }
 }  // extern C

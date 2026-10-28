@@ -1,0 +1,362 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Rouyashiki <https://rouyashiki.org>
+
+#include <cstring>
+#include <new>
+#include <stdexcept>
+#include <utility>
+
+#include "imports.hpp"
+#include "system_images.hpp"
+#include "yukiplt.hpp"
+
+namespace yukiplt {
+
+namespace {
+
+bool same_image(const ImageView& a, const ImageView& b) noexcept {
+  return a.load_bias == b.load_bias && a.phdr_table == b.phdr_table &&
+         a.phdr_count == b.phdr_count && a.instance_token == b.instance_token;
+}
+
+}  // namespace
+
+// Rebuild a rule's borrowed pointers to point into its own owned strings (needed
+// after the rules_ vector reallocates).  Static member so it can touch Rule.
+void RuleSet::rebind_selector(Rule& rule) noexcept {
+  rule.selector.base.symbol = rule.symbol.c_str();
+  rule.selector.base.version = rule.version.empty() ? nullptr : rule.version.c_str();
+  rule.selector.base.dependency = rule.dependency.empty() ? nullptr : rule.dependency.c_str();
+  rule.filter.name = rule.filter_name.empty() ? nullptr : rule.filter_name.c_str();
+}
+
+RuleSet::~RuleSet() {
+  // Like HookSession/HookHandle: destruction does not unhook.  A live handle
+  // logs the core's warning when its HookHandle is destroyed.
+}
+
+RuleSet::Rule* RuleSet::find_rule(uint64_t id) noexcept {
+  for (auto& rule : rules_)
+    if (rule.id == id && !rule.removed) return &rule;
+  return nullptr;
+}
+
+size_t RuleSet::BindingKeyHash::operator()(const BindingKey& k) const noexcept {
+  uint64_t h = k.rule_id * 0x9E3779B97F4A7C15ull;
+  auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; };
+  mix(k.load_bias);
+  mix(reinterpret_cast<uintptr_t>(k.phdr_table));
+  mix(k.phdr_count);
+  mix(k.instance_token);
+  return static_cast<size_t>(h ^ (h >> 32));
+}
+
+size_t RuleSet::find_binding(uint64_t rule_id, const ImageView& image) const noexcept {
+  auto it = binding_index_.find(key_of(rule_id, image));
+  return it == binding_index_.end() ? ~size_t{0} : it->second;
+}
+
+Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
+                                   const FunctionImportSelector& selector, void* replacement,
+                                   void** out_originals, size_t capacity) {
+  if (replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  if (selector.base.symbol == nullptr || *selector.base.symbol == '\0')
+    return Error::Make(ErrorCode::kInvalidArgument);
+  // Validate the filter and selector up front (same rules as find_images() and
+  // hook_function_imports()), so a malformed rule never silently fails later.
+  if (Error e = detail::validate_image_selector(filter)) return e;
+  if (Error e = detail::validate_function_selector(selector)) return e;
+  if (capacity > 0 && (out_originals == nullptr ||
+                       reinterpret_cast<uintptr_t>(out_originals) % alignof(void*) != 0))
+    return Error::Make(ErrorCode::kInvalidArgument);
+  try {
+    Rule rule;
+    rule.id = next_rule_id_;
+    rule.filter = filter;
+    rule.filter_name = (filter.name != nullptr) ? std::string(filter.name) : std::string();
+    rule.selector = selector;
+    rule.symbol = selector.base.symbol;
+    rule.version =
+        (selector.base.version != nullptr) ? std::string(selector.base.version) : std::string();
+    rule.dependency = (selector.base.dependency != nullptr) ? std::string(selector.base.dependency)
+                                                            : std::string();
+    rule.replacement = replacement;
+    rule.out_originals = out_originals;
+    rule.capacity = capacity;
+    rules_.push_back(std::move(rule));
+    // Re-point every rule's borrowed pointers: push_back may have reallocated.
+    for (auto& existing : rules_) rebind_selector(existing);
+    ++next_rule_id_;
+    return rules_.back().id;
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  }
+}
+
+Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter, const ImportSelector& selector,
+                                   void* replacement, void** out_originals, size_t capacity) {
+  // Promote a plain name/version selector to a JUMP_SLOT-only function selector.
+  FunctionImportSelector func;
+  func.base = selector;
+  func.sources = kSourceJmprel;
+  func.types = kTypeJumpSlot;
+  func.index_source = RelocationSource::kJmprel;
+  return add_rule(filter, func, replacement, out_originals, capacity);
+}
+
+namespace {
+
+// Translate a core HookResult/unhook outcome into a RuleState.
+RuleState install_state(const HookResult& result) noexcept {
+  if (result.ok()) return RuleState::kInstalled;
+  return result.handle.valid() ? RuleState::kIndeterminate : RuleState::kInstallFailed;
+}
+
+// Ensure one more push_back cannot allocate, doubling capacity when full.  May
+// throw std::bad_alloc; called only while nothing is installed yet.
+template <typename Vector>
+void reserve_for_one_more(Vector& v) {
+  if (v.size() < v.capacity()) return;
+  v.reserve(v.empty() ? 8 : v.size() * 2);
+}
+
+// Does one rule's image filter match this specific (image, path)?  Pure local
+// test — never calls the enumerator.  A system image (token 0) is only matched by
+// main-executable/load-bias filters; a custom image (token != 0) is matched by
+// path filters and load-bias.
+bool filter_matches(const ImageSelector& filter, const ImageView& image,
+                    const char* path) noexcept {
+  const char* p = path != nullptr ? path : "";
+  switch (filter.match) {
+    case ImageMatch::kMainExecutable:
+      return false;  // Cannot confirm "main executable" without enumeration.
+    case ImageMatch::kLoadBias:
+      return image.load_bias == filter.load_bias;
+    case ImageMatch::kExactPath:
+      return filter.name != nullptr && std::strcmp(p, filter.name) == 0;
+    case ImageMatch::kBasename: {
+      if (filter.name == nullptr) return false;
+      const char* slash = std::strrchr(p, '/');
+      return std::strcmp(slash != nullptr ? slash + 1 : p, filter.name) == 0;
+    }
+  }
+  return false;
+}
+
+}  // namespace
+
+// Apply one rule to one already-matched image instance.  Shared by refresh()
+// (enumerated images) and notify_loaded() (a caller-supplied custom image).
+// `expected_path` is the enumerated name a system image must still carry under
+// the linker lock (null: no path check).
+void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
+                                  const char* expected_path, RuleSummary& summary) {
+  const size_t existing = find_binding(rule.id, image);
+  // A binding is retried in place only after a clean install failure (it holds
+  // nothing and keeps its slot).  One that ended cleanly — released, or its
+  // image invalidated — is applied again as a NEW binding with a fresh slot:
+  // its old slot may still be read by code that escaped during the previous
+  // installation, so it is never reused (decision 8).  Installed, indeterminate,
+  // restore-failed and abandoned bindings are left alone: the first two still
+  // own the slot, and an abandoned one was given up on purpose.
+  bool retry_in_place = false;
+  if (existing != ~size_t{0}) {
+    const RuleState st = bindings_[existing].state;
+    if (st == RuleState::kPending || st == RuleState::kInstallFailed) {
+      retry_in_place = true;
+    } else if (st != RuleState::kReleased && st != RuleState::kInvalidated) {
+      return;
+    }
+  }
+  const bool new_binding = !retry_in_place;
+
+  // Each new binding consumes one original slot permanently; clean retries reuse
+  // that binding's slot. Disabled/capacity-failed bindings use the no-slot sentinel.
+  const size_t slot_index = new_binding ? rule.next_slot : bindings_[existing].original_index;
+  void** out = slot_index < rule.capacity ? &rule.out_originals[slot_index] : nullptr;
+
+  // Prepare the binding and index before installation can publish ownership.
+  // Superseded bindings remain history but leave the current index.
+  RuleBinding pending;
+  if (new_binding) {
+    try {
+      pending.rule_id = rule.id;
+      pending.image = image;
+      if (path != nullptr) pending.path = path;  // diagnostic copy, may allocate
+      pending.original_index = slot_index;
+      // Grow geometrically: reserving exactly size()+1 would reallocate (and move
+      // every binding and handle) on each new binding, making refresh quadratic.
+      reserve_for_one_more(bindings_);
+      reserve_for_one_more(handles_);
+      binding_index_[key_of(rule.id, image)] = bindings_.size();
+    } catch (const std::bad_alloc&) {
+      ++summary.attempted;
+      ++summary.failed;
+      return;  // Cannot track a new binding; do not install one.
+    }
+  }
+
+  ++summary.attempted;
+
+  // Original storage exhausted: refuse before any mprotect/publish/CAS.
+  const bool capacity_refused = rule.capacity != 0 && slot_index >= rule.capacity;
+  if (new_binding && slot_index < rule.capacity) rule.next_slot = slot_index + 1;
+
+  HookResult result{Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
+  SlotReport report{};
+  if (!capacity_refused) {
+    FunctionHookRequest request{rule.selector, rule.replacement, out};
+    result = detail::hook_function_imports_at(image, expected_path, &request, 1, &report);
+  }
+
+  if (new_binding) {
+    pending.state = install_state(result);
+    pending.error = result.error;
+    pending.install_report = report;
+    bindings_.push_back(std::move(pending));  // reserved above: no throw
+    handles_.push_back(std::move(result.handle));
+  } else {
+    bindings_[existing].state = install_state(result);
+    bindings_[existing].error = result.error;
+    bindings_[existing].install_report = report;
+    handles_[existing] = std::move(result.handle);
+  }
+
+  const size_t idx = new_binding ? bindings_.size() - 1 : existing;
+  if (result.ok())
+    ++summary.succeeded;
+  else
+    ++summary.failed;
+  if (handles_[idx].valid()) ++summary.retained;
+}
+
+RuleSummary RuleSet::refresh() {
+  RuleSummary summary;
+  const detail::ImageEnumerator enumerate = detail::active_image_enumerator();
+  for (auto& rule : rules_) {
+    if (rule.removed) continue;
+    rebind_selector(rule);
+    auto images = enumerate(rule.filter);
+    if (!images) {
+      // Enumeration failure is not an unload and not an install attempt: leave
+      // existing bindings untouched.  "No matching image" is the normal empty
+      // case; any other enumeration error (e.g. OOM) is reported as a failure.
+      if (images.error().code != ErrorCode::kImageNotFound) ++summary.failed;
+      continue;
+    }
+    // A system image is re-found under the linker lock by bias/phdr/phnum AND
+    // by the name enumeration reported, so an image replaced at the same
+    // address between enumeration and install is not hooked by mistake.
+    for (const auto& named : images.value())
+      apply_rule_to_image(rule, named.image, named.path.c_str(), named.path.c_str(), summary);
+  }
+  return summary;
+}
+
+namespace {
+
+// Undo one binding through the public unhook(), updating its state.  Returns
+// true on a clean release.
+bool undo_binding(RuleBinding& binding, HookHandle& handle, RuleSummary& summary) {
+  if (!handle.valid()) return false;
+  ++summary.attempted;
+  SlotReport report{};
+  Error error = yukiplt::unhook(handle, &report, 1);
+  binding.restore_report = report;
+  binding.error = error;
+  if (!error) {
+    binding.state = RuleState::kReleased;
+    ++summary.succeeded;
+    return true;
+  }
+  if (error.code == ErrorCode::kImageInvalidated) {
+    binding.state = RuleState::kInvalidated;
+    ++summary.succeeded;  // The image is gone; the handle is consumed.
+    return true;
+  }
+  binding.state = RuleState::kRestoreFailed;
+  ++summary.failed;
+  if (handle.valid()) ++summary.retained;
+  return false;
+}
+
+}  // namespace
+
+RuleSummary RuleSet::release_image(const ImageView& image) {
+  RuleSummary summary;
+  // Reverse order so dependent installs undo last-in-first-out.
+  for (size_t n = bindings_.size(); n-- > 0;) {
+    if (!same_image(bindings_[n].image, image)) continue;
+    undo_binding(bindings_[n], handles_[n], summary);
+  }
+  return summary;
+}
+
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
+  RuleSummary summary;
+  // A loader notifies about a specific custom instance; a system image (token 0)
+  // has no stable instance identity here and is handled through refresh().
+  if (image.instance_token == 0) {
+    summary.attempted = 1;
+    summary.failed = 1;
+    return summary;
+  }
+  for (auto& rule : rules_) {
+    if (rule.removed) continue;
+    rebind_selector(rule);
+    if (!filter_matches(rule.filter, image, path)) continue;
+    apply_rule_to_image(rule, image, path, nullptr, summary);
+  }
+  return summary;
+}
+
+RuleSummary RuleSet::notify_unloading(const ImageView& image) {
+  // Undo exactly this instance's bindings; identical to release_image(), named
+  // for the loader lifecycle pairing with notify_loaded().
+  return release_image(image);
+}
+
+RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
+  RuleSummary summary;
+  Rule* rule = find_rule(rule_id);
+  if (rule == nullptr) {
+    summary.failed = 1;  // unknown or already-removed rule
+    return summary;
+  }
+  for (size_t n = bindings_.size(); n-- > 0;) {
+    if (bindings_[n].rule_id != rule_id) continue;
+    undo_binding(bindings_[n], handles_[n], summary);
+  }
+  // Stop participating in future refreshes regardless; a retained failed handle
+  // is still reachable through bindings()/unhook() for a retry.
+  rule->removed = true;
+  return summary;
+}
+
+RuleSummary RuleSet::unhook() {
+  RuleSummary summary;
+  for (size_t n = bindings_.size(); n-- > 0;) undo_binding(bindings_[n], handles_[n], summary);
+  return summary;
+}
+
+RuleSummary RuleSet::abandon() {
+  RuleSummary summary;
+  for (size_t n = bindings_.size(); n-- > 0;) {
+    if (!handles_[n].valid()) continue;
+    ++summary.attempted;
+    Error error = yukiplt::abandon(handles_[n]);
+    bindings_[n].error = error;
+    if (!error) {
+      bindings_[n].state = RuleState::kAbandoned;
+      ++summary.succeeded;
+    } else {
+      ++summary.failed;
+      if (handles_[n].valid()) ++summary.retained;
+    }
+  }
+  return summary;
+}
+
+}  // namespace yukiplt

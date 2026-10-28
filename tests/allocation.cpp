@@ -10,6 +10,7 @@
 #include "overrides.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
+#include "system_images.hpp"
 #include "versioned_elf.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
@@ -135,3 +136,68 @@ TEST(ImportAllocation, FailedInstallNeverStrandsOwnershipOrPublishesOriginals) {
     EXPECT_FALSE(yukiplt::unhook(retry.handle));
   }
 }
+
+namespace {
+struct RuleOomFixture {
+  test::ElfBuilder::BuiltImage image;
+  std::string path = "liboom.so";
+  char maps[128]{};
+  bool writable = false;
+  static RuleOomFixture* current;
+  detail::PlatformOps ops{
+      [](void* p, uintptr_t, size_t, int prot) {
+        static_cast<RuleOomFixture*>(p)->writable = (prot & detail::kProtWrite) != 0;
+        return 0;
+      },
+      [](void* ctx, detail::MapsCoverage& coverage) {
+        auto& self = *static_cast<RuleOomFixture*>(ctx);
+        const size_t ps = detail::page_size();
+        uintptr_t begin = self.image.load_bias() & ~(ps - 1);
+        uintptr_t end = (self.image.load_bias() + self.image.buffer.size() + ps - 1) & ~(ps - 1);
+        std::snprintf(self.maps, sizeof(self.maps), "%zx-%zx %s 00000000 00:00 0",
+                      static_cast<size_t>(begin), static_cast<size_t>(end),
+                      self.writable ? "rw-p" : "r--p");
+        coverage.feed_line(self.maps, std::strlen(self.maps));
+        return coverage.finish();
+      },
+      [](void*, uintptr_t address) {
+        return __atomic_load_n(reinterpret_cast<uintptr_t*>(address), __ATOMIC_ACQUIRE);
+      },
+      [](void*, uintptr_t address, uintptr_t* expected, uintptr_t desired) {
+        return __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(address), expected, desired,
+                                           false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      },
+      this};
+
+  RuleOomFixture() {
+    test::ElfBuilder b;
+    b.add_symbol("target", 1).add_jump_slot(1);
+    image = b.build();
+    __atomic_store_n(reinterpret_cast<uintptr_t*>(image.got_slot_addr(0)), uintptr_t{0x1000},
+                     __ATOMIC_RELEASE);
+    current = this;
+    detail::set_active_ops(&ops);
+    detail::set_active_image_enumerator(&RuleOomFixture::enumerate);
+  }
+  ~RuleOomFixture() {
+    detail::set_active_image_enumerator(nullptr);
+    detail::set_active_ops(nullptr);
+    current = nullptr;
+  }
+  yukiplt::ImageView view() const {
+    return {image.load_bias(), image.phdr_table(), image.phdr_count, 0xAB};
+  }
+  uintptr_t slot() const { return image.got_slot_addr(0); }
+  static yukiplt::Result<std::vector<yukiplt::NamedImage>> enumerate(
+      const yukiplt::ImageSelector&) {
+    try {
+      std::vector<yukiplt::NamedImage> out;
+      out.push_back({current->view(), current->path});
+      return out;
+    } catch (const std::bad_alloc&) {
+      return yukiplt::Error::Make(yukiplt::ErrorCode::kOutOfMemory);
+    }
+  }
+};
+RuleOomFixture* RuleOomFixture::current = nullptr;
+}  // namespace

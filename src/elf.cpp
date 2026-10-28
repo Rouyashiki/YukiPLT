@@ -73,6 +73,10 @@ struct DynamicInfo {
   uint64_t dt_pltrelsz = 0;
   uint64_t dt_pltrel = 0;
   uint64_t dt_relaent = 0;
+  uint64_t dt_rela = 0;
+  uint64_t dt_relasz = 0;
+  uint64_t dt_android_rela = 0;
+  uint64_t dt_android_relasz = 0;
 
   bool has_symtab = false;
   bool has_strtab = false;
@@ -84,6 +88,13 @@ struct DynamicInfo {
   bool has_pltrelsz = false;
   bool has_pltrel = false;
   bool has_relaent = false;
+  bool has_rela = false;
+  bool has_relasz = false;
+  bool has_android_rela = false;
+  bool has_android_relasz = false;
+  // Set when a RELA-family tag repeats, or an unusable REL form is present.
+  // The opt-in GLOB_DAT/APS2 path rejects such an image; hook() ignores it.
+  bool reloc_tags_unusable = false;
 };
 
 /// Parse the dynamic section, extracting the tags we care about.
@@ -144,6 +155,35 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
       case DT_RELAENT:
         info.dt_relaent = d.d_un.d_val;
         info.has_relaent = true;
+        break;
+      case kDtRela:
+        if (info.has_rela) info.reloc_tags_unusable = true;
+        info.dt_rela = d.d_un.d_ptr;
+        info.has_rela = true;
+        break;
+      case kDtRelaSz:
+        if (info.has_relasz) info.reloc_tags_unusable = true;
+        info.dt_relasz = d.d_un.d_val;
+        info.has_relasz = true;
+        break;
+      case kDtAndroidRela:
+        if (info.has_android_rela) info.reloc_tags_unusable = true;
+        info.dt_android_rela = d.d_un.d_ptr;
+        info.has_android_rela = true;
+        break;
+      case kDtAndroidRelaSz:
+        if (info.has_android_relasz) info.reloc_tags_unusable = true;
+        info.dt_android_relasz = d.d_un.d_val;
+        info.has_android_relasz = true;
+        break;
+      case kDtRel:
+      case kDtRelSz:
+      case kDtRelEnt:
+      case kDtAndroidRel:
+      case kDtAndroidRelSz:
+        // ELF REL (no addend) is never valid on AArch64.  Its presence makes
+        // the opt-in relocation path refuse the image; hook() still ignores it.
+        info.reloc_tags_unusable = true;
         break;
       default:
         break;
@@ -322,6 +362,29 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
     // Validate the entire JMPREL table is within a PT_LOAD segment.
     if (!image.addr_in_load(image.jmprel, static_cast<size_t>(dinfo.dt_pltrelsz)))
       return Error::Make(ErrorCode::kCorruptedElf);
+  }
+
+  // Record optional relocation metadata here; validate it only when scanned.
+  // Malformed optional tables must not reject the legacy JUMP_SLOT path.
+  image.reloc_tags_unusable = dinfo.reloc_tags_unusable;
+  image.rela_ent = static_cast<size_t>(dinfo.dt_relaent);
+  if (dinfo.has_rela != dinfo.has_relasz) image.reloc_tags_unusable = true;
+  if (dinfo.has_android_rela != dinfo.has_android_relasz) image.reloc_tags_unusable = true;
+  if (dinfo.has_rela && dinfo.has_relasz) {
+    if (resolve_ptr(dinfo.dt_rela, image.rela)) {
+      image.rela_size = static_cast<size_t>(dinfo.dt_relasz);
+    } else {
+      image.rela = 0;
+      image.reloc_tags_unusable = true;
+    }
+  }
+  if (dinfo.has_android_rela && dinfo.has_android_relasz) {
+    if (resolve_ptr(dinfo.dt_android_rela, image.android_rela)) {
+      image.android_rela_size = static_cast<size_t>(dinfo.dt_android_relasz);
+    } else {
+      image.android_rela = 0;
+      image.reloc_tags_unusable = true;
+    }
   }
 
   return image;

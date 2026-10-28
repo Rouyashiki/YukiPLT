@@ -14,6 +14,7 @@
 #include "imports.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
+#include "system_images.hpp"
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <link.h>
@@ -67,7 +68,10 @@ ImageIdentity identity_of(const ImageView& v) noexcept {
 
 /// Run `fn(live)` on the loaded system image matching `want`, with the dynamic
 /// linker's lock held (so the image cannot be unloaded during the call) and the
-/// op lock acquired inside it.
+/// op lock acquired inside it.  If `want_path` is non-null, the live entry's
+/// name (dlpi_name, or "" when absent, as find_images() reports it) must also
+/// equal it; an entry with the same bias/phdr/phnum but another name is a
+/// different image and does not match.
 ///
 /// Lock order is linker -> op, never the reverse: the op lock is only ever
 /// taken inside this callback for an image operation, or standalone for a
@@ -76,14 +80,15 @@ ImageIdentity identity_of(const ImageView& v) noexcept {
 /// captured and rethrown after the iteration returns.  Returns true if the
 /// image was found (and `fn` ran).
 template <typename Fn>
-bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
+bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_path = nullptr) {
 #if defined(__linux__) || defined(__ANDROID__)
   struct Ctx {
     const ImageIdentity* want;
+    const char* want_path;
     Fn* fn;
     bool matched;
     std::exception_ptr error;
-  } ctx{&want, &fn, false, nullptr};
+  } ctx{&want, want_path, &fn, false, nullptr};
 
   dl_iterate_phdr(
       [](struct dl_phdr_info* info, size_t /*size*/, void* p) -> int {
@@ -92,6 +97,10 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
             reinterpret_cast<uintptr_t>(info->dlpi_phdr) != c->want->phdr_addr ||
             info->dlpi_phnum != c->want->phdr_count) {
           return 0;
+        }
+        if (c->want_path != nullptr &&
+            std::strcmp(info->dlpi_name == nullptr ? "" : info->dlpi_name, c->want_path) != 0) {
+          return 1;  // Same address, different image: the wanted one is gone.
         }
         ImageView live;
         live.load_bias = static_cast<uintptr_t>(info->dlpi_addr);
@@ -113,6 +122,7 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn) {
 #else
   (void)want;
   (void)fn;
+  (void)want_path;
   return false;
 #endif
 }
@@ -124,6 +134,10 @@ struct PlannedSlot {
   uintptr_t replacement;
   void** out_original;
   size_t report_index;  ///< Index into the caller's reports array.
+  /// A function GLOB_DAT slot must not be installed over an unresolved (zero)
+  /// value: that would turn a null weak function pointer non-null.  JUMP_SLOT
+  /// and legacy paths leave this false.
+  bool reject_zero_original = false;
 };
 
 /// Every non-null original-pointer output must be pointer-aligned (the release
@@ -220,13 +234,14 @@ void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<Plann
 }
 
 /// Core install path for one image, run under the op lock.  `img` must be a
-/// freshly inspected, currently-valid image.
-HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
-                   size_t count, SlotReport* reports, size_t report_cap,
-                   const SelectedHookRequest* selected = nullptr) {
+/// freshly inspected, currently-valid image.  `plan_fn` resolves the caller's
+/// requests into `planned` (one planner per request shape: legacy name,
+/// versioned selector, or function selector).
+template <typename PlanFn>
+HookResult install_planned(const ImageView& view, SlotReport* reports, size_t report_cap,
+                           PlanFn&& plan_fn) {
   detail::SmallVec<PlannedSlot, 4> planned;
-  Error plan = selected != nullptr ? plan_selected_requests(img, selected, count, planned)
-                                   : plan_requests(img, reqs, count, planned);
+  Error plan = plan_fn(planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
 
   const size_t ps = detail::page_size();
@@ -270,6 +285,11 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
     uintptr_t cur = 0;
     txn.load(planned[i].address, cur);
     planned[i].original = cur;
+    // Reject unresolved GLOB_DAT before any write. Zero JUMP_SLOT remains valid.
+    if (planned[i].reject_zero_original && cur == 0) {
+      return {Error::Make(ErrorCode::kUnsupportedRelocation),
+              detail_api::make(detail_api::invalid())};
+    }
     if (cur == planned[i].replacement) {  // replacement == current value: ambiguous ownership
       return {Error::Make(ErrorCode::kInvalidArgument), detail_api::make(detail_api::invalid())};
     }
@@ -332,6 +352,68 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
     return {Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
             detail_api::make(detail_api::invalid())};
   return {Error::Make(ErrorCode::kSlotOwnershipConflict), detail_api::make(detail_api::invalid())};
+}
+
+/// Plan a function-import batch: one scan of the image's selected sources shared
+/// by all requests, then unique selection per request with duplicate-target and
+/// output checks.
+Error plan_function_requests(const InspectedImage& img, const FunctionHookRequest* reqs,
+                             size_t count, detail::SmallVec<PlannedSlot, 4>& out) {
+  uint32_t sources = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (reqs[i].replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
+    Error invalid = detail::validate_function_selector(reqs[i].target);
+    if (invalid) return invalid;
+    sources |= reqs[i].target.sources;
+  }
+  auto scan = detail::scan_function_imports(img, sources);
+  if (!scan) return scan.error();
+  for (size_t i = 0; i < count; ++i) {
+    auto selected = detail::select_function_reloc(scan.value(), reqs[i].target);
+    if (!selected) return selected.error();
+    const auto& record = scan.value().records[selected.value()].entry;
+    const uintptr_t address = record.base.import.slot_address;
+    for (const auto& previous : out) {
+      if (previous.address == address) return Error::Make(ErrorCode::kInvalidArgument);
+    }
+    PlannedSlot ps;
+    ps.address = address;
+    ps.original = 0;
+    ps.replacement = reinterpret_cast<uintptr_t>(reqs[i].replacement);
+    ps.out_original = reqs[i].out_original;
+    ps.report_index = i;
+    // Only a GLOB_DAT slot must refuse a zero current value; a JUMP_SLOT slot is
+    // installed regardless (its lazy stub value is non-zero and legitimate).
+    ps.reject_zero_original = record.relocation_type == detail::kRAarch64GlobDat;
+    out.push_back(ps);
+  }
+  return Error::Ok();
+}
+
+/// Legacy name batch.
+HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
+                   size_t count, SlotReport* reports, size_t report_cap) {
+  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+    return plan_requests(img, reqs, count, planned);
+  });
+}
+
+/// Versioned selector batch.
+HookResult install(const ImageView& view, const InspectedImage& img,
+                   const SelectedHookRequest* selected, size_t count, SlotReport* reports,
+                   size_t report_cap) {
+  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+    return plan_selected_requests(img, selected, count, planned);
+  });
+}
+
+/// Function selector batch (JUMP_SLOT + function GLOB_DAT).
+HookResult install(const ImageView& view, const InspectedImage& img,
+                   const FunctionHookRequest* reqs, size_t count, SlotReport* reports,
+                   size_t report_cap) {
+  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+    return plan_function_requests(img, reqs, count, planned);
+  });
 }
 
 }  // namespace
@@ -497,7 +579,7 @@ HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
-      return install(live, inspected.value(), nullptr, count, reports, count, reqs);
+      return install(live, inspected.value(), reqs, count, reports, count);
     } catch (const std::bad_alloc&) {
       return fail(Error::Make(ErrorCode::kOutOfMemory));
     } catch (const std::length_error&) {
@@ -521,6 +603,77 @@ HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
     return fail(Error::Make(ErrorCode::kUnsupportedFormat));
   }
 }
+// Function GLOB_DAT / APS2 imports (opt-in)
+//
+// inspect_function_imports() and find_function_import() are read-only and use
+// the inspect_metadata() helper, so they live further down with the other
+// snapshot entry points.  The installing entry points are here, next to
+// hook_imports(), since they share its install() / run_on_system_image() path.
+
+HookResult hook_function_import(const ImageView& image, const FunctionImportSelector& selector,
+                                void* replacement, void** out_original, SlotReport* report) {
+  FunctionHookRequest request{selector, replacement, out_original};
+  return hook_function_imports(image, &request, 1, report);
+}
+
+HookResult hook_function_imports(const ImageView& image, const FunctionHookRequest* reqs,
+                                 size_t count, SlotReport* reports) {
+  return detail::hook_function_imports_at(image, nullptr, reqs, count, reports);
+}
+
+}  // namespace yukiplt
+
+namespace yukiplt::detail {
+
+HookResult hook_function_imports_at(const ImageView& image, const char* expected_path,
+                                    const FunctionHookRequest* reqs, size_t count,
+                                    SlotReport* reports) {
+  auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
+  if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
+  if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
+  for (size_t i = 0; i < count; ++i) {
+    auto error = detail::validate_function_selector(reqs[i].target);
+    if (error) return fail(error);
+    if (reqs[i].replacement == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
+  }
+  // Reject unusable outputs before taking any lock or touching the image.
+  Error outputs = validate_outputs(reqs, count);
+  if (outputs) return fail(outputs);
+  auto apply = [&](const ImageView& live) -> HookResult {
+    try {
+      auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
+      if (!inspected) return fail(inspected.error());
+      return install(live, inspected.value(), reqs, count, reports, count);
+    } catch (const std::bad_alloc&) {
+      return fail(Error::Make(ErrorCode::kOutOfMemory));
+    } catch (const std::length_error&) {
+      return fail(Error::Make(ErrorCode::kIntegerOverflow));
+    } catch (...) {
+      // Never unwind through the loader's C callback frame.
+      return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+    }
+  };
+  try {
+    if (image.instance_token == 0) {
+      // Not found, or found at the same address under another name: the image
+      // the caller enumerated is no longer the one loaded there.
+      auto result = fail(Error::Make(ErrorCode::kImageInvalidated));
+      run_on_system_image(
+          identity_of(image), [&](const ImageView& live) { result = apply(live); }, expected_path);
+      return result;
+    }
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return apply(image);
+  } catch (const std::bad_alloc&) {
+    return fail(Error::Make(ErrorCode::kOutOfMemory));
+  } catch (...) {
+    return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+  }
+}
+
+}  // namespace yukiplt::detail
+
+namespace yukiplt {
 // unhook
 
 namespace {
@@ -838,6 +991,31 @@ Result<VersionedImport> find_import(const ImageView& image, const ImportSelector
       });
 }
 
+Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, uint32_t sources) {
+  // Validate the source mask before any image access: a zero or out-of-range
+  // mask is a programming error, not an image problem.
+  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  return inspect_metadata<FunctionImportSnapshot>(
+      image, [&](const InspectedImage& inspected) -> Result<FunctionImportSnapshot> {
+        return detail::snapshot_function_imports(inspected, sources);
+      });
+}
+
+Result<FunctionImport> find_function_import(const ImageView& image,
+                                            const FunctionImportSelector& selector) {
+  auto invalid = detail::validate_function_selector(selector);
+  if (invalid) return invalid;
+  return inspect_metadata<FunctionImport>(
+      image, [&](const InspectedImage& inspected) -> Result<FunctionImport> {
+        auto scan = detail::scan_function_imports(inspected, selector.sources);
+        if (!scan) return scan.error();
+        auto selected = detail::select_function_reloc(scan.value(), selector);
+        if (!selected) return selected.error();
+        return std::move(scan.value().records[selected.value()].entry);
+      });
+}
+
 Error abandon(HookHandle& handle) {
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -851,12 +1029,13 @@ Error abandon(HookHandle& handle) {
 }
 
 namespace {
-/// Fill `out` from the recorded slots, reading each live value only when
-/// `live_image` says the mapping can be trusted for this call.  Runs under the
-/// op lock (and, for a system image, inside the linker callback).
+/// Read live values under the operation lock and, for system images, linker lock.
+/// Try one maps read for the group; fall back to individual slots on failure.
 void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* out, size_t cap) {
   const size_t ps = detail::page_size();
-  for (size_t i = 0; i < n && i < cap && out != nullptr; ++i) {
+  const size_t filled = n < cap ? n : cap;
+  if (out == nullptr) return;
+  for (size_t i = 0; i < filled; ++i) {
     out[i].address = recs[i].address;
     out[i].value_before = recs[i].original;
     out[i].value_observed = 0;
@@ -864,7 +1043,23 @@ void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* o
     // means value_observed holds a genuine live read.  We never invent an
     // observed value from the recorded replacement.
     out[i].status = SlotStatus::kUntouched;
-    if (ps == 0 || !live_image) continue;
+  }
+  if (ps == 0 || !live_image || filled == 0) return;
+
+  uintptr_t addrs[kMaxBatch];
+  for (size_t i = 0; i < filled; ++i) addrs[i] = recs[i].address;
+  Txn all(detail::active_ops(), ps);
+  if (!all.prepare(addrs, filled)) {
+    for (size_t i = 0; i < filled; ++i) {
+      uintptr_t cur = 0;
+      if (all.load(recs[i].address, cur)) {
+        out[i].value_observed = cur;
+        out[i].status = SlotStatus::kInstalled;
+      }
+    }
+    return;
+  }
+  for (size_t i = 0; i < filled; ++i) {
     Txn txn(detail::active_ops(), ps);
     uintptr_t one = recs[i].address;
     if (!txn.prepare(&one, 1)) {

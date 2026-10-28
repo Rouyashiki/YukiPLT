@@ -47,6 +47,25 @@ struct InspectedImage {
   uintptr_t jmprel = 0;
   size_t jmprel_count = 0;
 
+  // Unvalidated native dynamic-relocation metadata. Only explicit function
+  // scans validate it; malformed optional tables must not break JUMP_SLOT APIs.
+  uintptr_t rela = 0;
+  size_t rela_size = 0;
+
+  /// Android packed relocations (DT_ANDROID_RELA): raw runtime address and the
+  /// declared byte size.  Decoded and validated only on the opt-in path.
+  uintptr_t android_rela = 0;
+  size_t android_rela_size = 0;
+
+  /// True if a RELA-family tag (DT_RELA/RELASZ, DT_ANDROID_RELA/SZ) appeared
+  /// more than once or without its pair, its address overflowed, or an unusable
+  /// REL form (DT_REL/DT_ANDROID_REL) was present.  The opt-in path rejects such
+  /// an image when it scans DT_RELA or DT_ANDROID_RELA; hook() ignores it.
+  bool reloc_tags_unusable = false;
+
+  /// DT_RELAENT as declared (0 if absent).  Validated on the opt-in path.
+  size_t rela_ent = 0;
+
   /// Validated dynamic array for optional metadata readers.
   uintptr_t dynamic = 0;
   size_t dynamic_size = 0;
@@ -119,6 +138,94 @@ Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& imag
 // CorruptedElf, and multiple distinct slots are AmbiguousSymbol.
 Expected<ResolvedSlot, Error> resolve_unique_slot(const InspectedImage& image,
                                                   const char* symbol_name);
+
+// Dynamic tags for plain and Android-packed RELA, plus the REL/RELR tags we
+// must recognise in order to reject or ignore them. glibc's <elf.h> does not
+// define the DT_ANDROID_* tags, so we name them here regardless of platform.
+constexpr int64_t kDtRela = 7;
+constexpr int64_t kDtRelaSz = 8;
+constexpr int64_t kDtRelaEnt = 9;
+constexpr int64_t kDtRel = 17;  // ELF REL (no addend): never valid on AArch64.
+constexpr int64_t kDtRelSz = 18;
+constexpr int64_t kDtRelEnt = 19;
+constexpr int64_t kDtAndroidRel = 0x6000000f;
+constexpr int64_t kDtAndroidRelSz = 0x60000010;
+constexpr int64_t kDtAndroidRela = 0x60000011;
+constexpr int64_t kDtAndroidRelaSz = 0x60000012;
+constexpr int64_t kDtRelr = 0x24;
+constexpr int64_t kDtRelrSz = 0x23;
+constexpr int64_t kDtAndroidRelr = 0x6fffe000;
+constexpr int64_t kDtAndroidRelrSz = 0x6fffe001;
+
+// AArch64 dynamic relocation types.
+constexpr uint32_t kRAarch64Abs64 = 257;
+constexpr uint32_t kRAarch64GlobDat = 1025;
+constexpr uint32_t kRAarch64JumpSlot = 1026;
+constexpr uint32_t kRAarch64Relative = 1027;
+constexpr uint32_t kRAarch64TlsTprel = 1030;
+constexpr uint32_t kRAarch64TlsDesc = 1031;
+constexpr uint32_t kRAarch64IRelative = 1032;
+
+// ELF symbol types (st_info low nibble).
+constexpr uint8_t kSttNotype = 0;
+constexpr uint8_t kSttObject = 1;
+constexpr uint8_t kSttFunc = 2;
+constexpr uint8_t kSttTls = 6;
+constexpr uint8_t kSttGnuIfunc = 10;
+
+constexpr uint16_t kShnUndef = 0;
+
+// Android packed relocation group flags (APS2 "APS2" format).
+constexpr uint64_t kRelocGroupedByInfo = 1;
+constexpr uint64_t kRelocGroupedByOffsetDelta = 2;
+constexpr uint64_t kRelocGroupedByAddend = 4;
+constexpr uint64_t kRelocGroupHasAddend = 8;
+
+// APS2 magic: the four bytes 'A','P','S','2'.
+constexpr uint8_t kAps2Magic[4] = {0x41, 0x50, 0x53, 0x32};
+
+// Resource budget for a single packed stream (maintainer decision): reject,
+// without reading the whole stream, a header that claims an implausible number
+// of relocations or a table larger than this many bytes. These are resource
+// limits (kOutOfBounds), not proof the ELF is malformed.
+constexpr uint64_t kMaxPackedRelocations = uint64_t{1} << 22;
+constexpr size_t kMaxPackedBytes = size_t{64} << 20;
+
+inline uint32_t reloc_type_of(uint64_t r_info) noexcept {
+  return static_cast<uint32_t>(ELF64_R_TYPE(r_info));
+}
+inline uint32_t reloc_sym_of(uint64_t r_info) noexcept {
+  return static_cast<uint32_t>(ELF64_R_SYM(r_info));
+}
+
+// Stream native and APS2 relocations through validated readable LOADs.
+// On failure the caller discards all collected records. Legacy JMPREL uses imports.cpp.
+
+/// Where a relocation record was found.
+enum class RelocSource : uint8_t { kJmprel, kRela, kAndroidRela };
+
+/// One decoded RELA-form relocation (the fields the function-import path needs).
+struct DecodedReloc {
+  uintptr_t slot_address = 0;  ///< Runtime address of the GOT slot (r_offset + bias).
+  uint32_t symbol_index = 0;   ///< ELF64_R_SYM(r_info).
+  uint32_t type = 0;           ///< ELF64_R_TYPE(r_info).
+  int64_t addend = 0;          ///< r_addend.
+  RelocSource source = RelocSource::kRela;
+  size_t index = 0;  ///< Index within its own source table (decode order for APS2).
+};
+
+/// Receives each decoded record in table order.  Returning an error stops the
+/// decode and is passed through unchanged.  May throw (e.g. std::bad_alloc);
+/// the decoder holds no state that an exception could leave inconsistent.
+using RelocVisitor = Error (*)(void* context, const DecodedReloc& record);
+
+// Validate native relocation entry size, readable interval and slot arithmetic.
+// Visit all types; omit only a wholly contained JMPREL tail with the same end.
+Error decode_rela(const InspectedImage& image, RelocVisitor visit, void* context);
+
+// Decode bounded APS2. Reject malformed SLEB128 and offset/addend overflow;
+// allow only zero padding after the declared records.
+Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void* context);
 
 }  // namespace yukiplt::detail
 

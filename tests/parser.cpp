@@ -3,12 +3,21 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <vector>
 
+#include "aps2_encoder.hpp"
 #include "elf_builder.hpp"
 #include "elf.hpp"
 #include "imports.hpp"
+#include "overrides.hpp"
+#include "memory.hpp"
+#include "registry.hpp"
+#include "yukiplt.hpp"
 
 namespace elf_inspector_checks {
 using namespace yukiplt;
@@ -136,3 +145,265 @@ TEST(Resolver, UniqueSlotDuplicateRecordsRejected) {
 }
 
 }  // namespace hash_checks
+
+namespace function_imports_checks {
+using namespace yukiplt;
+using test::Aps2Group;
+using test::Aps2Reloc;
+using test::ElfBuilder;
+using test::encode_aps2;
+
+namespace {
+
+size_t live_groups() {
+  std::lock_guard<std::mutex> lock(detail::op_mutex());
+  return detail::Registry::instance().live_count();
+}
+
+constexpr uint32_t kAll = kSourceJmprel | kSourceRela | kSourceAndroidRela;
+
+}  // namespace
+
+namespace {
+
+constexpr uint64_t kGlobDatSym1 = ELF64_R_INFO(1, R_AARCH64_GLOB_DAT);
+
+struct RawAps2 {
+  std::vector<uint8_t> bytes;
+  detail::InspectedImage image;
+  size_t visited = 0;
+
+  explicit RawAps2(std::vector<uint8_t> stream, size_t padded_size = 0) : bytes(std::move(stream)) {
+    if (padded_size > bytes.size()) bytes.resize(padded_size, 0);
+    const uintptr_t base = reinterpret_cast<uintptr_t>(bytes.data());
+    image.load_segments.push_back({base, base + bytes.size(), PF_R | PF_W});
+    image.android_rela = base;
+    image.android_rela_size = bytes.size();
+  }
+
+  Error decode() {
+    visited = 0;
+    return detail::decode_android_rela(
+        image,
+        [](void* context, const detail::DecodedReloc&) {
+          ++*static_cast<size_t*>(context);
+          return Error::Ok();
+        },
+        &visited);
+  }
+};
+
+std::vector<uint8_t> aps2_header(int64_t total, int64_t initial_offset) {
+  std::vector<uint8_t> out = {0x41, 0x50, 0x53, 0x32};
+  test::append_sleb128(out, total);
+  test::append_sleb128(out, initial_offset);
+  return out;
+}
+
+void append_single(std::vector<uint8_t>& out, int64_t delta, uint64_t info) {
+  test::append_sleb128(out, 1);
+  test::append_sleb128(out, 0);
+  test::append_sleb128(out, delta);
+  test::append_sleb128(out, static_cast<int64_t>(info));
+}
+
+}  // namespace
+
+TEST(FunctionImportsAps2, CorruptionAfterTheTargetFailsTheWholeDecode) {
+  auto bytes = aps2_header(2, 0);
+  append_single(bytes, 8, kGlobDatSym1);
+  test::append_sleb128(bytes, 1);
+  test::append_sleb128(bytes, 0);
+  test::append_sleb128(bytes, 8);
+  bytes.push_back(0x80);
+  RawAps2 raw(bytes);
+  EXPECT_EQ(raw.decode().code, ErrorCode::kCorruptedElf);
+}
+
+TEST(FunctionImportsAps2, OverlongOrOutOfRangeSlebRejected) {
+  auto overlong = aps2_header(1, 0);
+  test::append_sleb128(overlong, 1);
+  test::append_sleb128(overlong, 0);
+  for (int i = 0; i < 10; ++i) overlong.push_back(0x80);
+  overlong.push_back(0x00);
+  test::append_sleb128(overlong, static_cast<int64_t>(kGlobDatSym1));
+  RawAps2 overlong_raw(overlong);
+  EXPECT_EQ(overlong_raw.decode().code, ErrorCode::kCorruptedElf);
+
+  auto wide = aps2_header(1, 0);
+  test::append_sleb128(wide, 1);
+  test::append_sleb128(wide, 0);
+  for (int i = 0; i < 9; ++i) wide.push_back(0x80);
+  wide.push_back(0x01);
+  test::append_sleb128(wide, static_cast<int64_t>(kGlobDatSym1));
+  RawAps2 wide_raw(wide);
+  EXPECT_EQ(wide_raw.decode().code, ErrorCode::kCorruptedElf);
+
+  for (int64_t extreme : {INT64_MAX, INT64_MIN}) {
+    std::vector<uint8_t> encoded;
+    test::append_sleb128(encoded, extreme);
+    ASSERT_EQ(encoded.size(), 10u);
+    auto bytes = aps2_header(1, 0);
+    test::append_sleb128(bytes, 1);
+    test::append_sleb128(bytes, 8);
+    test::append_sleb128(bytes, 8);
+    test::append_sleb128(bytes, static_cast<int64_t>(kGlobDatSym1));
+    test::append_sleb128(bytes, extreme);
+    RawAps2 raw(bytes);
+    EXPECT_FALSE(raw.decode()) << extreme;
+  }
+}
+
+namespace {
+Elf64_Dyn* find_dyn(ElfBuilder::BuiltImage& image, int64_t tag) {
+  const Elf64_Phdr* ph = image.phdr_table();
+  for (size_t i = 0; i < image.phdr_count; ++i) {
+    if (ph[i].p_type != PT_DYNAMIC) continue;
+    auto* d = reinterpret_cast<Elf64_Dyn*>(image.load_bias() + ph[i].p_vaddr);
+    for (; d->d_tag != DT_NULL; ++d)
+      if (d->d_tag == tag) return d;
+  }
+  return nullptr;
+}
+}  // namespace
+
+namespace {
+
+Error decode_rela(const detail::InspectedImage& img, std::vector<detail::DecodedReloc>& out) {
+  return detail::decode_rela(img, collect_into, &out);
+}
+
+Elf64_Rela glob_dat(uint32_t sym, uint64_t slot_vaddr) {
+  Elf64_Rela r{};
+  r.r_offset = slot_vaddr;
+  r.r_info = ELF64_R_INFO(sym, R_AARCH64_GLOB_DAT);
+  r.r_addend = 0;
+  return r;
+}
+
+}  // namespace
+
+namespace {
+FunctionImportSelector sel(const char* symbol, uint32_t sources = kAll,
+                           uint32_t types = kTypeJumpSlot | kTypeGlobDat) {
+  FunctionImportSelector s;
+  s.base.symbol = symbol;
+  s.sources = sources;
+  s.types = types;
+  return s;
+}
+}  // namespace
+
+namespace {
+
+struct FuncInstallFixture : testing::Test {
+  ElfBuilder::BuiltImage image;
+  uintptr_t first_page = 0;
+  uintptr_t end_page = 0;
+  bool writable = false;
+  size_t protect_calls = 0;
+  size_t maps_calls = 0;
+  size_t cas_calls = 0;
+
+  size_t race_before_cas = 0;
+  uintptr_t race_slot_addr = 0;
+  uintptr_t race_value = 0;
+  void* outputs[4]{};
+
+  detail::PlatformOps ops{
+      [](void* p, uintptr_t, size_t, int prot) {
+        auto& self = *static_cast<FuncInstallFixture*>(p);
+        ++self.protect_calls;
+        self.writable = (prot & detail::kProtWrite) != 0;
+        return 0;
+      },
+      [](void* p, detail::MapsCoverage& coverage) {
+        auto& self = *static_cast<FuncInstallFixture*>(p);
+        ++self.maps_calls;
+        char line[128];
+        std::snprintf(line, sizeof(line), "%zx-%zx %s 00000000 00:00 0",
+                      static_cast<size_t>(self.first_page), static_cast<size_t>(self.end_page),
+                      self.writable ? "rw-p" : "r--p");
+        coverage.feed_line(line, std::strlen(line));
+        return coverage.finish();
+      },
+      [](void*, uintptr_t address) {
+        return __atomic_load_n(reinterpret_cast<uintptr_t*>(address), __ATOMIC_ACQUIRE);
+      },
+      [](void* p, uintptr_t address, uintptr_t* expected, uintptr_t desired) {
+        auto& self = *static_cast<FuncInstallFixture*>(p);
+        if (++self.cas_calls == self.race_before_cas && self.race_slot_addr != 0)
+          __atomic_store_n(reinterpret_cast<uintptr_t*>(self.race_slot_addr), self.race_value,
+                           __ATOMIC_RELEASE);
+        return __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(address), expected, desired,
+                                           false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      },
+      this};
+
+  void set_backing(ElfBuilder::BuiltImage&& built) {
+    image = std::move(built);
+    const size_t ps = detail::page_size();
+    ASSERT_NE(ps, 0u);
+    first_page = image.load_bias() & ~(ps - 1);
+    end_page = (image.load_bias() + image.buffer.size() + ps - 1) & ~(ps - 1);
+  }
+  void SetUp() override { detail::set_active_ops(&ops); }
+  void TearDown() override { detail::set_active_ops(nullptr); }
+
+  ImageView view(uint64_t token = 0x51) const {
+    return {image.load_bias(), image.phdr_table(), image.phdr_count, token};
+  }
+  uintptr_t rd(uintptr_t addr) const {
+    return __atomic_load_n(reinterpret_cast<uintptr_t*>(addr), __ATOMIC_ACQUIRE);
+  }
+  void wr(uintptr_t addr, uintptr_t value) {
+    __atomic_store_n(reinterpret_cast<uintptr_t*>(addr), value, __ATOMIC_RELEASE);
+  }
+};
+
+void* const kReplA = reinterpret_cast<void*>(uintptr_t{0xA000});
+void* const kReplB = reinterpret_cast<void*>(uintptr_t{0xB000});
+
+}  // namespace
+
+TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModification) {
+  ElfBuilder b;
+  b.add_symbol("gfunc", 1).set_symbol_undefined(1);
+  b.add_rela(1, R_AARCH64_GLOB_DAT, 0);
+  set_backing(b.build());
+  wr(image.rela_slot_addr(0), 0);
+
+  const size_t baseline = live_groups();
+  auto result = hook_function_import(view(), sel("gfunc"), kReplA, &outputs[0]);
+  EXPECT_EQ(result.error.code, ErrorCode::kUnsupportedRelocation);
+  EXPECT_FALSE(result.handle.valid());
+  EXPECT_EQ(rd(image.rela_slot_addr(0)), 0u);
+  EXPECT_EQ(cas_calls, 0u);
+  EXPECT_EQ(outputs[0], nullptr);
+  EXPECT_EQ(live_groups(), baseline);
+}
+
+TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
+  ElfBuilder b;
+  b.add_symbol("good", 1);
+  b.add_symbol("bad", 2).set_symbol_undefined(2).set_symbol_type(2, STT_OBJECT);
+  b.add_jump_slot(1);
+  b.add_rela(2, R_AARCH64_GLOB_DAT, 0);
+  set_backing(b.build());
+  wr(image.got_slot_addr(0), 0x1111);
+  wr(image.rela_slot_addr(0), 0x2222);
+
+  const size_t baseline = live_groups();
+  FunctionHookRequest reqs[] = {{sel("good"), kReplA, &outputs[0]},
+                                {sel("bad"), kReplB, &outputs[1]}};
+  auto result = hook_function_imports(view(), reqs, 2);
+  EXPECT_EQ(result.error.code, ErrorCode::kUnsupportedRelocation);
+  EXPECT_FALSE(result.handle.valid());
+  EXPECT_EQ(rd(image.got_slot_addr(0)), 0x1111u);
+  EXPECT_EQ(rd(image.rela_slot_addr(0)), 0x2222u);
+  EXPECT_EQ(cas_calls, 0u);
+  EXPECT_EQ(maps_calls, 0u);
+  EXPECT_EQ(live_groups(), baseline);
+}
+
+}  // namespace function_imports_checks

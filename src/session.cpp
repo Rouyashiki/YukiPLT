@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <atomic>
 #include <cstring>
 #include <new>
 #include <stdexcept>
 
 #include "imports.hpp"
+#include "system_images.hpp"
 #include "yukiplt.hpp"
 
 #if defined(__linux__) || defined(__ANDROID__)
@@ -37,15 +39,7 @@ ImportSelector exact_selector(const VersionedImport& chosen) noexcept {
 }  // namespace
 
 Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
-  if (selector.match == ImageMatch::kExactPath || selector.match == ImageMatch::kBasename) {
-    if (selector.name == nullptr || *selector.name == '\0' ||
-        ((std::strchr(selector.name, '/') != nullptr) !=
-         (selector.match == ImageMatch::kExactPath)))
-      return Error::Make(ErrorCode::kInvalidArgument);
-  } else if (selector.match != ImageMatch::kMainExecutable &&
-             selector.match != ImageMatch::kLoadBias) {
-    return Error::Make(ErrorCode::kInvalidArgument);
-  }
+  if (Error invalid = detail::validate_image_selector(selector)) return invalid;
 #if defined(__linux__) || defined(__ANDROID__)
   struct Context {
     const ImageSelector& selector;
@@ -101,6 +95,27 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
   return Error::Make(ErrorCode::kUnsupportedFormat);
 #endif
 }
+
+}  // namespace yukiplt
+
+namespace yukiplt::detail {
+
+Error validate_image_selector(const ImageSelector& selector) noexcept {
+  if (selector.match == ImageMatch::kExactPath || selector.match == ImageMatch::kBasename) {
+    if (selector.name == nullptr || *selector.name == '\0' ||
+        ((std::strchr(selector.name, '/') != nullptr) !=
+         (selector.match == ImageMatch::kExactPath)))
+      return Error::Make(ErrorCode::kInvalidArgument);
+  } else if (selector.match != ImageMatch::kMainExecutable &&
+             selector.match != ImageMatch::kLoadBias) {
+    return Error::Make(ErrorCode::kInvalidArgument);
+  }
+  return Error::Ok();
+}
+
+}  // namespace yukiplt::detail
+
+namespace yukiplt {
 
 Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t* failed_target) {
   if (failed_target) *failed_target = ~size_t{0};
@@ -246,3 +261,7 @@ SessionSummary HookSession::abandon() {
 }
 
 }  // namespace yukiplt
+
+namespace yukiplt::detail {
+ImageEnumerator active_image_enumerator() noexcept { return &find_images; }
+}  // namespace yukiplt::detail

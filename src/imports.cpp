@@ -117,6 +117,8 @@ Result<size_t> symbol_count(const InspectedImage& image) {
 
 }  // namespace
 
+Result<size_t> dynamic_symbol_count(const InspectedImage& image) { return symbol_count(image); }
+
 Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
   ImportSnapshot snapshot;
   if (image.jmprel_count == 0) return snapshot;
@@ -321,9 +323,12 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
 
 }  // namespace
 
-Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image) {
-  auto raw = snapshot_imports(image);
-  if (!raw) return raw.error();
+// Attach version metadata to a caller-supplied set of imports (from DT_JMPREL,
+// DT_RELA or DT_ANDROID_RELA).  Shared by snapshot_versioned_imports() and the
+// function-import path so version parsing lives in one place.
+Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
+                                                 std::vector<ImportInfo> imports,
+                                                 size_t skipped_relocations) {
   auto tags = version_tags(image);
   if (!tags) return tags.error();
   const auto& t = tags.value();
@@ -359,8 +364,8 @@ Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage&
   if (t.present[0] && !image.dptr_adjusted && !safe_add(image.load_bias, versym, versym))
     return Error::Make(ErrorCode::kIntegerOverflow);
   VersionedImportSnapshot result;
-  result.skipped_relocations = raw.value().skipped_relocations;
-  for (auto& entry : raw.value().imports) {
+  result.skipped_relocations = skipped_relocations;
+  for (auto& entry : imports) {
     SymbolVersion version;
     version.table_present = t.present[0];
     if (t.present[0]) {
@@ -387,6 +392,12 @@ Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage&
     result.imports.push_back({std::move(entry), std::move(version)});
   }
   return result;
+}
+
+Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image) {
+  auto raw = snapshot_imports(image);
+  if (!raw) return raw.error();
+  return resolve_versions(image, std::move(raw.value().imports), raw.value().skipped_relocations);
 }
 
 Error validate_selector(const ImportSelector& selector) noexcept {
@@ -422,6 +433,474 @@ Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
         (selector.hidden == HiddenMatch::kHidden && !entry.version.hidden) ||
         (selector.hidden == HiddenMatch::kNonHidden && entry.version.hidden))
       continue;
+    if (selected != ~size_t{0}) return Error::Make(ErrorCode::kAmbiguousSymbol);
+    selected = i;
+  }
+  if (selected == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
+  return selected;
+}
+
+namespace {
+
+// True if [addr, addr + size) lies entirely within one readable (PF_R) LOAD.
+
+// Resolve r_offset to a runtime slot address.
+bool resolve_slot(const InspectedImage& image, uint64_t r_offset, uintptr_t& out) noexcept {
+  return safe_add(image.load_bias, static_cast<uintptr_t>(r_offset), out);
+}
+
+}  // namespace
+
+Error decode_rela(const InspectedImage& image, RelocVisitor visit, void* context) {
+  if (image.rela == 0 || image.rela_size == 0) return Error::Ok();
+  if (image.rela_ent != 0 && image.rela_ent != sizeof(Elf64_Rela))
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  if (image.rela_size % sizeof(Elf64_Rela) != 0) return Error::Make(ErrorCode::kCorruptedElf);
+  if (!readable(image, image.rela, image.rela_size)) return Error::Make(ErrorCode::kOutOfBounds);
+
+  size_t count = image.rela_size / sizeof(Elf64_Rela);
+
+  // Allow overlap only when JMPREL is wholly inside the native table and shares
+  // its end; decode the prefix once. Reject all other overlaps.
+  if (image.jmprel != 0 && image.jmprel_count != 0) {
+    uintptr_t rela_begin = image.rela;
+    uintptr_t rela_end = image.rela + image.rela_size;  // readable() proved no overflow.
+    uintptr_t plt_begin = image.jmprel;
+    uintptr_t plt_bytes = image.jmprel_count * sizeof(Elf64_Rela);
+    uintptr_t plt_end;
+    if (!safe_add(plt_begin, plt_bytes, plt_end)) return Error::Make(ErrorCode::kIntegerOverflow);
+    const bool disjoint = plt_end <= rela_begin || plt_begin >= rela_end;
+    if (!disjoint) {
+      const bool contained_with_shared_end = plt_begin >= rela_begin && plt_end == rela_end &&
+                                             (plt_begin - rela_begin) % sizeof(Elf64_Rela) == 0;
+      if (!contained_with_shared_end) return Error::Make(ErrorCode::kCorruptedElf);
+      count = (plt_begin - rela_begin) / sizeof(Elf64_Rela);
+    }
+  }
+
+  for (size_t i = 0; i < count; ++i) {
+    Elf64_Rela rela;
+    std::memcpy(&rela, reinterpret_cast<const void*>(image.rela + i * sizeof(Elf64_Rela)),
+                sizeof(rela));
+    DecodedReloc decoded;
+    if (!resolve_slot(image, rela.r_offset, decoded.slot_address))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    decoded.symbol_index = reloc_sym_of(rela.r_info);
+    decoded.type = reloc_type_of(rela.r_info);
+    decoded.addend = static_cast<int64_t>(rela.r_addend);
+    decoded.source = RelocSource::kRela;
+    decoded.index = i;
+    if (Error e = visit(context, decoded)) return e;
+  }
+  return Error::Ok();
+}
+
+namespace {
+
+/// A bounds-checked cursor over the packed byte stream.  Every read verifies it
+/// stays within [base, base + size); SLEB128 reads also cap the encoding length.
+class ByteCursor {
+ public:
+  ByteCursor(uintptr_t base, size_t size) noexcept : at_(base), end_(base + size), ok_(true) {
+    // The caller proved [base, base+size) is readable, so base+size cannot wrap.
+  }
+
+  bool ok() const noexcept { return ok_; }
+  size_t remaining() const noexcept { return ok_ ? static_cast<size_t>(end_ - at_) : 0; }
+
+  // Read one byte; sets failure and returns 0 at end of stream.
+  uint8_t byte() noexcept {
+    if (!ok_ || at_ >= end_) {
+      ok_ = false;
+      return 0;
+    }
+    uint8_t value;
+    std::memcpy(&value, reinterpret_cast<const void*>(at_), 1);
+    ++at_;
+    return value;
+  }
+
+  // SLEB128 must fit int64_t: byte ten may only terminate with 0x00 or 0x7f.
+  // Reject truncation, continuation and invalid sign extension.
+  int64_t sleb128() noexcept {
+    uint64_t result = 0;
+    int shift = 0;
+    constexpr int kMaxBytes = 10;
+    for (int i = 0; i < kMaxBytes; ++i) {
+      const uint8_t byte_value = byte();
+      if (!ok_) return 0;
+      if (i == kMaxBytes - 1) {
+        if (byte_value != 0x00 && byte_value != 0x7f) break;
+        if (byte_value == 0x7f) result |= uint64_t{1} << 63;
+        return static_cast<int64_t>(result);
+      }
+      result |= static_cast<uint64_t>(byte_value & 0x7f) << shift;
+      shift += 7;
+      if ((byte_value & 0x80) == 0) {
+        // Sign-extend from the final bit (shift <= 63 here).
+        if (byte_value & 0x40) result |= ~uint64_t{0} << shift;
+        return static_cast<int64_t>(result);
+      }
+    }
+    ok_ = false;
+    return 0;
+  }
+
+ private:
+  uintptr_t at_;
+  uintptr_t end_;
+  bool ok_;
+};
+
+constexpr uint64_t kKnownGroupFlags =
+    kRelocGroupedByInfo | kRelocGroupedByOffsetDelta | kRelocGroupedByAddend | kRelocGroupHasAddend;
+
+}  // namespace
+
+Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void* context) {
+  if (image.android_rela == 0 || image.android_rela_size == 0) return Error::Ok();
+  if (image.android_rela_size > kMaxPackedBytes) return Error::Make(ErrorCode::kOutOfBounds);
+  if (!readable(image, image.android_rela, image.android_rela_size))
+    return Error::Make(ErrorCode::kOutOfBounds);
+
+  ByteCursor cursor(image.android_rela, image.android_rela_size);
+
+  // Magic "APS2".
+  for (unsigned char expected : kAps2Magic) {
+    if (cursor.byte() != expected || !cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+  }
+
+  const int64_t total_signed = cursor.sleb128();
+  const int64_t group_base_offset = cursor.sleb128();
+  if (!cursor.ok() || total_signed < 0 || group_base_offset < 0)
+    return Error::Make(ErrorCode::kCorruptedElf);
+  const uint64_t total = static_cast<uint64_t>(total_signed);
+  if (total > kMaxPackedRelocations) return Error::Make(ErrorCode::kOutOfBounds);
+
+  // r_offset and the addend are accumulated with checked signed arithmetic: a
+  // stream whose running value overflows int64_t is rejected, never wrapped.
+  // Every emitted r_offset must also be non-negative.
+  int64_t offset = group_base_offset;
+  int64_t addend = 0;
+  uint64_t emitted = 0;
+
+  while (emitted < total) {
+    const int64_t group_size_signed = cursor.sleb128();
+    const int64_t group_flags_signed = cursor.sleb128();
+    if (!cursor.ok() || group_size_signed <= 0) return Error::Make(ErrorCode::kCorruptedElf);
+    const uint64_t group_size = static_cast<uint64_t>(group_size_signed);
+    if (group_size > total - emitted) return Error::Make(ErrorCode::kCorruptedElf);
+    if (group_flags_signed < 0 ||
+        (static_cast<uint64_t>(group_flags_signed) & ~kKnownGroupFlags) != 0)
+      return Error::Make(ErrorCode::kCorruptedElf);
+    const uint64_t flags = static_cast<uint64_t>(group_flags_signed);
+
+    const bool grouped_by_delta = (flags & kRelocGroupedByOffsetDelta) != 0;
+    const bool grouped_by_info = (flags & kRelocGroupedByInfo) != 0;
+    const bool group_has_addend = (flags & kRelocGroupHasAddend) != 0;
+    const bool grouped_by_addend = (flags & kRelocGroupedByAddend) != 0;
+    // "grouped by addend" without "has addend" is contradictory.
+    if (grouped_by_addend && !group_has_addend) return Error::Make(ErrorCode::kCorruptedElf);
+
+    int64_t group_offset_delta = 0;
+    uint64_t group_info = 0;
+    if (grouped_by_delta) {
+      group_offset_delta = cursor.sleb128();
+      if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+    }
+    if (grouped_by_info) {
+      group_info = static_cast<uint64_t>(cursor.sleb128());
+      if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+    }
+    if (grouped_by_addend) {
+      const int64_t group_addend_delta = cursor.sleb128();
+      if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+      if (__builtin_add_overflow(addend, group_addend_delta, &addend))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+    }
+
+    for (uint64_t i = 0; i < group_size; ++i) {
+      int64_t delta = group_offset_delta;
+      if (!grouped_by_delta) {
+        delta = cursor.sleb128();
+        if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+      }
+      if (__builtin_add_overflow(offset, delta, &offset))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+      if (offset < 0) return Error::Make(ErrorCode::kCorruptedElf);
+      uint64_t info = group_info;
+      if (!grouped_by_info) {
+        info = static_cast<uint64_t>(cursor.sleb128());
+        if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+      }
+      if (group_has_addend && !grouped_by_addend) {
+        const int64_t addend_delta = cursor.sleb128();
+        if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+        if (__builtin_add_overflow(addend, addend_delta, &addend))
+          return Error::Make(ErrorCode::kIntegerOverflow);
+      }
+      if (!group_has_addend) addend = 0;
+
+      DecodedReloc decoded;
+      if (!resolve_slot(image, static_cast<uint64_t>(offset), decoded.slot_address))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+      decoded.symbol_index = reloc_sym_of(info);
+      decoded.type = reloc_type_of(info);
+      decoded.addend = addend;
+      decoded.source = RelocSource::kAndroidRela;
+      decoded.index = static_cast<size_t>(emitted);
+      if (Error e = visit(context, decoded)) return e;
+      ++emitted;
+    }
+  }
+
+  // The declared count is consumed.  Any remaining bytes must be all-zero
+  // padding (LLD aligns the section); a non-zero trailing byte is malformed.
+  while (cursor.remaining() != 0) {
+    if (cursor.byte() != 0) return Error::Make(ErrorCode::kCorruptedElf);
+  }
+  if (!cursor.ok()) return Error::Make(ErrorCode::kCorruptedElf);
+  return Error::Ok();
+}
+
+namespace {
+
+RelocationSource to_public_source(RelocSource source) noexcept {
+  switch (source) {
+    case RelocSource::kJmprel:
+      return RelocationSource::kJmprel;
+    case RelocSource::kRela:
+      return RelocationSource::kRela;
+    case RelocSource::kAndroidRela:
+    default:
+      return RelocationSource::kAndroidRela;
+  }
+}
+
+// True if [addr, addr + size) lies entirely within one readable (PF_R) LOAD.
+// Every table this path reads must pass this, exactly as on the legacy path.
+
+// Per-scan state shared by every source.  The dynsym bound and the string
+// table are validated on the first record that needs a symbol, so an image
+// with nothing to import never has its hash table or strings read.
+struct ScanState {
+  const InspectedImage& image;
+  RawFunctionSnapshot& result;
+  size_t symbol_bound = 0;
+  bool symbols_ready = false;
+};
+
+Error ensure_symbols(ScanState& state) {
+  if (state.symbols_ready) return Error::Ok();
+  auto bound = dynamic_symbol_count(state.image);
+  if (!bound) return bound.error();
+  if (!readable(state.image, state.image.strtab, state.image.strsz))
+    return Error::Make(ErrorCode::kOutOfBounds);
+  state.symbol_bound = bound.value();
+  state.symbols_ready = true;
+  return Error::Ok();
+}
+
+// Read a record's symbol name (bounded by STRSZ), ELF symbol type and whether it
+// is undefined.  An empty name is recorded as-is, as the legacy snapshot does;
+// no selector can match it, because a selector's symbol must be non-empty.
+Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& name,
+                  uint8_t& symbol_type, bool& undefined) {
+  const InspectedImage& image = state.image;
+  if (symbol_index == 0 || symbol_index >= state.symbol_bound)
+    return Error::Make(ErrorCode::kCorruptedElf);
+  uintptr_t sym_addr;
+  if (!safe_add(image.symtab, static_cast<uintptr_t>(symbol_index) * sizeof(Elf64_Sym), sym_addr))
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  if (!readable(image, sym_addr, sizeof(Elf64_Sym))) return Error::Make(ErrorCode::kOutOfBounds);
+  Elf64_Sym sym;
+  std::memcpy(&sym, reinterpret_cast<const void*>(sym_addr), sizeof(sym));
+  if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
+  const char* begin = reinterpret_cast<const char*>(image.strtab + sym.st_name);
+  const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - sym.st_name));
+  if (end == nullptr) return Error::Make(ErrorCode::kCorruptedElf);
+  name.assign(begin, static_cast<size_t>(end - begin));
+  symbol_type = static_cast<uint8_t>(ELF64_ST_TYPE(sym.st_info));
+  undefined = sym.st_shndx == kShnUndef;
+  return Error::Ok();
+}
+
+// Keep one record from any source.  Only JUMP_SLOT and GLOB_DAT with a non-zero
+// symbol index are materialized, whichever table holds them (labelled with their
+// real source and type); every other record is only counted, so a large table
+// of RELATIVE or other relocations costs no memory.
+Error keep(ScanState& state, const DecodedReloc& reloc) {
+  if ((reloc.type != kRAarch64JumpSlot && reloc.type != kRAarch64GlobDat) ||
+      reloc.symbol_index == 0) {
+    ++state.result.skipped_relocations;
+    return Error::Ok();
+  }
+  if (reloc.slot_address % sizeof(uint64_t) != 0 ||
+      !state.image.addr_in_writable_load(reloc.slot_address, sizeof(uint64_t)))
+    return Error::Make(ErrorCode::kCorruptedElf);
+  if (Error e = ensure_symbols(state)) return e;
+  FunctionReloc record;
+  if (Error e = read_symbol(state, reloc.symbol_index, record.entry.base.import.symbol,
+                            record.entry.symbol_type, record.symbol_undefined))
+    return e;
+  record.entry.base.import.symbol_index = reloc.symbol_index;
+  record.entry.base.import.relocation_index = reloc.index;
+  record.entry.base.import.slot_address = reloc.slot_address;
+  record.entry.source = to_public_source(reloc.source);
+  record.entry.relocation_type = reloc.type;
+  record.addend = reloc.addend;
+  state.result.records.push_back(std::move(record));
+  return Error::Ok();
+}
+
+Error visit_record(void* context, const DecodedReloc& reloc) {
+  return keep(*static_cast<ScanState*>(context), reloc);
+}
+
+}  // namespace
+
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources) {
+  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  // Scanning DT_RELA or DT_ANDROID_RELA refuses an image whose relocation tags
+  // are unusable (a repeated tag, a pointer without its size, an overflowing
+  // address, or a REL form).  A DT_JMPREL-only scan does not read those tables
+  // and, like the legacy path, ignores them.
+  if (image.reloc_tags_unusable && (sources & (kSourceRela | kSourceAndroidRela)) != 0)
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+
+  RawFunctionSnapshot result;
+  ScanState state{image, result};
+
+  if ((sources & kSourceJmprel) != 0 && image.jmprel_count != 0) {
+    // inspect() bounded the table within a LOAD; reading it also needs PF_R.
+    if (!readable(image, image.jmprel, image.jmprel_count * sizeof(Elf64_Rela)))
+      return Error::Make(ErrorCode::kOutOfBounds);
+    for (size_t i = 0; i < image.jmprel_count; ++i) {
+      Elf64_Rela rela;
+      std::memcpy(&rela, reinterpret_cast<const void*>(image.jmprel + i * sizeof(Elf64_Rela)),
+                  sizeof(rela));
+      DecodedReloc reloc;
+      if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), reloc.slot_address))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+      reloc.symbol_index = reloc_sym_of(rela.r_info);
+      reloc.type = reloc_type_of(rela.r_info);
+      reloc.addend = static_cast<int64_t>(rela.r_addend);
+      reloc.source = RelocSource::kJmprel;
+      reloc.index = i;
+      if (Error e = keep(state, reloc)) return e;
+    }
+  }
+  if (sources & kSourceRela) {
+    if (Error e = decode_rela(image, visit_record, &state)) return e;
+  }
+  if (sources & kSourceAndroidRela) {
+    if (Error e = decode_android_rela(image, visit_record, &state)) return e;
+  }
+
+  // Duplicate slot addresses across all scanned sources are malformed.
+  std::vector<uintptr_t> addresses;
+  addresses.reserve(result.records.size());
+  for (const auto& record : result.records)
+    addresses.push_back(record.entry.base.import.slot_address);
+  std::sort(addresses.begin(), addresses.end());
+  if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
+    return Error::Make(ErrorCode::kCorruptedElf);
+
+  // Attach version metadata over the whole set, preserving order.
+  std::vector<ImportInfo> infos;
+  infos.reserve(result.records.size());
+  for (const auto& record : result.records) infos.push_back(record.entry.base.import);
+  auto versioned = resolve_versions(image, std::move(infos), result.skipped_relocations);
+  if (!versioned) return versioned.error();
+  for (size_t i = 0; i < result.records.size(); ++i)
+    result.records[i].entry.base.version = std::move(versioned.value().imports[i].version);
+  return result;
+}
+
+Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& image,
+                                                         uint32_t sources) {
+  auto scan = scan_function_imports(image, sources);
+  if (!scan) return scan.error();
+  FunctionImportSnapshot result;
+  result.skipped_relocations = scan.value().skipped_relocations;
+  result.imports.reserve(scan.value().records.size());
+  for (auto& record : scan.value().records) result.imports.push_back(std::move(record.entry));
+  return result;
+}
+
+Error validate_function_selector(const FunctionImportSelector& selector) noexcept {
+  if (Error e = validate_selector(selector.base)) return e;
+  if (selector.sources == 0 ||
+      (selector.sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  if (selector.types == 0 || (selector.types & ~(kTypeJumpSlot | kTypeGlobDat)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  return Error::Ok();
+}
+
+namespace {
+
+uint32_t source_bit(RelocationSource source) noexcept {
+  switch (source) {
+    case RelocationSource::kJmprel:
+      return kSourceJmprel;
+    case RelocationSource::kRela:
+      return kSourceRela;
+    case RelocationSource::kAndroidRela:
+    default:
+      return kSourceAndroidRela;
+  }
+}
+
+uint32_t type_bit(uint32_t relocation_type) noexcept {
+  if (relocation_type == kRAarch64JumpSlot) return kTypeJumpSlot;
+  if (relocation_type == kRAarch64GlobDat) return kTypeGlobDat;
+  return 0;
+}
+
+// A record is acceptable to hook only as JUMP_SLOT, or as GLOB_DAT with addend
+// zero, symbol type STT_FUNC and an undefined (imported) symbol.
+bool is_acceptable(const FunctionReloc& record) noexcept {
+  if (record.entry.relocation_type == kRAarch64JumpSlot) return true;
+  if (record.entry.relocation_type != kRAarch64GlobDat) return false;
+  return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined;
+}
+
+// Does the base (name/version/hidden/index) selector match this record?
+bool base_matches(const FunctionReloc& record, const FunctionImportSelector& selector) {
+  const auto& entry = record.entry;
+  const auto& sel = selector.base;
+  if (entry.base.import.symbol != sel.symbol) return false;
+  if (sel.relocation_index != ~size_t{0}) {
+    if (entry.source != selector.index_source) return false;
+    if (entry.base.import.relocation_index != sel.relocation_index) return false;
+  }
+  if (sel.version_match == VersionMatch::kUnversioned && entry.base.version.index >= 2)
+    return false;
+  if (sel.version_match == VersionMatch::kExact && entry.base.version.name != sel.version)
+    return false;
+  if (sel.dependency != nullptr && entry.base.version.dependency != sel.dependency) return false;
+  if (sel.hidden == HiddenMatch::kHidden && !entry.base.version.hidden) return false;
+  if (sel.hidden == HiddenMatch::kNonHidden && entry.base.version.hidden) return false;
+  return true;
+}
+
+}  // namespace
+
+Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
+                                     const FunctionImportSelector& selector) {
+  if (Error e = validate_function_selector(selector)) return e;
+  size_t selected = ~size_t{0};
+  for (size_t i = 0; i < scan.records.size(); ++i) {
+    const FunctionReloc& record = scan.records[i];
+    // Only records in the opted-in sources and types are candidates.
+    if ((source_bit(record.entry.source) & selector.sources) == 0) continue;
+    if ((type_bit(record.entry.relocation_type) & selector.types) == 0) continue;
+    if (!base_matches(record, selector)) continue;
+    // A matched record that is not hookable fails the whole call: never skip it
+    // and silently hook a different slot of the same name.
+    if (!is_acceptable(record)) return Error::Make(ErrorCode::kUnsupportedRelocation);
     if (selected != ~size_t{0}) return Error::Make(ErrorCode::kAmbiguousSymbol);
     selected = i;
   }

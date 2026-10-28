@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,66 @@ class ElfBuilder {
   /// Add a relocation with a custom type (for testing unsupported types).
   ElfBuilder& add_custom_rela(uint32_t sym_index, uint32_t rela_type, int64_t addend = 0) {
     custom_relas_.push_back({sym_index, rela_type, addend});
+    return *this;
+  }
+
+  /// Override a symbol's type (STT_*) and binding (STB_*).  By default every
+  /// symbol is STB_GLOBAL/STT_FUNC and defined (st_shndx = 1).
+  ElfBuilder& set_symbol_type(uint32_t index, uint8_t stt, uint8_t stb = STB_GLOBAL) {
+    symbol_info_[index] = ELF64_ST_INFO(stb, stt);
+    return *this;
+  }
+
+  /// Mark a symbol undefined (st_shndx = SHN_UNDEF), as an imported symbol is.
+  ElfBuilder& set_symbol_undefined(uint32_t index, bool undefined = true) {
+    symbol_undef_[index] = undefined;
+    return *this;
+  }
+
+  /// Add a record to a separate DT_RELA (.rela.dyn) table with its own GOT slot.
+  /// Returns *this; the slot index within the RELA table is its insertion order.
+  ElfBuilder& add_rela(uint32_t sym_index, uint32_t rela_type, int64_t addend = 0) {
+    rela_entries_.push_back({sym_index, rela_type, addend});
+    return *this;
+  }
+
+  /// Add a DT_RELA record whose r_offset aliases the GOT slot of a previously
+  /// added DT_RELA entry (by 0-based index in the RELA table).
+  ElfBuilder& alias_rela(uint32_t sym_index, uint32_t rela_type, size_t target_rela_index) {
+    rela_aliases_.push_back({sym_index, rela_type, target_rela_index});
+    return *this;
+  }
+
+  /// Make the DT_RELA table fully contain the JMPREL table, sharing the same end
+  /// address, as some linkers emit (DT_RELASZ covering the PLT relocations).
+  /// (Overlap decoding is covered directly against decode_rela in the tests; the
+  /// builder lays the two tables out separately, so this flag is reserved.)
+  ElfBuilder& set_rela_includes_jmprel(bool enable = true) {
+    rela_includes_jmprel_ = enable;
+    return *this;
+  }
+
+  /// Override DT_RELAENT (default sizeof(Elf64_Rela)).
+  ElfBuilder& set_relaent(uint64_t value) {
+    relaent_override_ = value;
+    has_relaent_override_ = true;
+    return *this;
+  }
+
+  /// Emit a raw DT_ANDROID_RELA table with these exact bytes and its own GOT
+  /// slots.  `slot_count` reserves that many 8-byte slots so encoded offsets
+  /// have a writable target; the encoder supplies the offsets.
+  ElfBuilder& set_android_rela(std::vector<uint8_t> bytes, size_t slot_count) {
+    android_rela_bytes_ = std::move(bytes);
+    android_rela_slots_ = slot_count;
+    has_android_rela_ = true;
+    return *this;
+  }
+
+  /// Emit DT_REL (no addend) instead of validating — used to prove the opt-in
+  /// path rejects REL-form images.
+  ElfBuilder& emit_spurious_rel_tag(bool enable = true) {
+    emit_rel_tag_ = enable;
     return *this;
   }
 
@@ -172,7 +233,15 @@ class ElfBuilder {
     /// Address of the GOT slot for the i-th JUMP_SLOT relocation.
     uintptr_t got_slot_addr(size_t i) const;
 
-    size_t got_offset = 0;  // Offset of GOT in buffer
+    /// Address of the i-th separate DT_RELA table's GOT slot.
+    uintptr_t rela_slot_addr(size_t i) const;
+
+    /// Address of the i-th DT_ANDROID_RELA GOT slot.
+    uintptr_t android_slot_addr(size_t i) const;
+
+    size_t got_offset = 0;          // Offset of JMPREL GOT in buffer
+    size_t rela_got_offset = 0;     // Offset of DT_RELA GOT in buffer
+    size_t android_got_offset = 0;  // Offset of DT_ANDROID_RELA GOT in buffer
   };
 
   /// Build the image.  The returned BuiltImage owns the buffer.
@@ -191,10 +260,35 @@ class ElfBuilder {
     size_t target_jmpslot_index;
   };
 
+  /// A record in a separate DT_RELA table.
+  struct RelaEntry {
+    uint32_t sym_index;
+    uint32_t rela_type;
+    int64_t addend;
+  };
+
+  /// A DT_RELA record aliasing another RELA entry's GOT slot.
+  struct RelaAlias {
+    uint32_t sym_index;
+    uint32_t rela_type;
+    size_t target_rela_index;
+  };
+
   std::vector<SymEntry> symbols_;
   std::vector<JmpSlotEntry> jmpslots_;
   std::vector<CustomRela> custom_relas_;
   std::vector<AliasedSlot> aliased_slots_;
+  std::vector<RelaEntry> rela_entries_;
+  std::vector<RelaAlias> rela_aliases_;
+  std::map<uint32_t, uint8_t> symbol_info_;
+  std::map<uint32_t, bool> symbol_undef_;
+  std::vector<uint8_t> android_rela_bytes_;
+  size_t android_rela_slots_ = 0;
+  bool has_android_rela_ = false;
+  bool rela_includes_jmprel_ = false;
+  uint64_t relaent_override_ = 0;
+  bool has_relaent_override_ = false;
+  bool emit_rel_tag_ = false;
   bool use_gnu_hash_ = true;
   bool use_sysv_hash_ = false;
   bool use_relro_ = false;

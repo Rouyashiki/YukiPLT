@@ -90,6 +90,54 @@ typedef struct yukiplt_c_slot_report {
   uint32_t status;
 } yukiplt_c_slot_report;
 
+// --- Function GLOB_DAT / APS2 (opt-in, added in ABI v1; see yukiplt.h) ---
+//
+// These extend selection/installation to R_AARCH64_GLOB_DAT function slots in
+// DT_RELA and DT_ANDROID_RELA, alongside JUMP_SLOT.  They are strictly opt-in:
+// the caller names the relocation sources and types.  v1's existing structs and
+// functions are unchanged; a caller probes availability with
+// yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS).
+enum {
+  YUKIPLT_C_SOURCE_JMPREL = 1u << 0,       // DT_JMPREL (PLT).
+  YUKIPLT_C_SOURCE_RELA = 1u << 1,         // DT_RELA (.rela.dyn).
+  YUKIPLT_C_SOURCE_ANDROID_RELA = 1u << 2  // DT_ANDROID_RELA (APS2 packed).
+};
+enum {
+  YUKIPLT_C_TYPE_JUMP_SLOT = 1u << 0,  // R_AARCH64_JUMP_SLOT.
+  YUKIPLT_C_TYPE_GLOB_DAT = 1u << 1    // R_AARCH64_GLOB_DAT (function, addend 0, UND FUNC).
+};
+// Scopes a relocation_index filter to one table (matches the source bits' order).
+enum {
+  YUKIPLT_C_RELOC_SOURCE_JMPREL = 0,
+  YUKIPLT_C_RELOC_SOURCE_RELA = 1,
+  YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA = 2
+};
+enum { YUKIPLT_C_FEATURE_FUNCTION_IMPORTS = 1 };
+
+// struct_size must be set to sizeof(yukiplt_c_function_selector) (use the macro);
+// a mismatch is rejected with INVALID_ARGUMENT.  It is a layout check, not an
+// extension mechanism: yukiplt_c_function_request embeds this struct by value,
+// so its size is part of the v1 ABI and fields cannot be appended in place.  A
+// later extension adds new structs and entry points instead.  sources and types
+// are bitmasks that must both be nonzero — naming them is the opt-in.
+typedef struct yukiplt_c_function_selector {
+  uint32_t struct_size;
+  uint32_t sources;
+  uint32_t types;
+  uint32_t index_source;  // YUKIPLT_C_RELOC_SOURCE_*; scopes base.relocation_index.
+  yukiplt_c_selector base;
+} yukiplt_c_function_selector;
+#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                             \
+  {(uint32_t)sizeof(yukiplt_c_function_selector),                                     \
+   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_RELA | YUKIPLT_C_SOURCE_ANDROID_RELA,   \
+   YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
+   YUKIPLT_C_SELECTOR(name)}
+typedef struct yukiplt_c_function_request {
+  yukiplt_c_function_selector target;
+  void* replacement;
+  void** out_original;
+} yukiplt_c_function_request;
+
 // ABI v1 targets ARM64 Android API23+. No STL, allocation ownership or C++
 // exceptions cross this boundary. Error values match the C++ core. No operation
 // silently succeeds after partial commit: INDETERMINATE retains a valid token.
@@ -134,6 +182,29 @@ yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle*, yukiplt_c_slot_report* 
 // token. Coordinate with the owner before unmapping; handles then unhook as
 // IMAGE_INVALIDATED. System reload at the same address remains ABA.
 yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image*) YUKIPLT_C_NOEXCEPT;
+
+// Returns nonzero if the running library implements the given feature id (one of
+// YUKIPLT_C_FEATURE_*).  The ABI version stays 1; this lets a caller built
+// against a newer header detect whether the opt-in function-import entry points
+// below are present before calling them.
+int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
+
+// Opt-in function-import hooks (JUMP_SLOT + function GLOB_DAT across the named
+// sources).  Same image/selector/transaction/ownership/original-output contract
+// as yukiplt_c_hook/yukiplt_c_hook_batch.  Each selector's struct_size must equal
+// sizeof(yukiplt_c_function_selector), and its sources/types masks must both be
+// nonzero.  Acceptance is a whitelist: a slot is hookable only as JUMP_SLOT, or
+// as GLOB_DAT whose import symbol is an undefined STT_FUNC with addend zero and a
+// nonzero current slot value; any other matched relocation fails the whole call
+// with UNSUPPORTED_RELOCATION and modifies nothing.  Unhook/abandon/query with
+// the shared yukiplt_c_unhook/abandon/query functions.
+yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image*, const yukiplt_c_function_selector*,
+                                        void* replacement, void** out_original,
+                                        yukiplt_c_handle* out_handle,
+                                        yukiplt_c_slot_report* report) YUKIPLT_C_NOEXCEPT;
+yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image*, const yukiplt_c_function_request*,
+                                         size_t count, yukiplt_c_handle* out_handle,
+                                         yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

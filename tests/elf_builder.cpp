@@ -70,6 +70,14 @@ struct LayoutBuilder {
 uintptr_t ElfBuilder::BuiltImage::got_slot_addr(size_t i) const {
   return reinterpret_cast<uintptr_t>(buffer.data() + got_offset + i * 8);
 }
+
+uintptr_t ElfBuilder::BuiltImage::rela_slot_addr(size_t i) const {
+  return reinterpret_cast<uintptr_t>(buffer.data() + rela_got_offset + i * 8);
+}
+
+uintptr_t ElfBuilder::BuiltImage::android_slot_addr(size_t i) const {
+  return reinterpret_cast<uintptr_t>(buffer.data() + android_got_offset + i * 8);
+}
 // ElfBuilder::build
 
 ElfBuilder::BuiltImage ElfBuilder::build() const {
@@ -112,8 +120,12 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   for (size_t i = 0; i < sym_count; ++i) {
     Elf64_Sym sym{};
     sym.st_name = name_offsets[i];
-    sym.st_info = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
-    sym.st_shndx = (i == 0) ? SHN_UNDEF : 1;
+    auto info_it = symbol_info_.find(static_cast<uint32_t>(i));
+    sym.st_info =
+        info_it != symbol_info_.end() ? info_it->second : ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+    auto undef_it = symbol_undef_.find(static_cast<uint32_t>(i));
+    const bool undefined = (i == 0) || (undef_it != symbol_undef_.end() && undef_it->second);
+    sym.st_shndx = undefined ? SHN_UNDEF : 1;
     sym.st_value = 0;
     sym.st_size = 0;
     lb.write_at(symtab_offset + i * sizeof(Elf64_Sym), sym);
@@ -270,6 +282,47 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   }
 
   size_t jmprel_size = total_relas * sizeof(Elf64_Rela);
+  // 7b. Separate DT_RELA table (.rela.dyn) + its own GOT slots.
+  size_t rela_table_offset = 0;
+  size_t rela_got_offset = 0;
+  size_t rela_count = rela_entries_.size() + rela_aliases_.size();
+  size_t rela_table_size = 0;
+  if (rela_count > 0) {
+    rela_got_offset = lb.align(8);
+    lb.alloc(rela_count * 8, 8);
+    rela_table_offset = lb.align(8);
+    size_t slot_idx = 0;
+    for (const auto& entry : rela_entries_) {
+      Elf64_Rela rela{};
+      rela.r_offset = rela_got_offset + slot_idx * 8;
+      rela.r_info = ELF64_R_INFO(entry.sym_index, entry.rela_type);
+      rela.r_addend = entry.addend;
+      lb.append(rela, 8);
+      ++slot_idx;
+    }
+    for (const auto& alias : rela_aliases_) {
+      Elf64_Rela rela{};
+      rela.r_offset = rela_got_offset + alias.target_rela_index * 8;
+      rela.r_info = ELF64_R_INFO(alias.sym_index, alias.rela_type);
+      rela.r_addend = 0;
+      lb.append(rela, 8);
+    }
+    rela_table_size = rela_count * sizeof(Elf64_Rela);
+  }
+  // 7c. DT_ANDROID_RELA table (raw bytes) + its own GOT slots.
+  size_t android_table_offset = 0;
+  size_t android_got_offset = 0;
+  if (has_android_rela_) {
+    if (android_rela_slots_ > 0) {
+      android_got_offset = lb.align(8);
+      lb.alloc(android_rela_slots_ * 8, 8);
+    }
+    android_table_offset = lb.align(8);
+    size_t bytes_off = lb.alloc(android_rela_bytes_.size(), 8);
+    if (!android_rela_bytes_.empty())
+      std::memcpy(lb.buf.data() + bytes_off, android_rela_bytes_.data(),
+                  android_rela_bytes_.size());
+  }
   // 8. Dynamic section.
   size_t dyn_offset = lb.align(8);
 
@@ -299,8 +352,19 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     maybe_add_dyn(DT_JMPREL, jmprel_offset);
     maybe_add_dyn(DT_PLTRELSZ, jmprel_size);
     maybe_add_dyn(DT_PLTREL, pltrel_override_);
-    maybe_add_dyn(DT_RELAENT, sizeof(Elf64_Rela));
+    maybe_add_dyn(DT_RELAENT, has_relaent_override_ ? relaent_override_ : sizeof(Elf64_Rela));
   }
+  if (rela_count > 0) {
+    maybe_add_dyn(/*DT_RELA=*/7, rela_table_offset);
+    maybe_add_dyn(/*DT_RELASZ=*/8, rela_table_size);
+    if (total_relas == 0)
+      maybe_add_dyn(DT_RELAENT, has_relaent_override_ ? relaent_override_ : sizeof(Elf64_Rela));
+  }
+  if (has_android_rela_) {
+    maybe_add_dyn(/*DT_ANDROID_RELA=*/0x60000011, android_table_offset);
+    maybe_add_dyn(/*DT_ANDROID_RELASZ=*/0x60000012, android_rela_bytes_.size());
+  }
+  if (emit_rel_tag_) maybe_add_dyn(/*DT_REL=*/17, 0);
 
   // DT_NULL terminator.
   if (!omit_dt_null_ && (truncate_dyn_ == 0 || dyn_count < truncate_dyn_)) add_dyn(DT_NULL, 0);
@@ -360,6 +424,8 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   result.phdr_offset = phdr_offset;
   result.phdr_count = num_phdrs;
   result.got_offset = got_offset;
+  result.rela_got_offset = rela_got_offset;
+  result.android_got_offset = android_got_offset;
 
   return result;
 }

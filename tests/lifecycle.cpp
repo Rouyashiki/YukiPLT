@@ -3,18 +3,21 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "elf_builder.hpp"
 #include "overrides.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
+#include "system_images.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
 
@@ -279,3 +282,168 @@ TEST(Registry, GenerationRejectsStaleHandle) {
 }
 
 }  // namespace registry_checks
+
+namespace rules_checks {
+using namespace yukiplt;
+using test::ElfBuilder;
+
+namespace {
+
+struct FakeImage {
+  ElfBuilder::BuiltImage built;
+  std::string path;
+  uint64_t token = 0;
+
+  ImageView view() const {
+    return {built.load_bias(), built.phdr_table(), built.phdr_count, token};
+  }
+  uintptr_t slot() const { return built.got_slot_addr(0); }
+};
+
+struct RulesFixture : testing::Test {
+  std::vector<FakeImage> images;
+
+  uintptr_t first_page = 0;
+  uintptr_t end_page = 0;
+  bool writable = false;
+
+  static RulesFixture* current;
+
+  detail::PlatformOps ops{
+      [](void* p, uintptr_t, size_t, int prot) {
+        static_cast<RulesFixture*>(p)->writable = (prot & detail::kProtWrite) != 0;
+        return 0;
+      },
+      [](void* p, detail::MapsCoverage& coverage) {
+        auto& self = *static_cast<RulesFixture*>(p);
+        const size_t ps = detail::page_size();
+
+        std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+        for (const auto& image : self.images) {
+          uintptr_t begin = image.built.load_bias() & ~(ps - 1);
+          uintptr_t end =
+              (image.built.load_bias() + image.built.buffer.size() + ps - 1) & ~(ps - 1);
+          ranges.emplace_back(begin, end);
+        }
+        std::sort(ranges.begin(), ranges.end());
+
+        for (size_t i = 0; i < ranges.size(); ++i) {
+          uintptr_t begin = ranges[i].first;
+          uintptr_t end = ranges[i].second;
+          while (i + 1 < ranges.size() && ranges[i + 1].first <= end) {
+            end = std::max(end, ranges[i + 1].second);
+            ++i;
+          }
+          char line[128];
+          std::snprintf(line, sizeof(line), "%zx-%zx %s 00000000 00:00 0",
+                        static_cast<size_t>(begin), static_cast<size_t>(end),
+                        self.writable ? "rw-p" : "r--p");
+          coverage.feed_line(line, std::strlen(line));
+        }
+        return coverage.finish();
+      },
+      [](void*, uintptr_t address) {
+        return __atomic_load_n(reinterpret_cast<uintptr_t*>(address), __ATOMIC_ACQUIRE);
+      },
+      [](void*, uintptr_t address, uintptr_t* expected, uintptr_t desired) {
+        return __atomic_compare_exchange_n(reinterpret_cast<uintptr_t*>(address), expected, desired,
+                                           false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+      },
+      this};
+
+  void SetUp() override {
+    current = this;
+    detail::set_active_ops(&ops);
+    detail::set_active_image_enumerator(&RulesFixture::enumerate);
+  }
+  void TearDown() override {
+    detail::set_active_image_enumerator(nullptr);
+    detail::set_active_ops(nullptr);
+    current = nullptr;
+  }
+
+  static uint64_t next_token() {
+    static uint64_t counter = 0x1000;
+    return ++counter;
+  }
+
+  FakeImage& add_image(const char* path, uintptr_t slot_value) {
+    ElfBuilder b;
+    b.add_symbol("target", 1).add_jump_slot(1);
+    FakeImage image;
+    image.built = b.build();
+    image.path = path;
+    image.token = next_token();
+    __atomic_store_n(reinterpret_cast<uintptr_t*>(image.built.got_slot_addr(0)), slot_value,
+                     __ATOMIC_RELEASE);
+    images.push_back(std::move(image));
+    return images.back();
+  }
+
+  static Result<std::vector<NamedImage>> enumerate(const ImageSelector& selector) {
+    if (current->enumeration_error != ErrorCode::kSuccess)
+      return Error::Make(current->enumeration_error);
+    std::vector<NamedImage> out;
+    for (const auto& image : current->images) {
+      bool match = selector.match == ImageMatch::kMainExecutable ||
+                   (selector.match == ImageMatch::kBasename && selector.name != nullptr &&
+                    image.path == selector.name);
+      if (match) out.push_back({image.view(), image.path});
+    }
+    if (out.empty()) return Error::Make(ErrorCode::kImageNotFound);
+    return out;
+  }
+
+  uintptr_t read(uintptr_t addr) const {
+    return __atomic_load_n(reinterpret_cast<uintptr_t*>(addr), __ATOMIC_ACQUIRE);
+  }
+  void write(uintptr_t addr, uintptr_t value) {
+    __atomic_store_n(reinterpret_cast<uintptr_t*>(addr), value, __ATOMIC_RELEASE);
+  }
+
+  ErrorCode enumeration_error = ErrorCode::kSuccess;
+};
+
+RulesFixture* RulesFixture::current = nullptr;
+
+ImageSelector match_basename(const char* name) { return {ImageMatch::kBasename, name, 0}; }
+
+void* const kRepl = reinterpret_cast<void*>(uintptr_t{0xA000});
+
+FunctionImportSelector target_selector() {
+  FunctionImportSelector s;
+  s.base.symbol = "target";
+  s.sources = kSourceJmprel;
+  s.types = kTypeJumpSlot;
+  return s;
+}
+
+}  // namespace
+
+TEST_F(RulesFixture, NotifyUnloadingFailureKeepsHandleAndDoesNotForget) {
+  auto& image = add_image("libkeep.so", 0x1000);
+  RuleSet rules;
+  void* originals[1]{};
+  ASSERT_TRUE(rules.add_rule(match_basename("libkeep.so"), target_selector(), kRepl, originals, 1));
+  ASSERT_EQ(rules.notify_loaded(image.view(), "libkeep.so").succeeded, 1u);
+
+  write(image.slot(), 0xC000);
+  auto failed = rules.notify_unloading(image.view());
+  EXPECT_EQ(failed.failed, 1u);
+  EXPECT_EQ(failed.retained, 1u);
+  EXPECT_EQ(rules.bindings()[0].state, RuleState::kRestoreFailed);
+
+  EXPECT_EQ(
+      hook_import(image.view(), {"target"}, reinterpret_cast<void*>(uintptr_t{0xB000}), nullptr)
+          .error.code,
+      ErrorCode::kAlreadyHooked);
+
+  ASSERT_TRUE(forget_image(image.view()).ok());
+  auto after_forget = rules.notify_unloading(image.view());
+  EXPECT_EQ(after_forget.failed, 0u);
+  EXPECT_EQ(rules.bindings()[0].state, RuleState::kInvalidated);
+  EXPECT_EQ(read(image.slot()), 0xC000u);
+  write(image.slot(), 0x1000);
+}
+
+}  // namespace rules_checks

@@ -146,8 +146,23 @@ class Registry {
   const Record* resolve(uint64_t id) const noexcept;
   bool slot_is_live(uintptr_t addr) const noexcept;
 
+  // Open-addressed live-slot index. Grow before claim; backward-shift deletion
+  // releases slots without allocating.
+  struct IndexEntry {
+    uintptr_t address = 0;  ///< 0 = empty (a GOT slot is never at address 0).
+    uint32_t record = 0;    ///< Index into records_.
+  };
+  size_t index_find(uintptr_t addr) const noexcept;  ///< Position, or capacity if absent.
+  void index_insert(uintptr_t addr, uint32_t record) noexcept;  ///< Capacity reserved.
+  void index_erase(uintptr_t addr, uint32_t record) noexcept;
+  void index_erase_record(const Record& r, uint32_t record) noexcept;
+  /// Make room for `extra` more entries at load factor <= 1/2.  May throw.
+  void index_reserve(size_t extra);
+
   SmallVec<Record, 8> records_;
   SmallVec<uint32_t, 8> free_list_;
+  SmallVec<IndexEntry, 16> index_;  ///< Size is 0 or a power of two.
+  size_t index_used_ = 0;
 };
 
 }  // namespace yukiplt::detail

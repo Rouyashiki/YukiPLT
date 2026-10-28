@@ -7,6 +7,7 @@ set(YUKIPLT_SOURCES
     imports.cpp
     memory.cpp
     registry.cpp
+    rules.cpp
     session.cpp
     yukiplt.cpp
 )

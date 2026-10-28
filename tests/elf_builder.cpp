@@ -170,10 +170,14 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     lb.append<uint32_t>(bloom_size, 4);
     lb.append<uint32_t>(bloom_shift, 4);
 
-    // Bloom filter (one 64-bit word, set all bits for simplicity —
-    // this makes every symbol pass the bloom check).
-    size_t bloom_offset = lb.append<NativeElfAddr>(~NativeElfAddr(0), alignof(NativeElfAddr));
-    (void)bloom_offset;
+    NativeElfAddr bloom = 0;
+    constexpr uint32_t bits = sizeof(NativeElfAddr) * 8;
+    for (const auto& symbol : symbols_) {
+      const uint32_t hash = gnu_hash(symbol.name.c_str());
+      bloom |= (NativeElfAddr{1} << (hash % bits)) |
+               (NativeElfAddr{1} << ((hash >> bloom_shift) % bits));
+    }
+    lb.append<NativeElfAddr>(bloom, alignof(NativeElfAddr));
 
     // Buckets: for each hashed symbol, bucket[hash % nbuckets] = sym_index.
     // With 1 bucket, everything chains from bucket 0.

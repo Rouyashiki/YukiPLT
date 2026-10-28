@@ -1044,7 +1044,8 @@ Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
 
 namespace {
 template <typename Snapshot, typename Collect>
-Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metadata) {
+Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metadata,
+                                  const char* expected_path = nullptr) {
   if (image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
   if (image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   // Catch allocation failures inside the callable as well: it runs inside a
@@ -1063,8 +1064,9 @@ Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metada
   try {
     if (image.instance_token == 0) {
       Result<Snapshot> result = Error::Make(ErrorCode::kImageInvalidated);
-      run_on_system_image(identity_of(image),
-                          [&](const ImageView& live) { result = collect(live); });
+      run_on_system_image(
+          identity_of(image), [&](const ImageView& live) { result = collect(live); },
+          expected_path);
       return result;
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -1127,10 +1129,15 @@ Result<FunctionImport> find_function_import(const ImageView& image,
 }
 
 Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageView& image,
-                                                                    uint32_t sources) {
-  return inspect_metadata<detail::RawFunctionSnapshot>(image, [&](const InspectedImage& inspected) {
-    return detail::scan_function_imports(inspected, sources);
-  });
+                                                                    uint32_t sources,
+                                                                    ScanBudget* budget,
+                                                                    const char* expected_path) {
+  return inspect_metadata<detail::RawFunctionSnapshot>(
+      image,
+      [&](const InspectedImage& inspected) {
+        return detail::scan_function_imports(inspected, sources, budget);
+      },
+      expected_path);
 }
 
 Error abandon(HookHandle& handle) {

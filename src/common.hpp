@@ -267,6 +267,30 @@ class Span {
   size_t size_;
 };
 
+// Per-operation work limits, shared across selected sources and candidate images.
+// Bytes count cumulative logical records/index payloads/text copied, including
+// temporaries. Container slack, allocator overhead and host callbacks are not an
+// RSS limit. No refund: a released temporary must not grant unlimited new work.
+struct ScanBudget {
+  size_t relocations = size_t{1} << 22;
+  size_t bytes = size_t{64} << 20;
+
+  Error take_records(size_t count) noexcept {
+    if (count > relocations) return Error::Make(ErrorCode::kOutOfBounds);
+    relocations -= count;
+    return Error::Ok();
+  }
+  Error take_bytes(size_t count) noexcept {
+    if (count > bytes) return Error::Make(ErrorCode::kOutOfBounds);
+    bytes -= count;
+    return Error::Ok();
+  }
+  template <typename T>
+  Error take_objects(size_t count) noexcept {
+    if (count > bytes / sizeof(T)) return Error::Make(ErrorCode::kOutOfBounds);
+    return take_bytes(count * sizeof(T));
+  }
+};
 }  // namespace yukiplt::detail
 
 #endif  // YUKIPLT_COMMON_HPP_

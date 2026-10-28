@@ -10,15 +10,6 @@
 
 namespace yukiplt::detail {
 // Helpers
-
-/// Convert ELF p_flags to POSIX PROT_* flags.
-static int pf_to_prot(uint32_t pf) {
-  int prot = 0;
-  if (pf & PF_R) prot |= 0x1;  // PROT_READ
-  if (pf & PF_W) prot |= 0x2;  // PROT_WRITE
-  if (pf & PF_X) prot |= 0x4;  // PROT_EXEC
-  return prot;
-}
 // InspectedImage query methods
 
 bool InspectedImage::addr_in_load(uintptr_t addr, size_t size) const noexcept {
@@ -39,25 +30,6 @@ bool InspectedImage::addr_in_writable_load(uintptr_t addr, size_t size) const no
     if ((seg.flags & PF_W) != 0 && addr >= seg.vaddr_begin && end <= seg.vaddr_end) return true;
   }
   return false;
-}
-
-bool InspectedImage::addr_in_relro(uintptr_t addr) const noexcept {
-  return relro_begin != relro_end && addr >= relro_begin && addr < relro_end;
-}
-
-int InspectedImage::protection_for(uintptr_t addr) const noexcept {
-  int prot = 0;
-  for (const auto& seg : load_segments) {
-    if (addr >= seg.vaddr_begin && addr < seg.vaddr_end) {
-      prot = pf_to_prot(seg.flags);
-      break;
-    }
-  }
-  // If the address is within RELRO, the loader has removed write permission.
-  if (addr_in_relro(addr)) {
-    prot &= ~0x2;  // Clear PROT_WRITE
-  }
-  return prot;
 }
 // Dynamic section parsing
 
@@ -143,14 +115,17 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
         info.has_hash = true;
         break;
       case DT_JMPREL:
+        if (info.has_jmprel) return Error::Make(ErrorCode::kCorruptedElf);
         info.dt_jmprel = d.d_un.d_ptr;
         info.has_jmprel = true;
         break;
       case DT_PLTRELSZ:
+        if (info.has_pltrelsz) return Error::Make(ErrorCode::kCorruptedElf);
         info.dt_pltrelsz = d.d_un.d_val;
         info.has_pltrelsz = true;
         break;
       case DT_PLTREL:
+        if (info.has_pltrel) return Error::Make(ErrorCode::kCorruptedElf);
         info.dt_pltrel = d.d_un.d_val;
         info.has_pltrel = true;
         break;
@@ -307,11 +282,12 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
   image.dynamic = dyn_begin;
   image.dynamic_size = dyn_size;
 
-  // Compute RELRO range.
+  // Validate RELRO arithmetic without inferring live page permissions.
   if (relro_phdr != nullptr) {
-    if (!safe_add(load_bias, static_cast<uintptr_t>(relro_phdr->p_vaddr), image.relro_begin))
+    uintptr_t relro_begin, relro_end;
+    if (!safe_add(load_bias, static_cast<uintptr_t>(relro_phdr->p_vaddr), relro_begin))
       return Error::Make(ErrorCode::kIntegerOverflow);
-    if (!safe_add(image.relro_begin, static_cast<uintptr_t>(relro_phdr->p_memsz), image.relro_end))
+    if (!safe_add(relro_begin, static_cast<uintptr_t>(relro_phdr->p_memsz), relro_end))
       return Error::Make(ErrorCode::kIntegerOverflow);
   }
 
@@ -381,10 +357,12 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
   // At least one hash table is required for symbol lookup.
   if (image.gnu_hash == 0 && image.sysv_hash == 0) return Error::Make(ErrorCode::kNoHashTable);
 
-  // JMPREL + PLTRELSZ (optional — an image may have no PLT relocations)
-  if (dinfo.has_jmprel && dinfo.has_pltrelsz) {
+  // No PLT is valid; a partially described PLT is not.
+  if (dinfo.has_jmprel != dinfo.has_pltrelsz || dinfo.has_jmprel != dinfo.has_pltrel)
+    return Error::Make(ErrorCode::kCorruptedElf);
+  if (dinfo.has_jmprel) {
     // Validate DT_PLTREL matches the native REL/RELA format.
-    if (dinfo.has_pltrel && dinfo.dt_pltrel != static_cast<uint64_t>(kDtNativeRel))
+    if (dinfo.dt_pltrel != static_cast<uint64_t>(kDtNativeRel))
       return Error::Make(ErrorCode::kUnsupportedFormat);
 
     // REL/RELAENT describes the ordinary dynamic table and is validated only
@@ -552,10 +530,17 @@ Expected<std::optional<uint32_t>, Error> gnu_hash_lookup(const InspectedImage& i
 
   if (sym_idx < symoffset) return Error::Make(ErrorCode::kCorruptedElf);
 
+  // Bound every chain index before interpreting it as a dynsym index. This
+  // uses a reliable hash count, or a readable LOAD bound when no exact count
+  // exists; it never invents an exact count from an empty GNU hash.
+  auto symbol_bound = dynamic_symbol_count(image);
+  if (!symbol_bound) return symbol_bound.error();
+
   // Chain walk.
   uint32_t h1 = h & ~uint32_t(1);  // Clear lowest bit for comparison.
 
   for (;;) {
+    if (sym_idx >= symbol_bound.value()) return Error::Make(ErrorCode::kCorruptedElf);
     uint32_t chain_idx = sym_idx - symoffset;
     auto r_chain = read_checked<uint32_t>(image, chains_addr, chain_idx);
     if (!r_chain) return r_chain.error();
@@ -648,14 +633,16 @@ Expected<uint32_t, Error> lookup_symbol(const InspectedImage& image, const char*
   if (image.gnu_hash != 0) {
     auto result = gnu_hash_lookup(image, name);
     if (!result) return result.error();
-    if (result.value().has_value()) return result.value().value();
+    const auto& found = result.value();
+    if (found.has_value()) return found.value();
   }
 
   // Fall back to SysV hash.
   if (image.sysv_hash != 0) {
     auto result = sysv_hash_lookup(image, name);
     if (!result) return result.error();
-    if (result.value().has_value()) return result.value().value();
+    const auto& found = result.value();
+    if (found.has_value()) return found.value();
   }
 
   // If neither hash table exists, report it.

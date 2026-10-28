@@ -3,11 +3,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "aps2_encoder.hpp"
@@ -17,6 +19,7 @@
 #include "overrides.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
+#include "versioned_elf.hpp"
 #include "yukiplt.hpp"
 
 namespace elf_inspector_checks {
@@ -405,3 +408,35 @@ TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
 }
 
 }  // namespace function_imports_checks
+
+namespace scan_limits_checks {
+using namespace yukiplt;
+using namespace yukiplt::detail;
+
+TEST(ScanLimits, SharedRecordAndMaterializationBudgetsHaveExactBoundaries) {
+  test::ElfBuilder builder;
+  auto image = builder.add_symbol("long_function_name_for_budget", 1)
+                   .set_symbol_undefined(1)
+                   .add_jump_slot(1)
+                   .add_rela(1, kNativeGlobDat)
+                   .build();
+  auto parsed = inspect(image.load_bias(), image.phdr_table(), image.phdr_count);
+  ASSERT_TRUE(parsed);
+  const uint32_t sources = kSourceJmprel | kSourceNativeDynamic;
+  ScanBudget baseline;
+  ASSERT_TRUE(scan_function_imports(parsed.value(), sources, &baseline));
+  const size_t used = ScanBudget{}.bytes - baseline.bytes;
+  for (size_t size : {used - 1, used}) {
+    ScanBudget budget{2, size};
+    auto result = scan_function_imports(parsed.value(), sources, &budget);
+    EXPECT_EQ(bool(result), size == used);
+    if (!result) EXPECT_EQ(result.error().code, ErrorCode::kOutOfBounds);
+  }
+  ScanBudget across_images{3, ScanBudget{}.bytes};
+  ASSERT_TRUE(scan_function_imports(parsed.value(), sources, &across_images));
+  auto result = scan_function_imports(parsed.value(), sources, &across_images);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(result.error().code, ErrorCode::kOutOfBounds);
+}
+
+}  // namespace scan_limits_checks

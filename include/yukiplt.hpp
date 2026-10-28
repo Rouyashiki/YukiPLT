@@ -328,9 +328,18 @@ constexpr uint32_t native_reloc_symbol(uint64_t info) noexcept {
 constexpr uint32_t native_reloc_type(uint64_t info) noexcept {
   return static_cast<uint32_t>(info & (kNativeUsesRela ? UINT64_C(0xffffffff) : UINT64_C(0xff)));
 }
+// Preconditions on ELF32: symbol fits 24 bits and type fits 8 bits.
+// Use try_native_reloc_info() when either input is untrusted.
 constexpr NativeElfAddr native_reloc_info(uint32_t symbol, uint32_t type) noexcept {
   return static_cast<NativeElfAddr>((uint64_t{symbol} << (kNativeUsesRela ? 32 : 8)) |
                                     (type & (kNativeUsesRela ? UINT32_MAX : UINT32_C(0xff))));
+}
+// Leaves output unchanged if an ELF32 field cannot be represented.
+constexpr bool try_native_reloc_info(uint32_t symbol, uint32_t type,
+                                     NativeElfAddr& output) noexcept {
+  if (!kNativeUsesRela && (symbol > UINT32_C(0xffffff) || type > UINT32_C(0xff))) return false;
+  output = native_reloc_info(symbol, type);
+  return true;
 }
 constexpr int64_t native_reloc_addend(const NativeElfRelocation& reloc) noexcept {
 #if YUKIPLT_USES_RELA
@@ -1582,6 +1591,11 @@ struct CandidateSelection {
 /// GLOB_DAT current-value conditions are deferred to installation.
 /// Limits may only be lowered. Text counts path+symbol bytes once per examined
 /// source/type record. These are not total snapshot/process/host memory limits.
+/// Snapshot acquisition additionally shares the function scanner's 2^22-record
+/// and 64 MiB cumulative logical materialization budgets across all images.
+/// System image paths must match dlpi_name under the same linker callback as
+/// inspection (including the empty main-executable name). Mismatch invalidates
+/// the image before any host callback. This does not eliminate same-path ABA.
 /// Failure returns no partial candidates; host callback side effects, if any,
 /// cannot be undone. Caller keeps supplied images stable for snapshot acquisition.
 Result<std::vector<FunctionCandidate>> expand_function_candidates(

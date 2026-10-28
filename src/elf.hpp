@@ -28,10 +28,6 @@ struct InspectedImage {
   /// PT_LOAD segments, sorted by vaddr_begin.
   SmallVec<LoadSegment> load_segments;
 
-  /// PT_GNU_RELRO range (zero if absent).
-  uintptr_t relro_begin = 0;
-  uintptr_t relro_end = 0;
-
   /// Symbol table (DT_SYMTAB runtime address).
   uintptr_t symtab = 0;
 
@@ -85,13 +81,6 @@ struct InspectedImage {
   /// satisfy this: a slot inside a non-writable segment means a malformed or
   /// hostile r_offset, and patching it would write into read-only data.
   [[nodiscard]] bool addr_in_writable_load(uintptr_t addr, size_t size) const noexcept;
-
-  /// Returns true if addr falls within the RELRO range.
-  [[nodiscard]] bool addr_in_relro(uintptr_t addr) const noexcept;
-
-  /// Deduce the POSIX protection flags (PROT_*) for an address from
-  /// PT_LOAD flags and RELRO.  Returns 0 if the address is not in any segment.
-  [[nodiscard]] int protection_for(uintptr_t addr) const noexcept;
 };
 
 // Inspect bounded native ELF metadata. The caller keeps the mapping and
@@ -232,11 +221,13 @@ using RelocVisitor = Error (*)(void* context, const DecodedReloc& record);
 
 // Validate native relocation entry size, readable interval and slot arithmetic.
 // Visit all types; omit only a wholly contained JMPREL tail with the same end.
-Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context);
+Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context,
+                                 ScanBudget* budget = nullptr);
 
 // Decode bounded APS2. Reject malformed SLEB128 and offset/addend overflow;
 // allow only zero padding after the declared records.
-Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context);
+Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context,
+                            ScanBudget* budget = nullptr);
 
 }  // namespace yukiplt::detail
 

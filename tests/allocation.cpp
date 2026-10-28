@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <new>
 
+#include "aps2_encoder.hpp"
 #include "elf_builder.hpp"
+#include "imports.hpp"
 #include "overrides.hpp"
 #include "memory.hpp"
 #include "registry.hpp"

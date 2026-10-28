@@ -4,9 +4,12 @@
 #include "imports.hpp"
 
 #include <algorithm>
+#include <bitset>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <new>
+#include <set>
 #include <stdexcept>
 
 #include "common.hpp"
@@ -182,12 +185,13 @@ Result<T> read_version(const InspectedImage& image, uintptr_t address, size_t in
   return value;
 }
 
-Result<std::string> string_at(const InspectedImage& image, uint32_t offset) {
+Result<std::string> string_at(const InspectedImage& image, uint32_t offset, ScanBudget& budget) {
   if (offset >= image.strsz || !readable(image, image.strtab, image.strsz))
     return Error::Make(ErrorCode::kCorruptedElf);
   const char* begin = reinterpret_cast<const char*>(image.strtab + offset);
   const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - offset));
   if (end == nullptr || end == begin) return Error::Make(ErrorCode::kCorruptedElf);
+  if (Error e = budget.take_bytes(static_cast<size_t>(end - begin) + 1)) return e;
   return std::string(begin, static_cast<size_t>(end - begin));
 }
 
@@ -227,16 +231,31 @@ struct NamedVersion {
   std::string dependency;
 };
 
-struct RecordRange {
-  uintptr_t begin;
-  uintptr_t end;
+struct VersionScan {
+  ScanBudget& budget;
+  std::map<uintptr_t, uintptr_t> ranges;
+  std::bitset<1u << 15> indices;
+
+  Error claim_index(uint16_t index) {
+    if (indices.test(index)) return Error::Make(ErrorCode::kCorruptedElf);
+    indices.set(index);
+    return budget.take_objects<NamedVersion>(1);
+  }
 };
 
 template <typename T>
-Result<T> read_record(const InspectedImage& image, uintptr_t address,
-                      std::vector<RecordRange>& ranges) {
+Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionScan& scan) {
   auto value = read_version<T>(image, address);
-  if (value) ranges.push_back({address, address + sizeof(T)});
+  if (!value) return value.error();
+  // read_version() proved the end cannot overflow. Check both neighbours before any
+  // allocation or following a shared auxiliary chain a second time.
+  const uintptr_t end = address + sizeof(T);
+  const auto next = scan.ranges.lower_bound(address);
+  if ((next != scan.ranges.end() && next->first < end) ||
+      (next != scan.ranges.begin() && std::prev(next)->second > address))
+    return Error::Make(ErrorCode::kCorruptedElf);
+  if (Error e = scan.budget.take_objects<std::pair<uintptr_t, uintptr_t>>(1)) return e;
+  scan.ranges.emplace_hint(next, address, end);
   return value;
 }
 
@@ -244,14 +263,14 @@ Result<T> read_record(const InspectedImage& image, uintptr_t address,
 // Forward, non-overlapping relative offsets and exact terminal links bound
 // traversal by both the declared counts and the readable mapping.
 Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
-                 std::vector<NamedVersion>& out, std::vector<RecordRange>& ranges) {
+                 std::vector<NamedVersion>& out, VersionScan& scan) {
   for (uint64_t i = 0; i < count; ++i) {
-    auto record = read_record<NativeElfVerneed>(image, address, ranges);
+    auto record = read_record<NativeElfVerneed>(image, address, scan);
     if (!record) return record.error();
     const auto& need = record.value();
     if (need.vn_version != 1 || need.vn_cnt == 0 || (i + 1 == count) != (need.vn_next == 0))
       return Error::Make(ErrorCode::kCorruptedElf);
-    auto file = string_at(image, need.vn_file);
+    auto file = string_at(image, need.vn_file, scan.budget);
     if (!file) return file.error();
     auto aux = advance(address, need.vn_aux, sizeof(NativeElfVerneed));
     if (!aux) return aux.error();
@@ -262,13 +281,15 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
       next_record = next.value();
     }
     for (size_t j = 0; j < need.vn_cnt; ++j) {
-      auto item = read_record<NativeElfVernaux>(image, aux.value(), ranges);
+      auto item = read_record<NativeElfVernaux>(image, aux.value(), scan);
       if (!item) return item.error();
       const auto& value = item.value();
       const uint16_t index = value.vna_other & kVersionMask;
       if (index < 2 || (j + 1 == need.vn_cnt) != (value.vna_next == 0))
         return Error::Make(ErrorCode::kCorruptedElf);
-      auto name = string_at(image, value.vna_name);
+      if (Error e = scan.claim_index(index)) return e;
+      if (Error e = scan.budget.take_bytes(file.value().size() + 1)) return e;
+      auto name = string_at(image, value.vna_name, scan.budget);
       if (!name) return name.error();
       if (elf_hash_value(name.value().c_str()) != value.vna_hash)
         return Error::Make(ErrorCode::kCorruptedElf);
@@ -284,9 +305,9 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
 }
 
 Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t count,
-                       std::vector<NamedVersion>& out, std::vector<RecordRange>& ranges) {
+                       std::vector<NamedVersion>& out, VersionScan& scan) {
   for (uint64_t i = 0; i < count; ++i) {
-    auto record = read_record<NativeElfVerdef>(image, address, ranges);
+    auto record = read_record<NativeElfVerdef>(image, address, scan);
     if (!record) return record.error();
     const auto& definition = record.value();
     const uint16_t index = definition.vd_ndx & kVersionMask;
@@ -294,6 +315,7 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
         (index == 1) != ((definition.vd_flags & 1) != 0) ||
         (i + 1 == count) != (definition.vd_next == 0))
       return Error::Make(ErrorCode::kCorruptedElf);
+    if (Error e = scan.claim_index(index)) return e;
     auto aux = advance(address, definition.vd_aux, sizeof(NativeElfVerdef));
     if (!aux) return aux.error();
     uintptr_t next_record = 0;
@@ -303,11 +325,11 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
       next_record = next.value();
     }
     for (size_t j = 0; j < definition.vd_cnt; ++j) {
-      auto item = read_record<NativeElfVerdaux>(image, aux.value(), ranges);
+      auto item = read_record<NativeElfVerdaux>(image, aux.value(), scan);
       if (!item) return item.error();
       if ((j + 1 == definition.vd_cnt) != (item.value().vda_next == 0))
         return Error::Make(ErrorCode::kCorruptedElf);
-      auto name = string_at(image, item.value().vda_name);
+      auto name = string_at(image, item.value().vda_name, scan.budget);
       if (!name) return name.error();
       if (j == 0) {
         if (elf_hash_value(name.value().c_str()) != definition.vd_hash)
@@ -331,7 +353,10 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
 // function-import path so version parsing lives in one place.
 Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
                                                  std::vector<ImportInfo> imports,
-                                                 size_t skipped_relocations) {
+                                                 size_t skipped_relocations,
+                                                 ScanBudget* shared_budget) {
+  ScanBudget local_budget;
+  ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
   auto tags = version_tags(image);
   if (!tags) return tags.error();
   const auto& t = tags.value();
@@ -339,7 +364,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
       (!t.present[0] && (t.present[1] || t.present[3])))
     return Error::Make(ErrorCode::kCorruptedElf);
   std::vector<NamedVersion> versions;
-  std::vector<RecordRange> ranges;
+  VersionScan scan{budget, {}, {}};
   for (size_t pair : {size_t{1}, size_t{3}}) {
     if (!t.present[pair]) continue;
     if (t.values[pair + 1] == 0) return Error::Make(ErrorCode::kCorruptedElf);
@@ -347,27 +372,18 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
     // Unlike SYMTAB and VERSYM, glibc leaves VERNEED/VERDEF load-relative.
     if (!safe_add(image.load_bias, t.values[pair], address))
       return Error::Make(ErrorCode::kIntegerOverflow);
-    auto error = pair == 1 ? read_needs(image, address, t.values[pair + 1], versions, ranges)
-                           : read_definitions(image, address, t.values[pair + 1], versions, ranges);
+    auto error = pair == 1 ? read_needs(image, address, t.values[pair + 1], versions, scan)
+                           : read_definitions(image, address, t.values[pair + 1], versions, scan);
     if (error) return error;
-  }
-  // Main-record and auxiliary chains have independent relative offsets. Aux
-  // entries may follow later main records; reject only actual byte overlap.
-  std::sort(ranges.begin(), ranges.end(),
-            [](const RecordRange& a, const RecordRange& b) { return a.begin < b.begin; });
-  for (size_t i = 1; i < ranges.size(); ++i) {
-    if (ranges[i].begin < ranges[i - 1].end) return Error::Make(ErrorCode::kCorruptedElf);
   }
   std::sort(versions.begin(), versions.end(),
             [](const NamedVersion& a, const NamedVersion& b) { return a.index < b.index; });
-  for (size_t i = 1; i < versions.size(); ++i) {
-    if (versions[i - 1].index == versions[i].index) return Error::Make(ErrorCode::kCorruptedElf);
-  }
   uintptr_t versym = t.values[0];
   if (t.present[0] && !image.dptr_adjusted && !safe_add(image.load_bias, versym, versym))
     return Error::Make(ErrorCode::kIntegerOverflow);
   VersionedImportSnapshot result;
   result.skipped_relocations = skipped_relocations;
+  if (Error e = budget.take_objects<VersionedImport>(imports.size())) return e;
   result.imports.reserve(imports.size());
   for (auto& entry : imports) {
     SymbolVersion version;
@@ -388,6 +404,8 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
         if (!symbol) return symbol.error();
         if ((symbol.value().st_shndx == SHN_UNDEF) != (found->source == VersionSource::kNeeded))
           return Error::Make(ErrorCode::kCorruptedElf);
+        if (Error e = budget.take_bytes(found->name.size() + 1)) return e;
+        if (Error e = budget.take_bytes(found->dependency.size() + 1)) return e;
         version.name = found->name;
         version.dependency = found->dependency;
         version.source = found->source;
@@ -456,7 +474,8 @@ bool resolve_slot(const InspectedImage& image, uint64_t r_offset, uintptr_t& out
 
 }  // namespace
 
-Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context) {
+Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context,
+                                 ScanBudget* budget) {
   if (image.rela == 0 || image.rela_size == 0) return Error::Ok();
   if (image.rela_ent != 0 && image.rela_ent != sizeof(NativeElfRelocation))
     return Error::Make(ErrorCode::kUnsupportedFormat);
@@ -487,6 +506,9 @@ Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit
     }
   }
 
+  if (budget) {
+    if (Error e = budget->take_records(count)) return e;
+  }
   for (size_t i = 0; i < count; ++i) {
     NativeElfRelocation rela;
     std::memcpy(&rela, reinterpret_cast<const void*>(image.rela + i * sizeof(NativeElfRelocation)),
@@ -566,7 +588,8 @@ constexpr uint64_t kKnownGroupFlags =
 
 }  // namespace
 
-Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context) {
+Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context,
+                            ScanBudget* budget) {
   if (image.android_rela == 0 || image.android_rela_size == 0) return Error::Ok();
   if (image.android_rela_size > kMaxPackedBytes) return Error::Make(ErrorCode::kOutOfBounds);
   if (!readable(image, image.android_rela, image.android_rela_size))
@@ -585,6 +608,9 @@ Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, voi
     return Error::Make(ErrorCode::kCorruptedElf);
   const uint64_t total = static_cast<uint64_t>(total_signed);
   if (total > kMaxPackedRelocations) return Error::Make(ErrorCode::kOutOfBounds);
+  if (budget) {
+    if (Error e = budget->take_records(static_cast<size_t>(total))) return e;
+  }
 
   // r_offset and the addend are accumulated with checked signed arithmetic: a
   // stream whose running value overflows int64_t is rejected, never wrapped.
@@ -711,6 +737,8 @@ Error validate_sources(uint32_t sources) noexcept {
 struct ScanState {
   const InspectedImage& image;
   RawFunctionSnapshot& result;
+  ScanBudget& budget;
+  std::set<uintptr_t> slots;
   size_t symbol_bound = 0;
   bool symbols_ready = false;
 };
@@ -746,6 +774,7 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
   const char* begin = reinterpret_cast<const char*>(image.strtab + sym.st_name);
   const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - sym.st_name));
   if (end == nullptr) return Error::Make(ErrorCode::kCorruptedElf);
+  if (Error e = state.budget.take_bytes(static_cast<size_t>(end - begin) + 1)) return e;
   name.assign(begin, static_cast<size_t>(end - begin));
   symbol_type = static_cast<uint8_t>(ELF64_ST_TYPE(sym.st_info));
   undefined = sym.st_shndx == kShnUndef;
@@ -755,8 +784,16 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
 // Keep one record from any source.  Only JUMP_SLOT and GLOB_DAT with a non-zero
 // symbol index are materialized, whichever table holds them (labelled with their
 // real source and type); every other record is only counted, so a large table
-// of RELATIVE or other relocations costs no memory.
+// of RELATIVE or other relocations retains only its address for alias checking.
 Error keep(ScanState& state, const DecodedReloc& reloc) {
+  // NONE has no destination. Every other record participates even when it is
+  // not a supported function import or has symbol index zero.
+  if (reloc.type != 0) {
+    if (state.slots.find(reloc.slot_address) != state.slots.end())
+      return Error::Make(ErrorCode::kCorruptedElf);
+    if (Error e = state.budget.take_objects<uintptr_t>(1)) return e;
+    state.slots.insert(reloc.slot_address);
+  }
   if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
     ++state.result.skipped_relocations;
     return Error::Ok();
@@ -765,6 +802,7 @@ Error keep(ScanState& state, const DecodedReloc& reloc) {
       !state.image.addr_in_writable_load(reloc.slot_address, kNativeSlotSize))
     return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = ensure_symbols(state)) return e;
+  if (Error e = state.budget.take_objects<FunctionReloc>(1)) return e;
   FunctionReloc record;
   if (Error e = read_symbol(state, reloc.symbol_index, record.entry.base.import.symbol,
                             record.entry.symbol_type, record.symbol_undefined))
@@ -785,7 +823,8 @@ Error visit_record(void* context, const DecodedReloc& reloc) {
 
 }  // namespace
 
-Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources) {
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
+                                                  ScanBudget* shared_budget) {
   if (Error e = validate_sources(sources)) return e;
   // Scanning DT_RELA or DT_ANDROID_RELA refuses an image whose relocation tags
   // are unusable (a repeated tag, a pointer without its size, an overflowing
@@ -796,9 +835,12 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
     return Error::Make(ErrorCode::kUnsupportedFormat);
 
   RawFunctionSnapshot result;
-  ScanState state{image, result};
+  ScanBudget local_budget;
+  ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
+  ScanState state{image, result, budget, {}};
 
   if ((sources & kSourceJmprel) != 0 && image.jmprel_count != 0) {
+    if (Error e = budget.take_records(image.jmprel_count)) return e;
     // inspect() bounded the table within a LOAD; reading it also needs PF_R.
     uintptr_t table_bytes;
     if (!safe_mul(image.jmprel_count, sizeof(NativeElfRelocation), table_bytes))
@@ -821,26 +863,18 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
     }
   }
   if (sources & kSourceNativeDynamic) {
-    if (Error e = decode_dynamic_relocations(image, visit_record, &state)) return e;
+    if (Error e = decode_dynamic_relocations(image, visit_record, &state, &budget)) return e;
   }
   if (sources & kSourceNativeAndroidPacked) {
-    if (Error e = decode_android_packed(image, visit_record, &state)) return e;
+    if (Error e = decode_android_packed(image, visit_record, &state, &budget)) return e;
   }
-
-  // Duplicate slot addresses across all scanned sources are malformed.
-  std::vector<uintptr_t> addresses;
-  addresses.reserve(result.records.size());
-  for (const auto& record : result.records)
-    addresses.push_back(record.entry.base.import.slot_address);
-  std::sort(addresses.begin(), addresses.end());
-  if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
-    return Error::Make(ErrorCode::kCorruptedElf);
 
   // Attach version metadata over the whole set, preserving order.
   std::vector<ImportInfo> infos;
+  if (Error e = budget.take_objects<ImportInfo>(result.records.size())) return e;
   infos.reserve(result.records.size());
   for (auto& record : result.records) infos.push_back(std::move(record.entry.base.import));
-  auto versioned = resolve_versions(image, std::move(infos), result.skipped_relocations);
+  auto versioned = resolve_versions(image, std::move(infos), result.skipped_relocations, &budget);
   if (!versioned) return versioned.error();
   for (size_t i = 0; i < result.records.size(); ++i)
     result.records[i].entry.base = std::move(versioned.value().imports[i]);
@@ -849,10 +883,12 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
 
 Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& image,
                                                          uint32_t sources) {
-  auto scan = scan_function_imports(image, sources);
+  ScanBudget budget;
+  auto scan = scan_function_imports(image, sources, &budget);
   if (!scan) return scan.error();
   FunctionImportSnapshot result;
   result.skipped_relocations = scan.value().skipped_relocations;
+  if (Error e = budget.take_objects<FunctionImport>(scan.value().records.size())) return e;
   result.imports.reserve(scan.value().records.size());
   for (auto& record : scan.value().records) result.imports.push_back(std::move(record.entry));
   return result;
@@ -987,9 +1023,11 @@ bool valid(const TextMatch& match) noexcept {
          (match.kind != TextMatchKind::kAny || match.text.empty()) &&
          (match.text.empty() || match.text.data() != nullptr);
 }
-Result<OwnedPattern> copy_pattern(const CandidatePattern& pattern) {
+Result<OwnedPattern> copy_pattern(const CandidatePattern& pattern, detail::ScanBudget& budget) {
   if (!valid(pattern.path) || !valid(pattern.symbol))
     return Error::Make(ErrorCode::kInvalidArgument);
+  if (Error e = budget.take_bytes(pattern.path.text.size())) return e;
+  if (Error e = budget.take_bytes(pattern.symbol.text.size())) return e;
   return OwnedPattern{{pattern.path.kind, std::string(pattern.path.text)},
                       {pattern.symbol.kind, std::string(pattern.symbol.text)}};
 }
@@ -1009,12 +1047,14 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
   void* const context = selection.context;
   const uint32_t sources = selection.sources, types = selection.types;
   try {
-    auto include = copy_pattern(selection.include);
+    detail::ScanBudget budget;
+    auto include = copy_pattern(selection.include, budget);
     if (!include) return include.error();
     std::vector<OwnedPattern> exclusions;
+    if (Error e = budget.take_objects<OwnedPattern>(selection.exclude_count)) return e;
     exclusions.reserve(selection.exclude_count);
     for (size_t i = 0; i < selection.exclude_count; ++i) {
-      auto pattern = copy_pattern(selection.exclude[i]);
+      auto pattern = copy_pattern(selection.exclude[i], budget);
       if (!pattern) return pattern.error();
       exclusions.push_back(std::move(pattern.value()));
     }
@@ -1024,12 +1064,17 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
       detail::RawFunctionSnapshot imports;
     };
     std::vector<Snapshot> snapshots;
+    if (Error e = budget.take_objects<Snapshot>(count)) return e;
     snapshots.reserve(count);
     for (size_t i = 0; i < count; ++i) {
+      if (images[i].image.instance_token == 0 && images[i].path.find('\0') != std::string::npos)
+        return Error::Make(ErrorCode::kImageInvalidated);
       for (size_t j = 0; j < i; ++j)
         if (same_image(images[i].image, images[j].image))
           return Error::Make(ErrorCode::kInvalidArgument);
-      auto snapshot = detail::inspect_function_relocs(images[i].image, sources);
+      if (Error e = budget.take_bytes(images[i].path.size() + 1)) return e;
+      auto snapshot = detail::inspect_function_relocs(images[i].image, sources, &budget,
+                                                      images[i].path.c_str());
       if (!snapshot) return snapshot.error();
       snapshots.push_back({images[i].image, images[i].path, std::move(snapshot.value())});
     }
@@ -1056,6 +1101,8 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
         if (excluded) continue;
         if (!detail::function_reloc_acceptable(record))
           return Error::Make(ErrorCode::kUnsupportedRelocation);
+        if (Error e = budget.take_objects<FunctionCandidate>(1)) return e;
+        if (Error e = budget.take_bytes(snapshot.path.size() + 1)) return e;
         FunctionCandidate candidate{snapshot.image, snapshot.path, std::move(record.entry)};
         if (predicate) {
           Result<bool> keep = Error::Make(ErrorCode::kUnsupportedFormat);
@@ -1075,6 +1122,7 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
       }
     }
     std::vector<uintptr_t> addresses;
+    if (Error e = budget.take_objects<uintptr_t>(result.size())) return e;
     addresses.reserve(result.size());
     for (const auto& candidate : result)
       addresses.push_back(candidate.selected.base.import.slot_address);

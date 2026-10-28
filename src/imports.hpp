@@ -6,6 +6,7 @@
 
 #include <vector>
 
+#include "common.hpp"
 #include "elf.hpp"
 #include "yukiplt.hpp"
 
@@ -25,7 +26,8 @@ Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage&
 // JUMP_SLOT and function-import paths).
 Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
                                                  std::vector<ImportInfo> imports,
-                                                 size_t skipped_relocations);
+                                                 size_t skipped_relocations,
+                                                 ScanBudget* budget = nullptr);
 Error validate_selector(const ImportSelector& selector) noexcept;
 Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
                              const ImportSelector& selector);
@@ -49,12 +51,15 @@ struct RawFunctionSnapshot {
 
 // Owning acceptance metadata acquired through the normal lifetime-protected
 // inspection path. No GOT read and no retained image pointer is dereferenced.
-Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, uint32_t sources);
+Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, uint32_t sources,
+                                                    ScanBudget* budget = nullptr,
+                                                    const char* expected_path = nullptr);
 bool function_reloc_acceptable(const FunctionReloc&) noexcept;
 
 // `sources` is a non-zero subset of RelocationSourceBit.  Validates RELA/APS2
 // metadata lazily (inspect() never fails on it).
-Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources);
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
+                                                  ScanBudget* budget = nullptr);
 
 // Build the public, owning snapshot from a scan.
 Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& image,

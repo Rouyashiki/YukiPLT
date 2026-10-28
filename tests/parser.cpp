@@ -24,6 +24,29 @@ using namespace yukiplt;
 using namespace yukiplt::detail;
 using namespace yukiplt::test;
 
+TEST(ElfInspector, RejectsDynamicReadWithoutReadableLoadAndUnalignedEntries) {
+  ElfBuilder unreadable;
+  unreadable.set_load_flags(PF_W);
+  auto no_read = unreadable.build();
+  EXPECT_EQ(inspect(no_read.load_bias(), no_read.phdr_table(), no_read.phdr_count).error().code,
+            ErrorCode::kOutOfBounds);
+  ElfBuilder builder;
+  auto image = builder.build();
+  image.buffer.resize(image.buffer.size() + 8);
+  auto* headers = const_cast<Elf64_Phdr*>(image.phdr_table());
+  for (size_t i = 0; i < image.phdr_count; ++i) {
+    auto& header = headers[i];
+    if (header.p_type == PT_LOAD) header.p_memsz += 8;
+    if (header.p_type == PT_DYNAMIC) {
+      std::memmove(image.buffer.data() + header.p_vaddr + 1, image.buffer.data() + header.p_vaddr,
+                   header.p_memsz);
+      ++header.p_vaddr;
+    }
+  }
+  EXPECT_EQ(inspect(image.load_bias(), image.phdr_table(), image.phdr_count).error().code,
+            ErrorCode::kCorruptedElf);
+}
+
 TEST(ElfInspector, MissingDtNull) {
   ElfBuilder b;
   b.add_symbol("f", 1);

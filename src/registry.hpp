@@ -124,6 +124,7 @@ class Registry {
   bool owns_live_replacement(uint64_t id) const;
   uintptr_t first_slot_of(uint64_t id) const;
   size_t live_count() const;
+  bool owns_slot(uintptr_t address) const noexcept { return slot_is_live(address); }
   void record_diagnostic(uint64_t id, const RecoveryDiagnostic& diagnostic) noexcept;
   Error recovery_snapshot(uint64_t id, RecoveryDiagnostic& diagnostic, ResidualPage* pages,
                           size_t capacity) const noexcept;

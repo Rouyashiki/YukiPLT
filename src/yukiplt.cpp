@@ -254,6 +254,18 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   Error plan = plan_fn(planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
 
+  // Publication is an unconditional store to caller storage, never a slot
+  // update. Reject aliasing a transaction target or another live owner before
+  // claiming slots, touching page permissions, or publishing any original.
+  Registry& reg = Registry::instance();
+  for (const auto& slot : planned) {
+    const uintptr_t output = reinterpret_cast<uintptr_t>(slot.out_original);
+    if (output == 0) continue;
+    if (reg.owns_slot(output)) return {Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
+    for (const auto& target : planned)
+      if (output == target.address) return {Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
+  }
+
   const size_t ps = detail::page_size();
   if (ps == 0)
     return {Error::Make(ErrorCode::kUnsupportedFormat), detail_api::make(detail_api::invalid())};
@@ -266,7 +278,6 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     recs[i].replacement = planned[i].replacement;
     slot_addrs[i] = planned[i].address;
   }
-  Registry& reg = Registry::instance();
   uint64_t id = reg.claim(identity_of(view), recs, planned.size());
   if (id == Registry::kInvalidId)
     return {Error::Make(ErrorCode::kAlreadyHooked), detail_api::make(detail_api::invalid())};

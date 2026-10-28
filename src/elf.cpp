@@ -100,7 +100,9 @@ struct DynamicInfo {
 /// Parse the dynamic section, extracting the tags we care about.
 /// The dynamic section is at [dyn_addr, dyn_addr + dyn_size) in memory.
 static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn_size) {
-  if (dyn_size < sizeof(Elf64_Dyn)) return Error::Make(ErrorCode::kCorruptedElf);
+  if (dyn_size < sizeof(Elf64_Dyn) || dyn_size % sizeof(Elf64_Dyn) != 0 ||
+      dyn_addr % alignof(Elf64_Dyn) != 0)
+    return Error::Make(ErrorCode::kCorruptedElf);
 
   const size_t max_entries = dyn_size / sizeof(Elf64_Dyn);
   const auto* dyn = reinterpret_cast<const Elf64_Dyn*>(dyn_addr);
@@ -216,6 +218,7 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
 
     switch (ph.p_type) {
       case PT_LOAD: {
+        if (ph.p_filesz > ph.p_memsz) return Error::Make(ErrorCode::kCorruptedElf);
         // Validate vaddr + memsz doesn't overflow.
         uint64_t vaddr_end64;
         if (!safe_add64(ph.p_vaddr, ph.p_memsz, vaddr_end64))
@@ -265,6 +268,12 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
 
   // PT_DYNAMIC must be within a PT_LOAD segment.
   if (!image.addr_in_load(dyn_begin, dyn_size)) return Error::Make(ErrorCode::kCorruptedElf);
+  bool readable_dynamic = false;
+  for (const auto& segment : image.load_segments)
+    if ((segment.flags & PF_R) != 0 && dyn_begin >= segment.vaddr_begin &&
+        dyn_end <= segment.vaddr_end)
+      readable_dynamic = true;
+  if (!readable_dynamic) return Error::Make(ErrorCode::kOutOfBounds);
   image.dynamic = dyn_begin;
   image.dynamic_size = dyn_size;
 
@@ -443,7 +452,8 @@ Expected<std::optional<uint32_t>, Error> gnu_hash_lookup(const InspectedImage& i
   uint32_t bloom_size = r_bloom_size.value();
   uint32_t bloom_shift = r_bloom_shift.value();
 
-  if (nbuckets == 0 || bloom_size == 0) return Error::Make(ErrorCode::kCorruptedElf);
+  if (nbuckets == 0 || bloom_size == 0 || bloom_shift >= 32)
+    return Error::Make(ErrorCode::kCorruptedElf);
 
   // Compute layout addresses.
   uintptr_t bloom_addr = base + 16;
@@ -565,7 +575,8 @@ Expected<std::optional<uint32_t>, Error> sysv_hash_lookup(const InspectedImage& 
   uint32_t sym_idx = r_sym_idx.value();
 
   // Walk the chain.
-  while (sym_idx != 0) {
+  for (uint32_t visited = 0; sym_idx != 0; ++visited) {
+    if (visited >= nchain) return Error::Make(ErrorCode::kCorruptedElf);
     if (sym_idx >= nchain) return Error::Make(ErrorCode::kCorruptedElf);
 
     // Read symbol.

@@ -190,7 +190,9 @@ yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
 
 // Strings are borrowed during the call. Selector filters are ANDed and must
 // select one JUMP_SLOT. No GLOB_DAT/APS2. Caller holds images/replacements/output
-// storage alive. The output handle must be zero; failure never overwrites an
+// storage alive. Original outputs must be caller-owned writable storage, never
+// GOT slots; aliases of planned or already owned slots are rejected before
+// publication. The output handle must be zero; failure never overwrites an
 // existing handle. Non-null original outputs must be distinct and aligned, else
 // INVALID_ARGUMENT before any lock or write. A system image no longer loaded
 // returns IMAGE_INVALIDATED. Originals are release-published after every page
@@ -263,6 +265,9 @@ yukiplt_c_error yukiplt_c_hook_functions_ex(
     const yukiplt_c_image*, const yukiplt_c_function_request_ex*, size_t count,
     yukiplt_c_handle* out_handle, yukiplt_c_slot_report* reports,
     yukiplt_c_recovery_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+// Actual LOAD intervals only; complete enumeration rejects ambiguity. Android
+// ARM64 ignores only the query's TBI top byte, without validating tags/PAC or
+// pointer validity. The returned image is not held alive.
 yukiplt_c_error yukiplt_c_image_containing(const void* address,
                                            yukiplt_c_image* out_image) YUKIPLT_C_NOEXCEPT;
 

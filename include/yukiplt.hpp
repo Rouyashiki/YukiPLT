@@ -598,6 +598,10 @@ class [[nodiscard]] Expected<void, E> {
 /// - Every non-null out_original must be aligned for void* and distinct within
 ///   one call; otherwise the call returns kInvalidArgument before taking any
 ///   lock or writing anything.
+///   Outputs must be caller-owned writable storage, separate from GOT slots.
+///   Aliasing this transaction's targets or another live Registry owner's Slot
+///   is rejected under the operation lock before any claim/publication. Plans
+///   also reject outputs aliasing a target in a different image group.
 ///
 /// - The library publishes each prior slot value to its out_original after all
 ///   validation and page-protection raises have succeeded and before the first
@@ -976,6 +980,8 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector);
 /// Find one publicly enumerable image whose actual PT_LOAD memory interval
 /// contains address. Holes are excluded, all images are enumerated to reject
 /// ambiguity. The result owns its path but does not hold the image alive.
+/// On Android ARM64 only the query's TBI top byte is ignored. This does not
+/// validate a memory tag, strip PAC signatures, or establish pointer validity.
 Result<NamedImage> find_image_containing(const void* address);
 
 struct HookTarget {

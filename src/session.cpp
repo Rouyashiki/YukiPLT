@@ -100,7 +100,13 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
 }
 
 Result<NamedImage> find_image_containing(const void* address) {
-  if (address == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
+  uintptr_t query_address = reinterpret_cast<uintptr_t>(address);
+#if defined(__ANDROID__) && defined(__aarch64__)
+  // Android ARM64 data pointers can carry a TBI/HWASan tag. Compare the virtual
+  // address to ELF intervals without dereferencing or validating that tag.
+  query_address &= UINT64_C(0x00ffffffffffffff);
+#endif
+  if (query_address == 0) return Error::Make(ErrorCode::kInvalidArgument);
 #if defined(__linux__) || defined(__ANDROID__)
   struct Context {
     uintptr_t address;
@@ -108,7 +114,7 @@ Result<NamedImage> find_image_containing(const void* address) {
     NamedImage found;
     Error error;
   };
-  Context ctx{reinterpret_cast<uintptr_t>(address), 0, {}, {}};
+  Context ctx{query_address, 0, {}, {}};
   dl_iterate_phdr(
       [](dl_phdr_info* info, size_t, void* opaque) -> int {
         auto& c = *static_cast<Context*>(opaque);
@@ -147,7 +153,10 @@ Result<NamedImage> find_image_containing(const void* address) {
 
 namespace yukiplt::detail {
 Result<bool> image_contains_address(const ImageView& image, uintptr_t address) {
-  if (!image.phdr_table || image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  // Some Android enumerators include an empty bookkeeping entry. It has no
+  // LOAD intervals and cannot contain an address; keep enumerating real images.
+  if (image.phdr_count == 0) return false;
+  if (!image.phdr_table) return Error::Make(ErrorCode::kInvalidArgument);
   bool found = false;
   for (size_t i = 0; i < image.phdr_count; ++i) {
     const auto& ph = image.phdr_table[i];
@@ -229,6 +238,15 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
           return Error::Make(ErrorCode::kInvalidArgument);
       }
       plan.targets_.push_back({target.image, found, target.replacement, target.out_original});
+    }
+    for (size_t i = 0; i < plan.targets_.size(); ++i) {
+      const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);
+      if (!output) continue;
+      for (const auto& target : plan.targets_)
+        if (output == target.selected.import.slot_address) {
+          if (failed_target) *failed_target = i;
+          return Error::Make(ErrorCode::kInvalidArgument);
+        }
     }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;
@@ -424,6 +442,15 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
           return Error::Make(ErrorCode::kInvalidArgument);
       plan.targets_.push_back({target.image, found, request.replacement, request.out_original,
                                request.require_current, request.expected_current});
+    }
+    for (size_t i = 0; i < plan.targets_.size(); ++i) {
+      const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);
+      if (!output) continue;
+      for (const auto& target : plan.targets_)
+        if (output == target.selected.base.import.slot_address) {
+          if (failed_target) *failed_target = i;
+          return Error::Make(ErrorCode::kInvalidArgument);
+        }
     }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;

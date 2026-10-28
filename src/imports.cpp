@@ -365,6 +365,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
     return Error::Make(ErrorCode::kIntegerOverflow);
   VersionedImportSnapshot result;
   result.skipped_relocations = skipped_relocations;
+  result.imports.reserve(imports.size());
   for (auto& entry : imports) {
     SymbolVersion version;
     version.table_present = t.present[0];
@@ -810,11 +811,11 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
   // Attach version metadata over the whole set, preserving order.
   std::vector<ImportInfo> infos;
   infos.reserve(result.records.size());
-  for (const auto& record : result.records) infos.push_back(record.entry.base.import);
+  for (auto& record : result.records) infos.push_back(std::move(record.entry.base.import));
   auto versioned = resolve_versions(image, std::move(infos), result.skipped_relocations);
   if (!versioned) return versioned.error();
   for (size_t i = 0; i < result.records.size(); ++i)
-    result.records[i].entry.base.version = std::move(versioned.value().imports[i].version);
+    result.records[i].entry.base = std::move(versioned.value().imports[i]);
   return result;
 }
 

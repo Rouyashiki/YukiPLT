@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -19,6 +20,41 @@ bool same_image(const ImageView& a, const ImageView& b) noexcept {
   return a.load_bias == b.load_bias && a.phdr_table == b.phdr_table &&
          a.phdr_count == b.phdr_count && a.instance_token == b.instance_token;
 }
+
+// Only borrowed filter strings and owned enumeration results, scoped to one
+// refresh. Installation still validates the live instance and path under the
+// linker lock. No addresses from this cache are dereferenced here.
+class RefreshImages {
+ public:
+  const Result<std::vector<NamedImage>>& get(const ImageSelector& filter) {
+    auto matches = [&](const Entry& entry) {
+      if (entry.filter.match != filter.match) return false;
+      if (filter.match == ImageMatch::kLoadBias && entry.filter.load_bias != filter.load_bias)
+        return false;
+      if ((filter.match == ImageMatch::kExactPath || filter.match == ImageMatch::kBasename) &&
+          std::strcmp(entry.filter.name, filter.name) != 0)
+        return false;
+      return true;
+    };
+    if (!first_) {
+      first_.emplace(Entry{filter, detail::active_image_enumerator()(filter)});
+      return first_->images;
+    }
+    if (matches(*first_)) return first_->images;
+    for (const auto& entry : entries_)
+      if (matches(entry)) return entry.images;
+    entries_.push_back({filter, detail::active_image_enumerator()(filter)});
+    return entries_.back().images;
+  }
+
+ private:
+  struct Entry {
+    ImageSelector filter;
+    Result<std::vector<NamedImage>> images;
+  };
+  std::optional<Entry> first_;
+  std::vector<Entry> entries_;
+};
 
 }  // namespace
 
@@ -298,23 +334,29 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
 
 RuleSummary RuleSet::refresh() {
   RuleSummary summary;
-  const detail::ImageEnumerator enumerate = detail::active_image_enumerator();
-  for (auto& rule : rules_) {
-    if (rule.removed) continue;
-    rebind_selector(rule);
-    auto images = enumerate(rule.filter);
-    if (!images) {
-      // Enumeration failure is not an unload and not an install attempt: leave
-      // existing bindings untouched.  "No matching image" is the normal empty
-      // case; any other enumeration error (e.g. OOM) is reported as a failure.
-      if (images.error().code != ErrorCode::kImageNotFound) ++summary.failed;
-      continue;
+  try {
+    RefreshImages cache;
+    for (auto& rule : rules_) {
+      if (rule.removed) continue;
+      rebind_selector(rule);
+      const auto& images = cache.get(rule.filter);
+      if (!images) {
+        // Enumeration failure is not an unload and not an install attempt: leave
+        // existing bindings untouched.  "No matching image" is the normal empty
+        // case; any other enumeration error (e.g. OOM) is reported as a failure.
+        if (images.error().code != ErrorCode::kImageNotFound) ++summary.failed;
+        continue;
+      }
+      // A system image is re-found under the linker lock by bias/phdr/phnum AND
+      // by the name enumeration reported, so an image replaced at the same
+      // address between enumeration and install is not hooked by mistake.
+      for (const auto& named : images.value())
+        apply_rule_to_image(rule, named.image, named.path.c_str(), named.path.c_str(), summary);
     }
-    // A system image is re-found under the linker lock by bias/phdr/phnum AND
-    // by the name enumeration reported, so an image replaced at the same
-    // address between enumeration and install is not hooked by mistake.
-    for (const auto& named : images.value())
-      apply_rule_to_image(rule, named.image, named.path.c_str(), named.path.c_str(), summary);
+  } catch (const std::bad_alloc&) {
+    ++summary.failed;
+  } catch (const std::length_error&) {
+    ++summary.failed;
   }
   summary.retained = retained_for(0, nullptr, true);
   return summary;
@@ -475,11 +517,11 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
   try {
     // Finish enumeration and all diagnostic string allocation before the first
     // installation. An enumeration error belongs to its rule, not to an unload.
-    const auto enumerate = detail::active_image_enumerator();
+    RefreshImages cache;
     for (auto& rule : rules_) {
       if (rule.removed) continue;
       rebind_selector(rule);
-      auto images = enumerate(rule.filter);
+      const auto& images = cache.get(rule.filter);
       if (!images) {
         RuleOperationEvent event;
         event.rule_id = rule.id;
@@ -487,11 +529,11 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
         event.error = images.error();
         report.events.push_back(std::move(event));
       } else {
-        for (auto& named : images.value()) {
+        for (const auto& named : images.value()) {
           RuleOperationEvent event;
           event.rule_id = rule.id;
           event.image = named.image;
-          event.path = std::move(named.path);
+          event.path = named.path;
           event.stage = RuleOperationStage::kInstall;
           report.events.push_back(std::move(event));
         }
@@ -519,6 +561,9 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
 
 RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
                                    RuleOperationReport& report) {
+  // Inputs may refer to the previous report's owned metadata.
+  RuleOperationReport previous = std::move(report);
+  report = {};
   reset_report(report);
   if (image.instance_token == 0)
     return report_failure(report, Error::Make(ErrorCode::kInvalidArgument), 0);
@@ -600,9 +645,10 @@ void RuleSet::finish_undo_report(RuleOperationReport& report) const {
 }
 
 RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report) {
-  if (Error e = prepare_undo_report(report, 0, &image, RuleOperationStage::kRestore))
-    return {0, 0, 1, retained_for(0, &image)};
-  auto summary = release_image(image);
+  const ImageView target = image;  // image may live in the report being replaced.
+  if (Error e = prepare_undo_report(report, 0, &target, RuleOperationStage::kRestore))
+    return {0, 0, 1, retained_for(0, &target)};
+  auto summary = release_image(target);
   finish_undo_report(report);
   return summary;
 }

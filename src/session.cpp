@@ -123,6 +123,11 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
   try {
     HookPlan plan;
     plan.targets_.reserve(count);
+    struct CachedSnapshot {
+      ImageView image;
+      VersionedImportSnapshot snapshot;
+    };
+    std::vector<CachedSnapshot> snapshots;
     for (size_t i = 0; i < count; ++i) {
       if (failed_target) *failed_target = i;
       const auto& target = targets[i];
@@ -138,14 +143,30 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
         if (same_image(target.image, targets[j].image)) ++group_size;
       }
       if (group_size > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
-      auto found = find_import(target.image, target.import);
-      if (!found) return found.error();
+      if (count == 1) {
+        auto found = find_import(target.image, target.import);
+        if (!found) return found.error();
+        plan.targets_.push_back(
+            {target.image, std::move(found.value()), target.replacement, target.out_original});
+        continue;
+      }
+      size_t cached = 0;
+      for (; cached < snapshots.size(); ++cached)
+        if (same_image(snapshots[cached].image, target.image)) break;
+      if (cached == snapshots.size()) {
+        auto snapshot = inspect_versioned_imports(target.image);
+        if (!snapshot) return snapshot.error();
+        snapshots.push_back({target.image, std::move(snapshot.value())});
+      }
+      const auto& snapshot = snapshots[cached].snapshot;
+      auto selected = detail::select_import(snapshot, target.import);
+      if (!selected) return selected.error();
+      const auto& found = snapshot.imports[selected.value()];
       for (const auto& previous : plan.targets_) {
-        if (previous.selected.import.slot_address == found.value().import.slot_address)
+        if (previous.selected.import.slot_address == found.import.slot_address)
           return Error::Make(ErrorCode::kInvalidArgument);
       }
-      plan.targets_.push_back(
-          {target.image, std::move(found.value()), target.replacement, target.out_original});
+      plan.targets_.push_back({target.image, found, target.replacement, target.out_original});
     }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;

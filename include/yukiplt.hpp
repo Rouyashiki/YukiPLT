@@ -475,6 +475,25 @@ class [[nodiscard]] Expected<void, E> {
   Expected(const E& err) : has_value_(false), error_(err) {}        // NOLINT: implicit
   Expected(E&& err) : has_value_(false), error_(std::move(err)) {}  // NOLINT: implicit
 
+  Expected(const Expected&) = default;
+  Expected(Expected&&) noexcept = default;
+  Expected& operator=(const Expected& other) {
+    if (this != &other) {
+      Expected copy(other);
+      *this = std::move(copy);
+    }
+    return *this;
+  }
+  Expected& operator=(Expected&& other) noexcept {
+    if (this != &other) {
+      // Commit with the constrained constructor, not E::operator=.
+      error_.~E();
+      new (&error_) E(std::move(other.error_));
+      has_value_ = other.has_value_;
+    }
+    return *this;
+  }
+
   [[nodiscard]] bool has_value() const noexcept { return has_value_; }
   [[nodiscard]] explicit operator bool() const noexcept { return has_value_; }
 

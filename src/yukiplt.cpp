@@ -162,14 +162,22 @@ Error validate_outputs(const Request* reqs, size_t count) noexcept {
 /// uniqueness and no duplicate targets within the batch.
 Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t count,
                     detail::SmallVec<PlannedSlot, 4>& out) {
+  // One complete validated scan for the batch; do not parse version metadata
+  // on the legacy name-only path.
+  auto snapshot = detail::snapshot_imports(img);
+  if (!snapshot) return snapshot.error();
   for (size_t i = 0; i < count; ++i) {
     if (reqs[i].symbol == nullptr || reqs[i].replacement == nullptr)
       return Error::Make(ErrorCode::kNullPointer);
 
-    auto slot = detail::resolve_unique_slot(img, reqs[i].symbol);
-    if (!slot) return slot.error();
-
-    uintptr_t addr = slot.value().address;
+    const ImportInfo* selected = nullptr;
+    for (const auto& entry : snapshot.value().imports) {
+      if (entry.symbol != reqs[i].symbol) continue;
+      if (selected) return Error::Make(ErrorCode::kAmbiguousSymbol);
+      selected = &entry;
+    }
+    if (!selected) return Error::Make(ErrorCode::kSymbolNotFound);
+    uintptr_t addr = selected->slot_address;
     for (const PlannedSlot& p : out) {
       if (p.address == addr) return Error::Make(ErrorCode::kInvalidArgument);  // duplicate target
     }

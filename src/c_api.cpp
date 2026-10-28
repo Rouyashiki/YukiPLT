@@ -203,7 +203,8 @@ yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
 }
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
   return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||
-         feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS;
+         feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS ||
+         feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES;
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         const yukiplt_c_function_selector* target,

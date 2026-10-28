@@ -306,6 +306,7 @@ struct RulesFixture : testing::Test {
   uintptr_t first_page = 0;
   uintptr_t end_page = 0;
   bool writable = false;
+  size_t enumeration_calls = 0;
 
   static RulesFixture* current;
 
@@ -381,6 +382,7 @@ struct RulesFixture : testing::Test {
   }
 
   static Result<std::vector<NamedImage>> enumerate(const ImageSelector& selector) {
+    ++current->enumeration_calls;
     if (current->enumeration_error != ErrorCode::kSuccess)
       return Error::Make(current->enumeration_error);
     std::vector<NamedImage> out;

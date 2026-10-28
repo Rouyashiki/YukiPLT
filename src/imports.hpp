@@ -50,6 +50,7 @@ struct RawFunctionSnapshot {
 // Owning acceptance metadata acquired through the normal lifetime-protected
 // inspection path. No GOT read and no retained image pointer is dereferenced.
 Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, uint32_t sources);
+bool function_reloc_acceptable(const FunctionReloc&) noexcept;
 
 // `sources` is a non-zero subset of RelocationSourceBit.  Validates RELA/APS2
 // metadata lazily (inspect() never fails on it).

@@ -6,9 +6,12 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <stdexcept>
 
 #include "common.hpp"
 #include "elf.hpp"
+#include "yukiplt.hpp"
 
 namespace yukiplt::detail {
 namespace {
@@ -911,4 +914,150 @@ Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
   return selected;
 }
 
+bool function_reloc_acceptable(const FunctionReloc& record) noexcept {
+  return is_acceptable(record);
+}
+
 }  // namespace yukiplt::detail
+
+namespace yukiplt {
+namespace {
+bool same_image(const ImageView& a, const ImageView& b) noexcept {
+  return a.load_bias == b.load_bias && a.phdr_table == b.phdr_table &&
+         a.phdr_count == b.phdr_count && a.instance_token == b.instance_token;
+}
+struct OwnedMatch {
+  TextMatchKind kind;
+  std::string text;
+  bool matches(std::string_view value) const noexcept {
+    switch (kind) {
+      case TextMatchKind::kAny:
+        return true;
+      case TextMatchKind::kExact:
+        return value == text;
+      case TextMatchKind::kPrefix:
+        return value.substr(0, text.size()) == text;
+      case TextMatchKind::kSuffix:
+        return value.size() >= text.size() && value.substr(value.size() - text.size()) == text;
+      case TextMatchKind::kSubstring:
+        return value.find(text) != std::string_view::npos;
+    }
+    return false;
+  }
+};
+struct OwnedPattern {
+  OwnedMatch path;
+  OwnedMatch symbol;
+  bool matches(const std::string& image_path, const std::string& symbol_name) const noexcept {
+    return path.matches(image_path) && symbol.matches(symbol_name);
+  }
+};
+bool valid(const TextMatch& match) noexcept {
+  return match.kind <= TextMatchKind::kSubstring &&
+         (match.kind != TextMatchKind::kAny || match.text.empty()) &&
+         (match.text.empty() || match.text.data() != nullptr);
+}
+Result<OwnedPattern> copy_pattern(const CandidatePattern& pattern) {
+  if (!valid(pattern.path) || !valid(pattern.symbol))
+    return Error::Make(ErrorCode::kInvalidArgument);
+  return OwnedPattern{{pattern.path.kind, std::string(pattern.path.text)},
+                      {pattern.symbol.kind, std::string(pattern.symbol.text)}};
+}
+}  // namespace
+
+Result<std::vector<FunctionCandidate>> expand_function_candidates(
+    const NamedImage* images, size_t count, const CandidateSelection& selection) {
+  if ((!images && count != 0) || (!selection.exclude && selection.exclude_count != 0))
+    return Error::Make(ErrorCode::kNullPointer);
+  const FunctionImportSelector validation{{"candidate"}, selection.sources, selection.types};
+  if (Error e = detail::validate_function_selector(validation)) return e;
+  const CandidateLimits limits = selection.limits;
+  if (limits.text_bytes > CandidateLimits{}.text_bytes ||
+      limits.candidates > CandidateLimits{}.candidates)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  const auto predicate = selection.predicate;
+  void* const context = selection.context;
+  const uint32_t sources = selection.sources, types = selection.types;
+  try {
+    auto include = copy_pattern(selection.include);
+    if (!include) return include.error();
+    std::vector<OwnedPattern> exclusions;
+    exclusions.reserve(selection.exclude_count);
+    for (size_t i = 0; i < selection.exclude_count; ++i) {
+      auto pattern = copy_pattern(selection.exclude[i]);
+      if (!pattern) return pattern.error();
+      exclusions.push_back(std::move(pattern.value()));
+    }
+    struct Snapshot {
+      ImageView image;
+      std::string path;
+      detail::RawFunctionSnapshot imports;
+    };
+    std::vector<Snapshot> snapshots;
+    snapshots.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      for (size_t j = 0; j < i; ++j)
+        if (same_image(images[i].image, images[j].image))
+          return Error::Make(ErrorCode::kInvalidArgument);
+      auto snapshot = detail::inspect_function_relocs(images[i].image, sources);
+      if (!snapshot) return snapshot.error();
+      snapshots.push_back({images[i].image, images[i].path, std::move(snapshot.value())});
+    }
+    // Every snapshot call has returned: neither the linker nor the op lock is
+    // held below. No user callback runs during snapshot acquisition.
+    std::vector<FunctionCandidate> result;
+    size_t text_remaining = limits.text_bytes;
+    for (auto& snapshot : snapshots) {
+      for (auto& record : snapshot.imports.records) {
+        const auto exact = exact_function_selector(record.entry);
+        if ((exact.types & types) == 0) continue;
+        const auto& symbol = record.entry.base.import.symbol;
+        if (snapshot.path.size() > text_remaining) return Error::Make(ErrorCode::kOutOfBounds);
+        text_remaining -= snapshot.path.size();
+        if (symbol.size() > text_remaining) return Error::Make(ErrorCode::kOutOfBounds);
+        text_remaining -= symbol.size();
+        if (!include.value().matches(snapshot.path, symbol)) continue;
+        bool excluded = false;
+        for (const auto& pattern : exclusions)
+          if (pattern.matches(snapshot.path, symbol)) {
+            excluded = true;
+            break;
+          }
+        if (excluded) continue;
+        if (!detail::function_reloc_acceptable(record))
+          return Error::Make(ErrorCode::kUnsupportedRelocation);
+        FunctionCandidate candidate{snapshot.image, snapshot.path, std::move(record.entry)};
+        if (predicate) {
+          Result<bool> keep = Error::Make(ErrorCode::kUnsupportedFormat);
+          try {
+            keep = predicate(candidate, context);
+          } catch (const std::bad_alloc&) {
+            return Error::Make(ErrorCode::kOutOfMemory);
+          } catch (...) {
+            return Error::Make(ErrorCode::kUnsupportedFormat);
+          }
+          if (!keep)
+            return keep.error().ok() ? Error::Make(ErrorCode::kInvalidArgument) : keep.error();
+          if (!keep.value()) continue;
+        }
+        if (result.size() == limits.candidates) return Error::Make(ErrorCode::kOutOfBounds);
+        result.push_back(std::move(candidate));
+      }
+    }
+    std::vector<uintptr_t> addresses;
+    addresses.reserve(result.size());
+    for (const auto& candidate : result)
+      addresses.push_back(candidate.selected.base.import.slot_address);
+    std::sort(addresses.begin(), addresses.end());
+    if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
+      return Error::Make(ErrorCode::kInvalidArgument);
+    return result;
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  }
+}
+}  // namespace yukiplt

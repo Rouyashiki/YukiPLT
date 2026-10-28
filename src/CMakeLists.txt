@@ -3,8 +3,8 @@
 
 set(YUKIPLT_SOURCES
     c_api.cpp
-    elf.cpp
     imports.cpp
+    elf.cpp
     session.cpp
     memory.cpp
     registry.cpp

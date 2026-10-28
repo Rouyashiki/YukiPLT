@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <new>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -1380,6 +1381,58 @@ class RuleSet {
   std::unordered_map<BindingKey, size_t, BindingKeyHash> binding_index_;
   uint64_t next_rule_id_ = 1;
 };
+
+enum class TextMatchKind : uint8_t { kAny, kExact, kPrefix, kSuffix, kSubstring };
+struct TextMatch {
+  TextMatchKind kind = TextMatchKind::kAny;
+  std::string_view text;
+};
+struct CandidatePattern {
+  TextMatch path;
+  TextMatch symbol;
+};
+struct FunctionCandidate {
+  ImageView image;
+  std::string path;
+  FunctionImport selected;
+  /// Borrowed strings refer to this candidate. Explicitly build a function
+  /// plan/session to install; candidate generation never writes target memory.
+  FunctionImportSelector selector() const noexcept { return exact_function_selector(selected); }
+};
+/// The candidate reference is borrowed for this invocation. The host may copy
+/// metadata and reenter library APIs; no linker/op lock is held. Return false
+/// to exclude, or an error to fail the whole expansion. Exceptions are contained
+/// (bad_alloc -> OutOfMemory, other exceptions -> UnsupportedFormat). The host
+/// controls its own policy/work/memory, including regex if desired.
+using CandidatePredicate = Result<bool> (*)(const FunctionCandidate&, void* context);
+struct CandidateLimits {
+  size_t text_bytes = 8u * 1024u * 1024u;
+  size_t candidates = 4096;
+};
+struct CandidateSelection {
+  uint32_t sources = 0;  // Explicit nonzero RelocationSourceBit mask.
+  uint32_t types = 0;    // Explicit nonzero RelocationTypeBit mask.
+  CandidatePattern include;
+  const CandidatePattern* exclude = nullptr;
+  size_t exclude_count = 0;
+  CandidatePredicate predicate = nullptr;
+  void* context = nullptr;
+  CandidateLimits limits;
+};
+/// Only the explicitly supplied images are inspected; count==0 yields an empty
+/// result. All image metadata/path strings and filter text are owned before any
+/// host callback. Matching is case-sensitive by byte, with no pattern syntax;
+/// path AND symbol, exclusions win. Empty prefix/suffix/substring matches every
+/// text; empty exact matches only empty text.
+/// A kAny match requires empty text. Duplicate image instances/selected slots
+/// are errors. A matched ineligible relocation fails rather than being skipped;
+/// GLOB_DAT current-value conditions are deferred to installation.
+/// Limits may only be lowered. Text counts path+symbol bytes once per examined
+/// source/type record. These are not total snapshot/process/host memory limits.
+/// Failure returns no partial candidates; host callback side effects, if any,
+/// cannot be undone. Caller keeps supplied images stable for snapshot acquisition.
+Result<std::vector<FunctionCandidate>> expand_function_candidates(
+    const NamedImage* images, size_t count, const CandidateSelection& selection);
 
 /// Stable original-address storage. Keep it and all replacement code/context
 /// alive until recovery AND caller-established quiescence. No implicit unhook,

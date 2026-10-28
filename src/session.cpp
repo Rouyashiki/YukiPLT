@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <stdexcept>
 
@@ -14,6 +15,8 @@
 #include <link.h>
 #include <sys/auxv.h>
 #endif
+
+#include "elf.hpp"
 
 namespace yukiplt {
 namespace {
@@ -96,9 +99,68 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
 #endif
 }
 
+Result<NamedImage> find_image_containing(const void* address) {
+  if (address == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
+#if defined(__linux__) || defined(__ANDROID__)
+  struct Context {
+    uintptr_t address;
+    size_t matches = 0;
+    NamedImage found;
+    Error error;
+  };
+  Context ctx{reinterpret_cast<uintptr_t>(address), 0, {}, {}};
+  dl_iterate_phdr(
+      [](dl_phdr_info* info, size_t, void* opaque) -> int {
+        auto& c = *static_cast<Context*>(opaque);
+        ImageView view{static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum,
+                       0};
+        auto contains = detail::image_contains_address(view, c.address);
+        if (!contains) {
+          c.error = contains.error();
+          return 1;
+        }
+        if (!contains.value()) return 0;
+        ++c.matches;
+        if (c.matches != 1) return 0;
+        try {
+          c.found = {view, info->dlpi_name ? info->dlpi_name : ""};
+        } catch (const std::bad_alloc&) {
+          c.error = Error::Make(ErrorCode::kOutOfMemory);
+          return 1;
+        } catch (const std::length_error&) {
+          c.error = Error::Make(ErrorCode::kIntegerOverflow);
+          return 1;
+        }
+        return 0;
+      },
+      &ctx);
+  if (ctx.error) return ctx.error;
+  if (ctx.matches == 0) return Error::Make(ErrorCode::kImageNotFound);
+  if (ctx.matches != 1) return Error::Make(ErrorCode::kAmbiguousImage);
+  return std::move(ctx.found);
+#else
+  return Error::Make(ErrorCode::kUnsupportedFormat);
+#endif
+}
+
 }  // namespace yukiplt
 
 namespace yukiplt::detail {
+Result<bool> image_contains_address(const ImageView& image, uintptr_t address) {
+  if (!image.phdr_table || image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  bool found = false;
+  for (size_t i = 0; i < image.phdr_count; ++i) {
+    const auto& ph = image.phdr_table[i];
+    if (ph.p_type != PT_LOAD) continue;
+    if (ph.p_filesz > ph.p_memsz) return Error::Make(ErrorCode::kCorruptedElf);
+    const uintptr_t max = std::numeric_limits<uintptr_t>::max();
+    if (ph.p_vaddr > max - image.load_bias) return Error::Make(ErrorCode::kIntegerOverflow);
+    const uintptr_t begin = image.load_bias + static_cast<uintptr_t>(ph.p_vaddr);
+    if (ph.p_memsz > max - begin) return Error::Make(ErrorCode::kIntegerOverflow);
+    if (address >= begin && address - begin < ph.p_memsz) found = true;
+  }
+  return found;
+}
 
 Error validate_image_selector(const ImageSelector& selector) noexcept {
   if (selector.match == ImageMatch::kExactPath || selector.match == ImageMatch::kBasename) {
@@ -271,6 +333,213 @@ SessionSummary HookSession::abandon() {
     if (!group.handle.valid()) continue;
     ++summary.attempted;
     group.restore_error = yukiplt::abandon(group.handle);
+    if (!group.restore_error) {
+      group.state = SessionState::kAbandoned;
+      ++summary.succeeded;
+    } else
+      ++summary.failed;
+    if (group.handle.valid()) ++summary.retained;
+  }
+  return summary;
+}
+
+FunctionImportSelector exact_function_selector(const FunctionImport& chosen) noexcept {
+  FunctionImportSelector result;
+  result.base.symbol = chosen.base.import.symbol.c_str();
+  result.base.version_match =
+      chosen.base.version.index >= 2 ? VersionMatch::kExact : VersionMatch::kUnversioned;
+  result.base.version = chosen.base.version.index >= 2 ? chosen.base.version.name.c_str() : nullptr;
+  result.base.dependency =
+      chosen.base.version.dependency.empty() ? nullptr : chosen.base.version.dependency.c_str();
+  result.base.hidden = chosen.base.version.hidden ? HiddenMatch::kHidden : HiddenMatch::kNonHidden;
+  result.base.relocation_index = chosen.base.import.relocation_index;
+  switch (chosen.source) {
+    case RelocationSource::kJmprel:
+      result.sources = kSourceJmprel;
+      break;
+    case RelocationSource::kRela:
+      result.sources = kSourceRela;
+      break;
+    case RelocationSource::kAndroidRela:
+      result.sources = kSourceAndroidRela;
+      break;
+  }
+  result.index_source = chosen.source;
+  result.types = chosen.relocation_type == detail::kRAarch64JumpSlot  ? kTypeJumpSlot
+                 : chosen.relocation_type == detail::kRAarch64GlobDat ? kTypeGlobDat
+                                                                      : 0;
+  return result;
+}
+Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targets, size_t count,
+                                                  size_t* failed_target) {
+  if (failed_target) *failed_target = ~size_t{0};
+  if (!targets || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  try {
+    struct Cached {
+      ImageView image;
+      uint32_t sources = 0;
+      size_t count = 0;
+      bool loaded = false;
+      detail::RawFunctionSnapshot snapshot;
+    };
+    std::vector<Cached> cache;
+    FunctionHookPlan plan;
+    plan.targets_.reserve(count);
+    // Validate requests before scanning each group's union of explicit sources.
+    for (size_t i = 0; i < count; ++i) {
+      if (failed_target) *failed_target = i;
+      const auto& request = targets[i].request;
+      if (Error e = detail::validate_function_selector(request.target)) return e;
+      if (!request.replacement ||
+          reinterpret_cast<uintptr_t>(request.out_original) % alignof(void*) != 0)
+        return Error::Make(ErrorCode::kInvalidArgument);
+      for (size_t j = 0; j < i; ++j)
+        if (request.out_original && request.out_original == targets[j].request.out_original)
+          return Error::Make(ErrorCode::kInvalidArgument);
+      size_t group = 0;
+      for (; group < cache.size(); ++group)
+        if (same_image(cache[group].image, targets[i].image)) break;
+      if (group == cache.size()) cache.push_back({targets[i].image, 0, 0, false, {}});
+      if (++cache[group].count > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
+      cache[group].sources |= request.target.sources;
+    }
+    for (size_t i = 0; i < count; ++i) {
+      if (failed_target) *failed_target = i;
+      const auto& target = targets[i];
+      const auto& request = target.request;
+      size_t group = 0;
+      while (!same_image(cache[group].image, target.image)) ++group;
+      auto& cached = cache[group];
+      if (!cached.loaded) {
+        auto snapshot = detail::inspect_function_relocs(cached.image, cached.sources);
+        if (!snapshot) return snapshot.error();
+        cached.snapshot = std::move(snapshot.value());
+        cached.loaded = true;
+      }
+      auto selected = detail::select_function_reloc(cached.snapshot, request.target);
+      if (!selected) return selected.error();
+      const auto& found = cached.snapshot.records[selected.value()].entry;
+      for (const auto& prior : plan.targets_)
+        if (prior.selected.base.import.slot_address == found.base.import.slot_address)
+          return Error::Make(ErrorCode::kInvalidArgument);
+      plan.targets_.push_back({target.image, found, request.replacement, request.out_original,
+                               request.require_current, request.expected_current});
+    }
+    if (failed_target) *failed_target = ~size_t{0};
+    return plan;
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  }
+}
+Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& plan) {
+  if (plan.targets().empty()) return Error::Make(ErrorCode::kInvalidArgument);
+  try {
+    FunctionHookSession session;
+    session.targets_.reserve(plan.targets().size());
+    for (const auto& target : plan.targets()) {
+      size_t group = 0;
+      for (; group < session.images_.size(); ++group) {
+        if (same_image(session.images_[group].image, target.image)) break;
+      }
+      if (group == session.images_.size()) {
+        FunctionSessionImageResult result;
+        result.image = target.image;
+        session.images_.push_back(std::move(result));
+      }
+      session.images_[group].target_indices.push_back(session.targets_.size());
+      session.targets_.push_back({target, nullptr, {}, {}});
+    }
+    return session;
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  }
+}
+
+SessionSummary FunctionHookSession::install() {
+  SessionSummary summary;
+  for (auto& group : images_) {
+    if (group.state == SessionState::kIndeterminate ||
+        group.state == SessionState::kRestoreFailed) {
+      ++summary.failed;
+    } else if (group.state == SessionState::kPrepared ||
+               group.state == SessionState::kInstallFailed) {
+      ++summary.attempted;
+      FunctionHookRequestEx requests[kGroupLimit];
+      SlotReport reports[kGroupLimit];
+      size_t n = 0;
+      for (size_t index : group.target_indices) {
+        auto& target = targets_[index].target;
+        requests[n++] = {exact_function_selector(target.selected), target.replacement,
+                         target.out_original, target.require_current, target.expected_current};
+      }
+      auto result = hook_function_imports_ex(group.image, requests, n, reports, &group.operation);
+      group.install_error = result.error;
+      group.handle = std::move(result.handle);
+      group.state = result.ok()            ? SessionState::kInstalled
+                    : group.handle.valid() ? SessionState::kIndeterminate
+                                           : SessionState::kInstallFailed;
+      if (result.ok())
+        ++summary.succeeded;
+      else
+        ++summary.failed;
+      for (size_t i = 0; i < n; ++i) {
+        auto& target = targets_[group.target_indices[i]];
+        target.install_report = reports[i];
+        if (reports[i].address != 0)
+          target.original = reinterpret_cast<void*>(reports[i].value_before);
+      }
+    }
+    if (group.handle.valid()) ++summary.retained;
+  }
+  return summary;
+}
+
+SessionSummary FunctionHookSession::unhook() {
+  SessionSummary summary;
+  for (auto it = images_.rbegin(); it != images_.rend(); ++it) {
+    auto& group = *it;
+    if (!group.handle.valid()) continue;
+    ++summary.attempted;
+    SlotReport reports[kGroupLimit];
+    group.restore_error = yukiplt::unhook(group.handle, reports, group.target_indices.size());
+    group.operation = {};
+    group.operation.error = group.restore_error;
+    group.operation.stage =
+        group.restore_error ? OperationStage::kPrepare : OperationStage::kComplete;
+    group.operation.image_invalidated = group.restore_error.code == ErrorCode::kImageInvalidated;
+    if (group.handle.valid()) {
+      if (Error e = query_recovery(group.handle, &group.operation)) group.operation.error = e;
+    }
+    if (!group.restore_error) {
+      group.state = SessionState::kReleased;
+      ++summary.succeeded;
+    } else {
+      group.state = group.restore_error.code == ErrorCode::kImageInvalidated
+                        ? SessionState::kInvalidated
+                        : SessionState::kRestoreFailed;
+      ++summary.failed;
+    }
+    for (size_t i = 0; i < group.target_indices.size(); ++i)
+      targets_[group.target_indices[i]].restore_report = reports[i];
+    if (group.handle.valid()) ++summary.retained;
+  }
+  return summary;
+}
+
+SessionSummary FunctionHookSession::abandon() {
+  SessionSummary summary;
+  for (auto& group : images_) {
+    if (!group.handle.valid()) continue;
+    ++summary.attempted;
+    group.restore_error = yukiplt::abandon(group.handle);
+    group.operation = {};
+    group.operation.error = group.restore_error;
+    group.operation.stage =
+        group.restore_error ? OperationStage::kPrepare : OperationStage::kComplete;
     if (!group.restore_error) {
       group.state = SessionState::kAbandoned;
       ++summary.succeeded;

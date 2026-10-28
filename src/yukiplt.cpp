@@ -138,6 +138,8 @@ struct PlannedSlot {
   /// value: that would turn a null weak function pointer non-null.  JUMP_SLOT
   /// and legacy paths leave this false.
   bool reject_zero_original = false;
+  bool require_current = false;
+  uintptr_t expected_current = 0;
 };
 
 /// Every non-null original-pointer output must be pointer-aligned (the release
@@ -247,7 +249,7 @@ void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<Plann
 /// versioned selector, or function selector).
 template <typename PlanFn>
 HookResult install_planned(const ImageView& view, SlotReport* reports, size_t report_cap,
-                           PlanFn&& plan_fn) {
+                           PlanFn&& plan_fn, RecoveryDiagnostic* diagnostic = nullptr) {
   detail::SmallVec<PlannedSlot, 4> planned;
   Error plan = plan_fn(planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
@@ -293,6 +295,16 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     uintptr_t cur = 0;
     txn.load(planned[i].address, cur);
     planned[i].original = cur;
+    if (planned[i].require_current && cur != planned[i].expected_current) {
+      if (diagnostic) diagnostic->stage = OperationStage::kExpectedCurrent;
+      if (reports) {
+        reports[planned[i].report_index].address = planned[i].address;
+        reports[planned[i].report_index].value_before = cur;
+        reports[planned[i].report_index].value_observed = cur;
+        reports[planned[i].report_index].status = SlotStatus::kConflict;
+      }
+      return {Error::Make(ErrorCode::kSlotOwnershipConflict), HookHandle{}};
+    }
     // Reject unresolved GLOB_DAT before any write. Zero JUMP_SLOT remains valid.
     if (planned[i].reject_zero_original && cur == 0) {
       return {Error::Make(ErrorCode::kUnsupportedRelocation),
@@ -311,6 +323,12 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   Publication publication{&planned};
   CommitResult r =
       txn.commit(ops, planned.size(), CommitMode::kAllOrNothing, publish_originals, &publication);
+  if (diagnostic) {
+    diagnostic->raise_errno = r.raise_errno;
+    diagnostic->restore_errno = r.restore_errno;
+    diagnostic->rollback_failed = r.rollback_failed;
+    diagnostic->stage = r.raise_errno != 0 ? OperationStage::kRaise : OperationStage::kCommit;
+  }
   write_reports(reports, report_cap, planned, ops, planned.size());
 
   // Pages this commit raised but could not restore.  While any such page
@@ -340,6 +358,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
 
   const bool clean_success = r.all_committed && r.pages_restored && pn == 0;
   if (clean_success) {
+    if (diagnostic) diagnostic->stage = OperationStage::kComplete;
     reg.finish_restore(id, /*released=*/false, GroupState::kPrepared, recs, planned.size(), nullptr,
                        0);
     reg.mark_installed(id);
@@ -357,6 +376,10 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
                                    r.restore_errno != 0 ? r.restore_errno : r.raise_errno);
     reg.record_diagnostic(id, {pn != 0 ? OperationStage::kRestorePages : OperationStage::kRollback,
                                error, r.raise_errno, r.restore_errno, r.rollback_failed});
+    if (diagnostic) {
+      diagnostic->stage = pn != 0 ? OperationStage::kRestorePages : OperationStage::kRollback;
+      diagnostic->residual_page_count = pn;
+    }
     return {error, detail_api::make(id)};
   }
 
@@ -371,8 +394,9 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
 /// Plan a function-import batch: one scan of the image's selected sources shared
 /// by all requests, then unique selection per request with duplicate-target and
 /// output checks.
-Error plan_function_requests(const InspectedImage& img, const FunctionHookRequest* reqs,
-                             size_t count, detail::SmallVec<PlannedSlot, 4>& out) {
+template <typename Request>
+Error plan_function_requests(const InspectedImage& img, const Request* reqs, size_t count,
+                             detail::SmallVec<PlannedSlot, 4>& out) {
   uint32_t sources = 0;
   for (size_t i = 0; i < count; ++i) {
     if (reqs[i].replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
@@ -399,6 +423,10 @@ Error plan_function_requests(const InspectedImage& img, const FunctionHookReques
     // Only a GLOB_DAT slot must refuse a zero current value; a JUMP_SLOT slot is
     // installed regardless (its lazy stub value is non-zero and legitimate).
     ps.reject_zero_original = record.relocation_type == detail::kRAarch64GlobDat;
+    if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
+      ps.require_current = reqs[i].require_current;
+      ps.expected_current = reqs[i].expected_current;
+    }
     out.push_back(ps);
   }
   return Error::Ok();
@@ -635,13 +663,11 @@ HookResult hook_function_imports(const ImageView& image, const FunctionHookReque
   return detail::hook_function_imports_at(image, nullptr, reqs, count, reports);
 }
 
-}  // namespace yukiplt
-
-namespace yukiplt::detail {
-
-HookResult hook_function_imports_at(const ImageView& image, const char* expected_path,
-                                    const FunctionHookRequest* reqs, size_t count,
-                                    SlotReport* reports) {
+namespace {
+template <typename Request>
+HookResult hook_functions_impl(const ImageView& image, const char* expected_path,
+                               const Request* reqs, size_t count, SlotReport* reports,
+                               RecoveryDiagnostic* diagnostic = nullptr) {
   auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
   if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
   if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
@@ -657,7 +683,16 @@ HookResult hook_function_imports_at(const ImageView& image, const char* expected
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
-      return install(live, inspected.value(), reqs, count, reports, count);
+      if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
+        return install_planned(
+            live, reports, count,
+            [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+              return plan_function_requests(inspected.value(), reqs, count, planned);
+            },
+            diagnostic);
+      } else {
+        return install(live, inspected.value(), reqs, count, reports, count);
+      }
     } catch (const std::bad_alloc&) {
       return fail(Error::Make(ErrorCode::kOutOfMemory));
     } catch (const std::length_error&) {
@@ -685,9 +720,30 @@ HookResult hook_function_imports_at(const ImageView& image, const char* expected
   }
 }
 
+}  // namespace
+
+}  // namespace yukiplt
+
+namespace yukiplt::detail {
+HookResult hook_function_imports_at(const ImageView& image, const char* expected_path,
+                                    const FunctionHookRequest* reqs, size_t count,
+                                    SlotReport* reports) {
+  return hook_functions_impl(image, expected_path, reqs, count, reports);
+}
 }  // namespace yukiplt::detail
 
 namespace yukiplt {
+
+HookResult hook_function_imports_ex(const ImageView& image, const FunctionHookRequestEx* reqs,
+                                    size_t count, SlotReport* reports,
+                                    RecoveryDiagnostic* diagnostic) {
+  RecoveryDiagnostic value;
+  value.stage = OperationStage::kPrepare;
+  auto result = hook_functions_impl(image, nullptr, reqs, count, reports, &value);
+  value.error = result.error;
+  if (diagnostic) *diagnostic = value;
+  return result;
+}
 // unhook
 
 namespace {
@@ -1054,6 +1110,13 @@ Result<FunctionImport> find_function_import(const ImageView& image,
         if (!selected) return selected.error();
         return std::move(scan.value().records[selected.value()].entry);
       });
+}
+
+Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageView& image,
+                                                                    uint32_t sources) {
+  return inspect_metadata<detail::RawFunctionSnapshot>(image, [&](const InspectedImage& inspected) {
+    return detail::scan_function_imports(inspected, sources);
+  });
 }
 
 Error abandon(HookHandle& handle) {

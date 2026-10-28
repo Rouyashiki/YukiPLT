@@ -972,6 +972,11 @@ struct NamedImage {
 /// are not pinned. No promise of visibility into every linker namespace.
 Result<std::vector<NamedImage>> find_images(const ImageSelector& selector);
 
+/// Find one publicly enumerable image whose actual PT_LOAD memory interval
+/// contains address. Holes are excluded, all images are enumerated to reject
+/// ambiguity. The result owns its path but does not hold the image alive.
+Result<NamedImage> find_image_containing(const void* address);
+
 struct HookTarget {
   ImageView image;
   ImportSelector import;
@@ -1074,6 +1079,90 @@ class HookSession {
 /// Copy a validated plan and preallocate every report/group before any write.
 /// Failure never leaves a partial session or any installed hook.
 Result<HookSession> prepare_session(const HookPlan& plan);
+
+/// Optional value precondition, checked after VMA validation and before page
+/// raises/original publication. A later external writer is still checked by CAS.
+/// Equality is not proof of provider identity or of an unchanged ownership history.
+struct FunctionHookRequestEx {
+  FunctionImportSelector target;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
+  bool require_current = false;
+  uintptr_t expected_current = 0;
+};
+/// diagnostic is the immediate operation result, including failures without a
+/// surviving handle. It must not alias requests/reports/original outputs.
+HookResult hook_function_imports_ex(const ImageView&, const FunctionHookRequestEx*, size_t count,
+                                    SlotReport* reports = nullptr,
+                                    RecoveryDiagnostic* diagnostic = nullptr);
+
+/// Borrowed selector strings remain valid only while the owning import is
+/// unchanged/alive. Pins exact source, type, version, hidden bit and table index.
+FunctionImportSelector exact_function_selector(const FunctionImport&) noexcept;
+
+struct FunctionHookTarget {
+  ImageView image;
+  FunctionHookRequestEx request;
+};
+struct FunctionPlannedTarget {
+  ImageView image;
+  FunctionImport selected;
+  void* replacement = nullptr;
+  void** out_original = nullptr;
+  bool require_current = false;
+  uintptr_t expected_current = 0;
+};
+class FunctionHookPlan {
+ public:
+  const std::vector<FunctionPlannedTarget>& targets() const noexcept { return targets_; }
+
+ private:
+  friend Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget*, size_t,
+                                                           size_t*);
+  std::vector<FunctionPlannedTarget> targets_;
+};
+/// Read-only owning metadata; never reads GOT or holds an image alive. One
+/// image group is limited to 64 targets, with no automatic splitting.
+Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget*, size_t count,
+                                                  size_t* failed_target = nullptr);
+struct FunctionSessionTargetResult {
+  FunctionPlannedTarget target;
+  void* original = nullptr;
+  SlotReport install_report;
+  SlotReport restore_report;
+};
+struct FunctionSessionImageResult {
+  ImageView image;
+  std::vector<size_t> target_indices;
+  HookHandle handle;
+  SessionState state = SessionState::kPrepared;
+  Error install_error;
+  Error restore_error;
+  RecoveryDiagnostic operation;
+};
+/// Same lifetime and synchronization contract as HookSession: one transaction
+/// per image, continue after failures, undo in reverse group order. Installation
+/// revalidates metadata/VMAs/ownership. Destruction does not undo hooks or wait
+/// for calls to finish. The caller owns replacement code and original storage.
+class FunctionHookSession {
+ public:
+  FunctionHookSession() = default;
+  FunctionHookSession(const FunctionHookSession&) = delete;
+  FunctionHookSession& operator=(const FunctionHookSession&) = delete;
+  FunctionHookSession(FunctionHookSession&&) noexcept = default;
+  FunctionHookSession& operator=(FunctionHookSession&&) noexcept = default;
+  const std::vector<FunctionSessionTargetResult>& targets() const noexcept { return targets_; }
+  const std::vector<FunctionSessionImageResult>& images() const noexcept { return images_; }
+  SessionSummary install();
+  SessionSummary unhook();
+  SessionSummary abandon();
+
+ private:
+  friend Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
+  std::vector<FunctionSessionTargetResult> targets_;
+  std::vector<FunctionSessionImageResult> images_;
+};
+Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
 
 // Explicit rule refresh; no background tracking. Each (rule, image instance)
 // owns one single-slot group. Serialize all operations and result reads per

@@ -7,6 +7,8 @@
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail {
+// Caller keeps Program Headers readable; pure LOAD interval check, no holes.
+Result<bool> image_contains_address(const ImageView&, uintptr_t address);
 
 /// Enumerate images matching `selector`.  Same contract as find_images().
 using ImageEnumerator = Result<std::vector<NamedImage>> (*)(const ImageSelector&);

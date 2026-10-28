@@ -25,10 +25,10 @@ add_library(yukiplt_regression_core STATIC
     "${YUKIPLT_ROOT}/src/c_api.cpp"
     "${YUKIPLT_ROOT}/src/elf.cpp"
     "${YUKIPLT_ROOT}/src/imports.cpp"
+    "${YUKIPLT_ROOT}/src/session.cpp"
     "${YUKIPLT_ROOT}/src/memory.cpp"
     "${YUKIPLT_ROOT}/src/registry.cpp"
     "${YUKIPLT_ROOT}/src/rules.cpp"
-    "${YUKIPLT_ROOT}/src/session.cpp"
     "${YUKIPLT_ROOT}/src/yukiplt.cpp"
     "${YUKIPLT_ROOT}/tests/overrides.cpp"
 )

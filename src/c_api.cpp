@@ -17,6 +17,15 @@ static_assert(static_cast<uint32_t>(SlotStatus::kRollbackFailed) == YUKIPLT_C_RO
 yukiplt_c_error converted(Error error) noexcept {
   return {static_cast<uint32_t>(error.code), error.sys_errno};
 }
+yukiplt_c_recovery_diagnostic converted(const RecoveryDiagnostic& value) noexcept {
+  return {static_cast<uint32_t>(value.stage),
+          converted(value.error),
+          value.raise_errno,
+          value.restore_errno,
+          value.rollback_failed ? 1u : 0u,
+          value.image_invalidated ? 1u : 0u,
+          value.residual_page_count};
+}
 ImageView view(const yukiplt_c_image& image) noexcept {
   return {image.load_bias, static_cast<const Elf64_Phdr*>(image.program_headers),
           image.program_header_count, image.instance_token};
@@ -99,13 +108,7 @@ yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle* handle,
     ResidualPage buffer[kLimit];
     Error result = query_recovery(borrowed.value, &value, buffer, std::min(capacity, kLimit));
     if (result) return result;
-    *diagnostic = {static_cast<uint32_t>(value.stage),
-                   converted(value.error),
-                   value.raise_errno,
-                   value.restore_errno,
-                   value.rollback_failed ? 1u : 0u,
-                   value.image_invalidated ? 1u : 0u,
-                   value.residual_page_count};
+    *diagnostic = converted(value);
     for (size_t i = 0; i < std::min({capacity, value.residual_page_count, kLimit}); ++i)
       pages[i] = {buffer[i].address, buffer[i].original_protection, buffer[i].raised_protection,
                   buffer[i].sys_errno};
@@ -204,7 +207,9 @@ yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
   return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||
          feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS ||
-         feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES;
+         feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES ||
+         feature_id == YUKIPLT_C_FEATURE_EXPECTED_CURRENT ||
+         feature_id == YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY;
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         const yukiplt_c_function_selector* target,
@@ -236,6 +241,50 @@ yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image* image,
     detail_api::set(result.handle, detail_api::invalid());  // transfer, do not abandon
     copy_reports(output, reports, count);
     return result.error;
+  });
+}
+yukiplt_c_error yukiplt_c_hook_functions_ex(const yukiplt_c_image* image,
+                                            const yukiplt_c_function_request_ex* requests,
+                                            size_t count, yukiplt_c_handle* handle,
+                                            yukiplt_c_slot_report* output,
+                                            yukiplt_c_recovery_diagnostic* diagnostic) noexcept {
+  RecoveryDiagnostic operation;
+  operation.stage = OperationStage::kPrepare;
+  const auto error = guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    FunctionHookRequestEx translated[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      if (requests[i].struct_size != sizeof(yukiplt_c_function_request_ex) ||
+          requests[i].require_current > 1 ||
+          !function_selector(requests[i].base.target, translated[i].target))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      translated[i].replacement = requests[i].base.replacement;
+      translated[i].out_original = requests[i].base.out_original;
+      translated[i].require_current = requests[i].require_current != 0;
+      translated[i].expected_current = requests[i].expected_current;
+    }
+    auto result = hook_function_imports_ex(view(*image), translated, count, reports, &operation);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+  operation.error = Error::Sys(static_cast<ErrorCode>(error.code), error.sys_errno);
+  if (diagnostic) *diagnostic = converted(operation);
+  return error;
+}
+
+yukiplt_c_error yukiplt_c_image_containing(const void* address, yukiplt_c_image* output) noexcept {
+  return guarded([&] {
+    if (!output) return Error::Make(ErrorCode::kNullPointer);
+    auto found = find_image_containing(address);
+    if (!found) return found.error();
+    const auto& image = found.value().image;
+    *output = {image.load_bias, image.phdr_table, image.phdr_count, image.instance_token};
+    return Error::Ok();
   });
 }
 }  // extern C

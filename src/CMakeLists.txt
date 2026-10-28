@@ -5,10 +5,10 @@ set(YUKIPLT_SOURCES
     c_api.cpp
     elf.cpp
     imports.cpp
+    session.cpp
     memory.cpp
     registry.cpp
     rules.cpp
-    session.cpp
     yukiplt.cpp
 )
 

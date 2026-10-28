@@ -893,6 +893,7 @@ Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
                                      const FunctionImportSelector& selector) {
   if (Error e = validate_function_selector(selector)) return e;
   size_t selected = ~size_t{0};
+  bool ambiguous = false;
   for (size_t i = 0; i < scan.records.size(); ++i) {
     const FunctionReloc& record = scan.records[i];
     // Only records in the opted-in sources and types are candidates.
@@ -902,10 +903,11 @@ Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
     // A matched record that is not hookable fails the whole call: never skip it
     // and silently hook a different slot of the same name.
     if (!is_acceptable(record)) return Error::Make(ErrorCode::kUnsupportedRelocation);
-    if (selected != ~size_t{0}) return Error::Make(ErrorCode::kAmbiguousSymbol);
+    if (selected != ~size_t{0}) ambiguous = true;
     selected = i;
   }
   if (selected == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
+  if (ambiguous) return Error::Make(ErrorCode::kAmbiguousSymbol);
   return selected;
 }
 

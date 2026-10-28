@@ -116,7 +116,9 @@ enum {
 enum {
   YUKIPLT_C_FEATURE_FUNCTION_IMPORTS = 1,
   YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS = 2,
-  YUKIPLT_C_FEATURE_ERROR_NAMES = 3
+  YUKIPLT_C_FEATURE_ERROR_NAMES = 3,
+  YUKIPLT_C_FEATURE_EXPECTED_CURRENT = 4,
+  YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY = 5
 };
 
 enum {
@@ -246,6 +248,23 @@ yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image*, const yukiplt_c_
 yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image*, const yukiplt_c_function_request*,
                                          size_t count, yukiplt_c_handle* out_handle,
                                          yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
+
+typedef struct yukiplt_c_function_request_ex {
+  uint32_t struct_size;  // Must equal sizeof(this exact layout).
+  yukiplt_c_function_request base;
+  uint32_t require_current;  // 0 or 1 only.
+  uintptr_t expected_current;
+} yukiplt_c_function_request_ex;
+// Value equality is a precondition, not provider authentication. Checked after
+// complete VMA validation and before permissions/publication; CAS still applies.
+// diagnostic is optional and immediate, including clean precondition failure.
+// Output buffers must not alias requests or each other.
+yukiplt_c_error yukiplt_c_hook_functions_ex(
+    const yukiplt_c_image*, const yukiplt_c_function_request_ex*, size_t count,
+    yukiplt_c_handle* out_handle, yukiplt_c_slot_report* reports,
+    yukiplt_c_recovery_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+yukiplt_c_error yukiplt_c_image_containing(const void* address,
+                                           yukiplt_c_image* out_image) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

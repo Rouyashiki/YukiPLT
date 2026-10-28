@@ -317,6 +317,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     for (size_t i = 0; i < raised && pn < kMaxBatch; ++i) {
       pr[pn].page = res[i].page;
       pr[pn].original_prot = res[i].original_prot;
+      pr[pn].sys_errno = res[i].sys_errno;
       ++pn;
     }
   }
@@ -334,6 +335,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     reg.finish_restore(id, /*released=*/false, GroupState::kPrepared, recs, planned.size(), nullptr,
                        0);
     reg.mark_installed(id);
+    reg.record_diagnostic(id, {OperationStage::kComplete, Error::Ok()});
     claim.retained = true;
     return {Error::Ok(), detail_api::make(id)};
   }
@@ -343,7 +345,11 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   if (pn > 0 || r.rollback_failed) {
     reg.mark_indeterminate(id, recs, planned.size(), pr, pn);
     claim.retained = true;
-    return {Error::Make(ErrorCode::kIndeterminate), detail_api::make(id)};
+    const Error error = Error::Sys(ErrorCode::kIndeterminate,
+                                   r.restore_errno != 0 ? r.restore_errno : r.raise_errno);
+    reg.record_diagnostic(id, {pn != 0 ? OperationStage::kRestorePages : OperationStage::kRollback,
+                               error, r.raise_errno, r.restore_errno, r.rollback_failed});
+    return {error, detail_api::make(id)};
   }
 
   // Every raised page was restored and no rollback failed, so nothing is left
@@ -697,7 +703,8 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
       reg.begin_restore(id, image, recs, kMaxBatch, &slot_count, pages, kMaxBatch, &page_count);
   if (begin) {
     if (begin.code == ErrorCode::kImageInvalidated) {
-      reg.release(id);  // custom image forgotten: consume the handle
+      const Error released = reg.release(id);
+      if (released) return released;
       detail_api::set(handle, detail_api::invalid());
     }
     return begin;
@@ -715,6 +722,8 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   const size_t ps = detail::page_size();
   if (ps == 0) {
     reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
+    reg.record_diagnostic(id,
+                          {OperationStage::kPrepare, Error::Make(ErrorCode::kUnsupportedFormat)});
     return Error::Make(ErrorCode::kUnsupportedFormat);
   }
 
@@ -729,16 +738,23 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   try {
     prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
                        page_count > 0 ? extra_pages : nullptr, page_count);
-  } catch (...) {
+  } catch (const std::bad_alloc&) {
     // prepare has not changed any slot or page. Restore the exact prior state
     // before the public boundary translates the allocation exception.
     reg.finish_restore(id, false, previous_state, nullptr, 0, nullptr, 0);
+    reg.record_diagnostic(id, {OperationStage::kPrepare, Error::Make(ErrorCode::kOutOfMemory)});
+    throw;
+  } catch (...) {
+    reg.finish_restore(id, false, previous_state, nullptr, 0, nullptr, 0);
+    reg.record_diagnostic(id,
+                          {OperationStage::kPrepare, Error::Make(ErrorCode::kUnsupportedFormat)});
     throw;
   }
   if (prep) {
     // A failed/incomplete maps read does not prove unload. Preserve recovery
     // state; custom-image invalidation requires forget_image().
     reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
+    reg.record_diagnostic(id, {OperationStage::kPrepare, prep});
     return prep;
   }
 
@@ -770,16 +786,21 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   // restore raised protection, and retain conflicts with third-party protection.
   PageResidueRecord leftover[kMaxBatch];
   size_t leftover_count = 0;
+  int restore_errno = r.restore_errno;
   for (size_t i = 0; i < page_count; ++i) {
     detail::VmaInfo live{};
     if (!txn.page_vma(pages[i].page, live)) {
+      pages[i].sys_errno = 0;
       leftover[leftover_count++] = pages[i];
       continue;
     }
     const int live_prot = detail::prot_of(live);
     if (live_prot == pages[i].original_prot) continue;
-    if (live_prot != (pages[i].original_prot | detail::kProtWrite) ||
-        txn.protect_page(pages[i].page, pages[i].original_prot) != 0) {
+    const bool conflict = live_prot != (pages[i].original_prot | detail::kProtWrite);
+    const int error = conflict ? 0 : txn.protect_page(pages[i].page, pages[i].original_prot);
+    if (conflict || error != 0) {
+      pages[i].sys_errno = error;
+      if (restore_errno == 0) restore_errno = error;
       leftover[leftover_count++] = pages[i];
     }
   }
@@ -842,6 +863,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   for (size_t i = 0; i < raised && pn < kMaxBatch; ++i) {
     new_pages[pn].page = res[i].page;
     new_pages[pn].original_prot = res[i].original_prot;
+    new_pages[pn].sys_errno = res[i].sys_errno;
     ++pn;
   }
   for (size_t i = 0; i < leftover_count && pn < kMaxBatch; ++i) {
@@ -867,19 +889,29 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   // raise errno, since a stuck page is the more serious residual state.
   if (rollback_failed || !pages_clean) {
     reg.finish_restore(id, false, GroupState::kIndeterminate, recs, slot_count, new_pages, pn);
-    return Error::Make(ErrorCode::kIndeterminate);
+    const Error error =
+        Error::Sys(ErrorCode::kIndeterminate, restore_errno != 0 ? restore_errno : r.raise_errno);
+    reg.record_diagnostic(
+        id, {!pages_clean ? OperationStage::kRestorePages : OperationStage::kRollback, error,
+             r.raise_errno, restore_errno, rollback_failed});
+    return error;
   }
 
   if (r.raise_errno != 0) {
     // A page could not be raised, but every page we did raise was restored, so
     // nothing is left writable.  No slot was written; keep the handle to retry.
-    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, nullptr, 0);
+    reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, new_pages, 0);
+    reg.record_diagnostic(
+        id, {OperationStage::kRaise, Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
+             r.raise_errno});
     return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
   }
 
   // Slots left as a third party's value: keep ownership for a later retry.
   (void)any_foreign;
   reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, new_pages, pn);
+  reg.record_diagnostic(id,
+                        {OperationStage::kCommit, Error::Make(ErrorCode::kSlotModifiedExternally)});
   return Error::Make(ErrorCode::kSlotModifiedExternally);
 }
 
@@ -1127,6 +1159,20 @@ Error forget_image(const ImageView& custom_image) {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
     Registry::instance().forget_custom_image(identity_of(custom_image));
     return Error::Ok();
+  } catch (...) {
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  }
+}
+
+Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, ResidualPage* pages,
+                     size_t capacity) {
+  if (diagnostic == nullptr || (pages == nullptr && capacity != 0))
+    return Error::Make(ErrorCode::kNullPointer);
+  if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
+  try {
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return Registry::instance().recovery_snapshot(detail_api::id(handle), *diagnostic, pages,
+                                                  capacity);
   } catch (...) {
     return Error::Make(ErrorCode::kUnsupportedFormat);
   }

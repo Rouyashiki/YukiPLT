@@ -7,6 +7,7 @@
 
 #include "registry.hpp"
 #include "yukiplt.h"
+#include "yukiplt.hpp"
 
 namespace {
 using namespace yukiplt;
@@ -83,6 +84,34 @@ yukiplt_c_error guarded(Function function) noexcept {
 }  // namespace
 
 extern "C" {
+const char* yukiplt_c_error_name(uint32_t code) noexcept {
+  return error_name(static_cast<ErrorCode>(code));
+}
+yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle* handle,
+                                         yukiplt_c_recovery_diagnostic* diagnostic,
+                                         yukiplt_c_residual_page* pages, size_t capacity) noexcept {
+  return guarded([&] {
+    if (!handle || !diagnostic || (!pages && capacity != 0))
+      return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token == 0) return Error::Make(ErrorCode::kInvalidArgument);
+    BorrowedHandle borrowed(handle->token);
+    RecoveryDiagnostic value;
+    ResidualPage buffer[kLimit];
+    Error result = query_recovery(borrowed.value, &value, buffer, std::min(capacity, kLimit));
+    if (result) return result;
+    *diagnostic = {static_cast<uint32_t>(value.stage),
+                   converted(value.error),
+                   value.raise_errno,
+                   value.restore_errno,
+                   value.rollback_failed ? 1u : 0u,
+                   value.image_invalidated ? 1u : 0u,
+                   value.residual_page_count};
+    for (size_t i = 0; i < std::min({capacity, value.residual_page_count, kLimit}); ++i)
+      pages[i] = {buffer[i].address, buffer[i].original_protection, buffer[i].raised_protection,
+                  buffer[i].sys_errno};
+    return Error::Ok();
+  });
+}
 uint32_t yukiplt_c_abi_version(void) noexcept { return YUKIPLT_C_ABI_VERSION; }
 yukiplt_c_error yukiplt_c_image_from_soname(const char* name, yukiplt_c_image* out) noexcept {
   return guarded([&] {
@@ -173,7 +202,8 @@ yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
   });
 }
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
-  return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ? 1 : 0;
+  return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||
+         feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS;
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         const yukiplt_c_function_selector* target,

@@ -61,6 +61,7 @@ struct SlotRecord {
 struct PageResidueRecord {
   uintptr_t page = 0;
   int original_prot = 0;
+  int sys_errno = 0;
 };
 
 // Per-copy Registry; every operation requires op_mutex. Callers receive copies.
@@ -123,6 +124,9 @@ class Registry {
   bool owns_live_replacement(uint64_t id) const;
   uintptr_t first_slot_of(uint64_t id) const;
   size_t live_count() const;
+  void record_diagnostic(uint64_t id, const RecoveryDiagnostic& diagnostic) noexcept;
+  Error recovery_snapshot(uint64_t id, RecoveryDiagnostic& diagnostic, ResidualPage* pages,
+                          size_t capacity) const noexcept;
 
  private:
   template <typename T>
@@ -136,6 +140,7 @@ class Registry {
     ImageIdentity image;
     SmallVec<SlotRecord, 2> slots;
     SmallVec<PageResidueRecord, 2> residue;
+    RecoveryDiagnostic diagnostic;
   };
 
   static bool is_live(GroupState /*s*/) noexcept { return true; }  // all stored states are live

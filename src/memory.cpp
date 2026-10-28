@@ -494,6 +494,7 @@ void Txn::restore_pages(CommitResult& result) noexcept {
       p.raised = false;
     } else {
       p.restore_failed = true;
+      p.restore_errno = err;
       result.pages_restored = false;
       if (result.restore_errno == 0) result.restore_errno = err;
     }
@@ -603,6 +604,7 @@ size_t Txn::residue(PageResidue* out, size_t cap) const noexcept {
       out[n].page = p.base;
       out[n].original_prot = prot_of(p.vma);
       out[n].raised_prot = prot_of(p.vma) | kProtWrite;
+      out[n].sys_errno = p.restore_errno;
     }
     ++n;
   }

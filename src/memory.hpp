@@ -157,6 +157,7 @@ struct PageResidue {
   uintptr_t page = 0;
   int original_prot = kProtNone;  ///< Protection the live VMA reported.
   int raised_prot = kProtNone;    ///< Protection we set it to.
+  int sys_errno = 0;
 };
 
 /// Summary of a commit.  Per-slot detail is in the SlotOps.
@@ -234,6 +235,7 @@ class Txn {
     bool used = false;            ///< Touched by the current commit.
     bool raised = false;          ///< Currently raised by this transaction.
     bool restore_failed = false;  ///< A restore was attempted and failed.
+    int restore_errno = 0;
   };
 
   /// Index of the prepared page containing `addr`, or pages_.size() if none.

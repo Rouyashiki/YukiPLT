@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <algorithm>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -36,9 +37,17 @@ RuleSet::~RuleSet() {
 }
 
 RuleSet::Rule* RuleSet::find_rule(uint64_t id) noexcept {
-  for (auto& rule : rules_)
-    if (rule.id == id && !rule.removed) return &rule;
-  return nullptr;
+  Rule* rule = rule_by_id(id);
+  return rule && !rule->removed ? rule : nullptr;
+}
+const RuleSet::Rule* RuleSet::rule_by_id(uint64_t id) const noexcept {
+  const auto it =
+      std::lower_bound(rules_.begin(), rules_.end(), id,
+                       [](const Rule& rule, uint64_t wanted) { return rule.id < wanted; });
+  return it != rules_.end() && it->id == id ? &*it : nullptr;
+}
+RuleSet::Rule* RuleSet::rule_by_id(uint64_t id) noexcept {
+  return const_cast<Rule*>(static_cast<const RuleSet&>(*this).rule_by_id(id));
 }
 
 size_t RuleSet::BindingKeyHash::operator()(const BindingKey& k) const noexcept {
@@ -56,9 +65,25 @@ size_t RuleSet::find_binding(uint64_t rule_id, const ImageView& image) const noe
   return it == binding_index_.end() ? ~size_t{0} : it->second;
 }
 
+size_t RuleSet::retained_for(uint64_t rule_id, const ImageView* image,
+                             bool active_only) const noexcept {
+  size_t count = 0;
+  for (size_t i = 0; i < bindings_.size(); ++i) {
+    const auto& binding = bindings_[i];
+    if (!handles_[i].valid() || (rule_id != 0 && binding.rule_id != rule_id) ||
+        (image != nullptr && !same_image(binding.image, *image)))
+      continue;
+    const Rule* rule = active_only ? rule_by_id(binding.rule_id) : nullptr;
+    if (active_only && (!rule || rule->removed)) continue;
+    ++count;
+  }
+  return count;
+}
+
 Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
                                    const FunctionImportSelector& selector, void* replacement,
                                    void** out_originals, size_t capacity) {
+  if (next_rule_id_ == 0) return Error::Make(ErrorCode::kIntegerOverflow);
   if (replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
   if (selector.base.symbol == nullptr || *selector.base.symbol == '\0')
     return Error::Make(ErrorCode::kInvalidArgument);
@@ -119,7 +144,16 @@ RuleState install_state(const HookResult& result) noexcept {
 template <typename Vector>
 void reserve_for_one_more(Vector& v) {
   if (v.size() < v.capacity()) return;
-  v.reserve(v.empty() ? 8 : v.size() * 2);
+  if (v.size() == v.max_size()) throw std::length_error("RuleSet capacity");
+  v.reserve(v.empty() ? 8 : v.size() > v.max_size() / 2 ? v.max_size() : v.size() * 2);
+}
+
+void read_recovery(const HookHandle& handle, RecoveryDiagnostic& diagnostic) {
+  const Error error = query_recovery(handle, &diagnostic);
+  if (error) {
+    diagnostic = {};
+    diagnostic.error = error;
+  }
 }
 
 // Does one rule's image filter match this specific (image, path)?  Pure local
@@ -152,8 +186,15 @@ bool filter_matches(const ImageSelector& filter, const ImageView& image,
 // `expected_path` is the enumerated name a system image must still carry under
 // the linker lock (null: no path check).
 void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
-                                  const char* expected_path, RuleSummary& summary) {
+                                  const char* expected_path, RuleSummary& summary,
+                                  RuleOperationEvent* event) {
   const size_t existing = find_binding(rule.id, image);
+  if (event && existing != ~size_t{0}) {
+    event->binding_index = existing;
+    event->state = bindings_[existing].state;
+    event->error = bindings_[existing].error;
+    if (handles_[existing].valid()) read_recovery(handles_[existing], event->recovery);
+  }
   // A binding is retried in place only after a clean install failure (it holds
   // nothing and keeps its slot).  One that ended cleanly — released, or its
   // image invalidated — is applied again as a NEW binding with a fresh slot:
@@ -180,6 +221,18 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   // Prepare the binding and index before installation can publish ownership.
   // Superseded bindings remain history but leave the current index.
   RuleBinding pending;
+  auto record_prepare_failure = [&](Error error) {
+    ++summary.attempted;
+    ++summary.failed;
+    if (event) {
+      event->attempted = true;
+      event->stage = RuleOperationStage::kBindingPrepare;
+      event->error = error;
+      event->state = RuleState::kInstallFailed;
+      event->binding_index = ~size_t{0};
+      event->recovery = {};
+    }
+  };
   if (new_binding) {
     try {
       pending.rule_id = rule.id;
@@ -192,9 +245,11 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
       reserve_for_one_more(handles_);
       binding_index_[key_of(rule.id, image)] = bindings_.size();
     } catch (const std::bad_alloc&) {
-      ++summary.attempted;
-      ++summary.failed;
+      record_prepare_failure(Error::Make(ErrorCode::kOutOfMemory));
       return;  // Cannot track a new binding; do not install one.
+    } catch (const std::length_error&) {
+      record_prepare_failure(Error::Make(ErrorCode::kIntegerOverflow));
+      return;
     }
   }
 
@@ -225,6 +280,15 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   }
 
   const size_t idx = new_binding ? bindings_.size() - 1 : existing;
+  if (event) {
+    event->attempted = true;
+    event->stage = capacity_refused ? RuleOperationStage::kCapacity : RuleOperationStage::kInstall;
+    event->error = result.error;
+    event->state = bindings_[idx].state;
+    event->binding_index = idx;
+    event->recovery = {};
+    if (handles_[idx].valid()) read_recovery(handles_[idx], event->recovery);
+  }
   if (result.ok())
     ++summary.succeeded;
   else
@@ -252,6 +316,7 @@ RuleSummary RuleSet::refresh() {
     for (const auto& named : images.value())
       apply_rule_to_image(rule, named.image, named.path.c_str(), named.path.c_str(), summary);
   }
+  summary.retained = retained_for(0, nullptr, true);
   return summary;
 }
 
@@ -291,6 +356,7 @@ RuleSummary RuleSet::release_image(const ImageView& image) {
     if (!same_image(bindings_[n].image, image)) continue;
     undo_binding(bindings_[n], handles_[n], summary);
   }
+  summary.retained = retained_for(0, &image);
   return summary;
 }
 
@@ -309,10 +375,15 @@ RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
     if (!filter_matches(rule.filter, image, path)) continue;
     apply_rule_to_image(rule, image, path, nullptr, summary);
   }
+  summary.retained = 0;
+  for (const auto& rule : rules_)
+    if (!rule.removed && filter_matches(rule.filter, image, path))
+      summary.retained += retained_for(rule.id, &image);
   return summary;
 }
 
 RuleSummary RuleSet::notify_unloading(const ImageView& image) {
+  if (image.instance_token == 0) return {1, 0, 1, 0};
   // Undo exactly this instance's bindings; identical to release_image(), named
   // for the loader lifecycle pairing with notify_loaded().
   return release_image(image);
@@ -323,6 +394,7 @@ RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
   Rule* rule = find_rule(rule_id);
   if (rule == nullptr) {
     summary.failed = 1;  // unknown or already-removed rule
+    summary.retained = rule_id == 0 ? 0 : retained_for(rule_id);
     return summary;
   }
   for (size_t n = bindings_.size(); n-- > 0;) {
@@ -332,12 +404,14 @@ RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
   // Stop participating in future refreshes regardless; a retained failed handle
   // is still reachable through bindings()/unhook() for a retry.
   rule->removed = true;
+  summary.retained = retained_for(rule_id);
   return summary;
 }
 
 RuleSummary RuleSet::unhook() {
   RuleSummary summary;
   for (size_t n = bindings_.size(); n-- > 0;) undo_binding(bindings_[n], handles_[n], summary);
+  summary.retained = retained_for();
   return summary;
 }
 
@@ -356,6 +430,209 @@ RuleSummary RuleSet::abandon() {
       if (handles_[n].valid()) ++summary.retained;
     }
   }
+  summary.retained = retained_for();
+  return summary;
+}
+
+RuleSetStatistics RuleSet::statistics() const noexcept {
+  RuleSetStatistics result{rules_.size(), 0, bindings_.size(), retained_for()};
+  for (const auto& rule : rules_)
+    if (!rule.removed) ++result.active_rules;
+  return result;
+}
+
+Result<RuleStatistics> RuleSet::statistics(uint64_t rule_id) const noexcept {
+  const Rule* found = rule_by_id(rule_id);
+  if (!found) return Error::Make(ErrorCode::kInvalidArgument);
+  const Rule& rule = *found;
+  RuleStatistics result{rule_id,
+                        rule.removed,
+                        rule.capacity != 0,
+                        rule.capacity,
+                        rule.next_slot,
+                        rule.capacity - rule.next_slot,
+                        0,
+                        retained_for(rule_id)};
+  for (const auto& binding : bindings_)
+    if (binding.rule_id == rule_id) ++result.bindings;
+  return result;
+}
+
+namespace {
+void reset_report(RuleOperationReport& report) noexcept {
+  report.preparation_error = Error::Ok();
+  report.events.clear();
+}
+RuleSummary report_failure(RuleOperationReport& report, Error error, size_t retained) noexcept {
+  report.events.clear();
+  report.preparation_error = error;
+  return {0, 0, 1, retained};
+}
+}  // namespace
+
+RuleSummary RuleSet::refresh(RuleOperationReport& report) {
+  reset_report(report);
+  try {
+    // Finish enumeration and all diagnostic string allocation before the first
+    // installation. An enumeration error belongs to its rule, not to an unload.
+    const auto enumerate = detail::active_image_enumerator();
+    for (auto& rule : rules_) {
+      if (rule.removed) continue;
+      rebind_selector(rule);
+      auto images = enumerate(rule.filter);
+      if (!images) {
+        RuleOperationEvent event;
+        event.rule_id = rule.id;
+        event.stage = RuleOperationStage::kEnumerate;
+        event.error = images.error();
+        report.events.push_back(std::move(event));
+      } else {
+        for (auto& named : images.value()) {
+          RuleOperationEvent event;
+          event.rule_id = rule.id;
+          event.image = named.image;
+          event.path = std::move(named.path);
+          event.stage = RuleOperationStage::kInstall;
+          report.events.push_back(std::move(event));
+        }
+      }
+    }
+  } catch (const std::bad_alloc&) {
+    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory),
+                          retained_for(0, nullptr, true));
+  } catch (const std::length_error&) {
+    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow),
+                          retained_for(0, nullptr, true));
+  }
+  RuleSummary summary;
+  for (auto& event : report.events) {
+    if (event.stage == RuleOperationStage::kEnumerate) {
+      if (event.error.code != ErrorCode::kImageNotFound) ++summary.failed;
+      continue;
+    }
+    Rule& rule = *rule_by_id(event.rule_id);
+    apply_rule_to_image(rule, event.image, event.path.c_str(), event.path.c_str(), summary, &event);
+  }
+  summary.retained = retained_for(0, nullptr, true);
+  return summary;
+}
+
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
+                                   RuleOperationReport& report) {
+  reset_report(report);
+  if (image.instance_token == 0)
+    return report_failure(report, Error::Make(ErrorCode::kInvalidArgument), 0);
+  try {
+    for (auto& rule : rules_) {
+      if (rule.removed) continue;
+      rebind_selector(rule);
+      if (!filter_matches(rule.filter, image, path)) continue;
+      RuleOperationEvent event;
+      event.rule_id = rule.id;
+      event.image = image;
+      if (path) event.path = path;
+      event.stage = RuleOperationStage::kInstall;
+      report.events.push_back(std::move(event));
+    }
+  } catch (const std::bad_alloc&) {
+    size_t retained = 0;
+    for (const auto& rule : rules_)
+      if (!rule.removed && filter_matches(rule.filter, image, path))
+        retained += retained_for(rule.id, &image);
+    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory), retained);
+  } catch (const std::length_error&) {
+    size_t retained = 0;
+    for (const auto& rule : rules_)
+      if (!rule.removed && filter_matches(rule.filter, image, path))
+        retained += retained_for(rule.id, &image);
+    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow), retained);
+  }
+  RuleSummary summary;
+  for (auto& event : report.events)
+    apply_rule_to_image(*rule_by_id(event.rule_id), image, event.path.c_str(), nullptr, summary,
+                        &event);
+  summary.retained = 0;
+  for (const auto& event : report.events) summary.retained += retained_for(event.rule_id, &image);
+  return summary;
+}
+
+Error RuleSet::prepare_undo_report(RuleOperationReport& report, uint64_t rule_id,
+                                   const ImageView* image, RuleOperationStage stage) const {
+  reset_report(report);
+  try {
+    for (size_t n = bindings_.size(); n-- > 0;) {
+      const auto& binding = bindings_[n];
+      if (!handles_[n].valid() || (rule_id != 0 && binding.rule_id != rule_id) ||
+          (image && !same_image(*image, binding.image)))
+        continue;
+      RuleOperationEvent event;
+      event.rule_id = binding.rule_id;
+      event.image = binding.image;
+      event.path = binding.path;
+      event.stage = stage;
+      event.binding_index = n;
+      event.attempted = true;
+      report.events.push_back(std::move(event));
+    }
+    return Error::Ok();
+  } catch (const std::bad_alloc&) {
+    report.preparation_error = Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    report.preparation_error = Error::Make(ErrorCode::kIntegerOverflow);
+  }
+  report.events.clear();
+  return report.preparation_error;
+}
+
+void RuleSet::finish_undo_report(RuleOperationReport& report) const {
+  for (auto& event : report.events) {
+    const auto& binding = bindings_[event.binding_index];
+    event.state = binding.state;
+    event.error = binding.error;
+    event.recovery = {};
+    event.recovery.error = binding.error;
+    event.recovery.stage =
+        binding.error.ok() ? OperationStage::kComplete : OperationStage::kPrepare;
+    event.recovery.image_invalidated = binding.state == RuleState::kInvalidated;
+    if (handles_[event.binding_index].valid())
+      read_recovery(handles_[event.binding_index], event.recovery);
+  }
+}
+
+RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report) {
+  if (Error e = prepare_undo_report(report, 0, &image, RuleOperationStage::kRestore))
+    return {0, 0, 1, retained_for(0, &image)};
+  auto summary = release_image(image);
+  finish_undo_report(report);
+  return summary;
+}
+RuleSummary RuleSet::notify_unloading(const ImageView& image, RuleOperationReport& report) {
+  if (image.instance_token == 0)
+    return report_failure(report, Error::Make(ErrorCode::kInvalidArgument), 0);
+  return release_image(image, report);
+}
+RuleSummary RuleSet::remove_rule(uint64_t rule_id, RuleOperationReport& report) {
+  if (find_rule(rule_id) == nullptr)
+    return report_failure(report, Error::Make(ErrorCode::kInvalidArgument),
+                          rule_id == 0 ? 0 : retained_for(rule_id));
+  if (Error e = prepare_undo_report(report, rule_id, nullptr, RuleOperationStage::kRestore))
+    return {0, 0, 1, retained_for(rule_id)};
+  auto summary = remove_rule(rule_id);
+  finish_undo_report(report);
+  return summary;
+}
+RuleSummary RuleSet::unhook(RuleOperationReport& report) {
+  if (Error e = prepare_undo_report(report, 0, nullptr, RuleOperationStage::kRestore))
+    return {0, 0, 1, retained_for()};
+  auto summary = unhook();
+  finish_undo_report(report);
+  return summary;
+}
+RuleSummary RuleSet::abandon(RuleOperationReport& report) {
+  if (Error e = prepare_undo_report(report, 0, nullptr, RuleOperationStage::kAbandon))
+    return {0, 0, 1, retained_for()};
+  auto summary = abandon();
+  finish_undo_report(report);
   return summary;
 }
 

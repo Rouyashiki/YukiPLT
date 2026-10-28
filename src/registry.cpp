@@ -4,6 +4,7 @@
 #include "registry.hpp"
 
 #include "common.hpp"
+#include "memory.hpp"
 
 namespace yukiplt::detail {
 
@@ -145,6 +146,7 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
   r.residue.clear();
   for (size_t i = 0; i < count; ++i) r.slots.push_back(slots[i]);
   r.image = image;
+  r.diagnostic = {};
   r.state = GroupState::kPrepared;
   r.in_use = true;
   free_list_.pop_back();
@@ -174,7 +176,7 @@ void Registry::mark_indeterminate(uint64_t id, const SlotRecord* slots, size_t c
   for (size_t i = 0; i < page_count; ++i) r->residue.push_back(pages[i]);
 }
 
-void Registry::drop(uint64_t id) { release(id); }
+void Registry::drop(uint64_t id) { (void)release(id); }
 
 Error Registry::begin_restore(uint64_t id, ImageIdentity& image, SlotRecord* slots, size_t slot_cap,
                               size_t* slot_count, PageResidueRecord* pages, size_t page_cap,
@@ -243,6 +245,25 @@ Error Registry::snapshot(uint64_t id, ImageIdentity& image, SlotRecord* slots, s
   size_t n = r->slots.size() < cap ? r->slots.size() : cap;
   for (size_t i = 0; i < n; ++i) slots[i] = r->slots[i];
   if (count != nullptr) *count = r->slots.size();
+  return Error::Ok();
+}
+
+void Registry::record_diagnostic(uint64_t id, const RecoveryDiagnostic& diagnostic) noexcept {
+  if (Record* r = resolve(id)) r->diagnostic = diagnostic;
+}
+
+Error Registry::recovery_snapshot(uint64_t id, RecoveryDiagnostic& diagnostic, ResidualPage* pages,
+                                  size_t capacity) const noexcept {
+  const Record* r = resolve(id);
+  if (r == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
+  diagnostic = r->diagnostic;
+  diagnostic.image_invalidated = r->image.invalidated;
+  diagnostic.residual_page_count = r->residue.size();
+  for (size_t i = 0; i < capacity && i < r->residue.size(); ++i) {
+    const auto& p = r->residue[i];
+    pages[i] = {p.page, static_cast<uint32_t>(p.original_prot),
+                static_cast<uint32_t>(p.original_prot | kProtWrite), p.sys_errno};
+  }
   return Error::Ok();
 }
 

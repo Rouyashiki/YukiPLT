@@ -258,10 +258,12 @@ enum class ErrorCode : uint32_t {
 };
 
 /// Describes an error with a code and optional system errno.
-struct Error {
+struct [[nodiscard]] Error {
   ErrorCode code = ErrorCode::kSuccess;
 
-  /// System errno, meaningful only for kPermissionDenied and kVmaUnavailable.
+  /// System errno for permission/maps failures, including kIndeterminate:
+  /// first restoration errno takes precedence over a page-raise errno.
+  /// Zero when no system-call error occurred (e.g. CAS/protection conflict).
   int sys_errno = 0;
 
   /// Returns true when no error.
@@ -275,6 +277,59 @@ struct Error {
   static Error Sys(ErrorCode c, int e) noexcept { return {c, e}; }
 };
 
+/// Stable, allocation-free name; unknown values return "Unknown".
+[[nodiscard]] inline const char* error_name(ErrorCode code) noexcept {
+  switch (code) {
+    case ErrorCode::kSuccess:
+      return "Success";
+    case ErrorCode::kInvalidArgument:
+      return "InvalidArgument";
+    case ErrorCode::kNullPointer:
+      return "NullPointer";
+    case ErrorCode::kInvalidImage:
+      return "InvalidImage";
+    case ErrorCode::kCorruptedElf:
+      return "CorruptedElf";
+    case ErrorCode::kUnsupportedFormat:
+      return "UnsupportedFormat";
+    case ErrorCode::kUnsupportedRelocation:
+      return "UnsupportedRelocation";
+    case ErrorCode::kSymbolNotFound:
+      return "SymbolNotFound";
+    case ErrorCode::kNoHashTable:
+      return "NoHashTable";
+    case ErrorCode::kAmbiguousSymbol:
+      return "AmbiguousSymbol";
+    case ErrorCode::kSlotOwnershipConflict:
+      return "SlotOwnershipConflict";
+    case ErrorCode::kAlreadyHooked:
+      return "AlreadyHooked";
+    case ErrorCode::kNotInstalled:
+      return "NotInstalled";
+    case ErrorCode::kSlotModifiedExternally:
+      return "SlotModifiedExternally";
+    case ErrorCode::kIndeterminate:
+      return "Indeterminate";
+    case ErrorCode::kPermissionDenied:
+      return "PermissionDenied";
+    case ErrorCode::kImageInvalidated:
+      return "ImageInvalidated";
+    case ErrorCode::kOutOfMemory:
+      return "OutOfMemory";
+    case ErrorCode::kIntegerOverflow:
+      return "IntegerOverflow";
+    case ErrorCode::kOutOfBounds:
+      return "OutOfBounds";
+    case ErrorCode::kImageNotFound:
+      return "ImageNotFound";
+    case ErrorCode::kAmbiguousImage:
+      return "AmbiguousImage";
+    case ErrorCode::kVmaUnavailable:
+      return "VmaUnavailable";
+  }
+  return "Unknown";
+}
+
 }  // namespace yukiplt
 
 /// \brief Minimal Expected<T, E> for error propagation (C++17).
@@ -285,8 +340,10 @@ namespace yukiplt::detail {
 ///
 /// For the special case Expected<void, E>, only the error branch stores data.
 template <typename T, typename E>
-class Expected {
+class [[nodiscard]] Expected {
   static_assert(!std::is_same_v<T, E>, "T and E must be different types");
+  static_assert(std::is_nothrow_move_constructible_v<T> && std::is_nothrow_move_constructible_v<E>,
+                "Expected requires non-throwing move construction");
 
  public:
   Expected(const T& val) : has_value_(true) {  // NOLINT: implicit
@@ -371,7 +428,14 @@ class Expected {
   template <typename F>
   auto map(F&& f) const& -> Expected<decltype(f(std::declval<const T&>())), E> {
     using U = decltype(f(std::declval<const T&>()));
-    if (has_value_) return Expected<U, E>(f(storage_.value));
+    if (has_value_) {
+      if constexpr (std::is_void_v<U>) {
+        f(storage_.value);
+        return Expected<void, E>();
+      } else {
+        return Expected<U, E>(f(storage_.value));
+      }
+    }
     return Expected<U, E>(storage_.error);
   }
 
@@ -402,7 +466,10 @@ class Expected {
 
 /// Specialization for Expected<void, E>.
 template <typename E>
-class Expected<void, E> {
+class [[nodiscard]] Expected<void, E> {
+  static_assert(std::is_nothrow_move_constructible_v<E>,
+                "Expected requires non-throwing move construction");
+
  public:
   Expected() : has_value_(true) {}                                  // NOLINT
   Expected(const E& err) : has_value_(false), error_(err) {}        // NOLINT: implicit
@@ -444,7 +511,8 @@ class Expected<void, E> {
 ///         // unhook()/abandon().
 ///     }
 ///     // Later:
-///     yukiplt::unhook(r.handle);
+///     const auto undo = yukiplt::unhook(r.handle);
+///     if (!undo.ok()) { /* retain r.handle and retry before releasing context */ }
 ///
 /// ## Semantics
 ///
@@ -683,7 +751,7 @@ class HookHandle {
 /// kIndeterminate — where the hook is NOT fully active but the handle must be
 /// kept so the caller can recover (unhook) or relinquish (abandon) the
 /// partially-applied state.  On every other error the handle is invalid.
-struct HookResult {
+struct [[nodiscard]] HookResult {
   Error error;
   HookHandle handle;
 
@@ -830,6 +898,45 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
 // System images are rejected. Call before unmapping the custom instance.
 Error forget_image(const ImageView& custom_image);
 
+class HookHandle;
+
+enum class OperationStage : uint32_t {
+  kNone = 0,
+  kPrepare = 1,
+  kExpectedCurrent = 2,
+  kRaise = 3,
+  kCommit = 4,
+  kRollback = 5,
+  kRestorePages = 6,
+  kComplete = 7,
+};
+
+/// Recorded recovery state, not a live inspection of memory or permissions.
+struct RecoveryDiagnostic {
+  OperationStage stage = OperationStage::kNone;
+  Error error;
+  int raise_errno = 0;
+  int restore_errno = 0;
+  bool rollback_failed = false;
+  bool image_invalidated = false;
+  size_t residual_page_count = 0;
+};
+
+struct ResidualPage {
+  uintptr_t address = 0;
+  uint32_t original_protection = 0;  ///< Linux PROT_* bits, as last recorded.
+  uint32_t raised_protection = 0;
+  int sys_errno = 0;  ///< Last failed restoration; 0 may mean a protection conflict.
+};
+
+/// Copies the last operation and residual pages under the Registry lock only.
+/// Never reads an image, GOT or maps. diagnostic is required; pages may be null
+/// for count-only (capacity must then be zero). At most capacity pages are
+/// copied; diagnostic.residual_page_count always gives the total. Outputs are
+/// unchanged on failure. A consumed handle has no queryable history.
+[[nodiscard]] Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic,
+                                   ResidualPage* pages = nullptr, size_t capacity = 0);
+
 enum class ImageMatch : uint8_t { kMainExecutable, kExactPath, kBasename, kLoadBias };
 struct ImageSelector {
   ImageMatch match = ImageMatch::kMainExecutable;
@@ -905,7 +1012,7 @@ struct SessionImageResult {
   Error install_error;
   Error restore_error;
 };
-struct SessionSummary {
+struct [[nodiscard]] SessionSummary {
   size_t attempted = 0;
   size_t succeeded = 0;
   size_t failed = 0;
@@ -980,12 +1087,56 @@ struct RuleBinding {
 };
 
 /// Summary of a RuleSet operation, same shape as SessionSummary.
-struct RuleSummary {
+struct [[nodiscard]] RuleSummary {
   size_t attempted = 0;
   size_t succeeded = 0;
   size_t failed = 0;
-  size_t retained = 0;  ///< Bindings still holding ownership/recovery handles.
+  size_t retained = 0;  ///< Live handles among this operation's targets, including skipped ones.
   [[nodiscard]] bool ok() const noexcept { return failed == 0; }
+};
+
+enum class RuleOperationStage : uint32_t {
+  kValidate,
+  kEnumerate,
+  kBindingPrepare,
+  kCapacity,
+  kInstall,
+  kRestore,
+  kAbandon
+};
+struct RuleOperationEvent {
+  uint64_t rule_id = 0;
+  ImageView image{};
+  std::string path;
+  RuleOperationStage stage = RuleOperationStage::kValidate;
+  Error error;
+  bool attempted = false;
+  RuleState state = RuleState::kPending;
+  size_t binding_index = ~size_t{0};
+  RecoveryDiagnostic recovery;
+};
+/// Caller-owned results. Preparation errors precede every side effect; events
+/// own their text and are not references into the RuleSet. An ImageView remains
+/// an identity, not a lifetime guarantee. kImageNotFound enumeration is normal.
+struct RuleOperationReport {
+  Error preparation_error;
+  std::vector<RuleOperationEvent> events;
+};
+struct RuleStatistics {
+  uint64_t rule_id = 0;
+  bool removed = false;
+  bool original_storage_enabled = false;
+  size_t original_capacity = 0;
+  size_t original_used = 0;
+  size_t original_remaining = 0;
+  size_t bindings = 0;
+  size_t active_handles = 0;
+};
+struct RuleSetStatistics {
+  size_t registered_rules = 0;
+  size_t active_rules = 0;
+  size_t bindings = 0;
+  size_t active_handles = 0;
 };
 
 /// Move-only, like HookSession.  Destruction/move-overwrite does NOT unhook;
@@ -1050,6 +1201,18 @@ class RuleSet {
   /// are never re-applied by refresh()/notify_loaded().
   RuleSummary abandon();
 
+  /// Detailed overloads reserve all report storage before any hook/unhook.
+  /// A preparation failure returns failed=1, attempted=0 and preserves hooks.
+  RuleSummary refresh(RuleOperationReport& report);
+  RuleSummary notify_loaded(const ImageView& image, const char* path, RuleOperationReport& report);
+  RuleSummary notify_unloading(const ImageView& image, RuleOperationReport& report);
+  RuleSummary release_image(const ImageView& image, RuleOperationReport& report);
+  RuleSummary remove_rule(uint64_t rule_id, RuleOperationReport& report);
+  RuleSummary unhook(RuleOperationReport& report);
+  RuleSummary abandon(RuleOperationReport& report);
+  [[nodiscard]] RuleSetStatistics statistics() const noexcept;
+  [[nodiscard]] Result<RuleStatistics> statistics(uint64_t rule_id) const noexcept;
+
   /// Per-(rule, image instance) results.  Valid until the next mutation.
   [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
 
@@ -1069,11 +1232,19 @@ class RuleSet {
 
   // Internal helpers (rules.cpp).
   Rule* find_rule(uint64_t id) noexcept;
+  Rule* rule_by_id(uint64_t id) noexcept;
+  const Rule* rule_by_id(uint64_t id) const noexcept;
   size_t find_binding(uint64_t rule_id, const ImageView& image) const noexcept;
   static void rebind_selector(Rule& rule) noexcept;
+  size_t retained_for(uint64_t rule_id = 0, const ImageView* image = nullptr,
+                      bool active_only = false) const noexcept;
   // Apply one rule to one already-matched image instance, updating bindings.
   void apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
-                           const char* expected_path, RuleSummary& summary);
+                           const char* expected_path, RuleSummary& summary,
+                           RuleOperationEvent* event = nullptr);
+  Error prepare_undo_report(RuleOperationReport& report, uint64_t rule_id, const ImageView* image,
+                            RuleOperationStage stage) const;
+  void finish_undo_report(RuleOperationReport& report) const;
 
   std::vector<Rule> rules_;
   std::vector<RuleBinding> bindings_;
@@ -1102,6 +1273,32 @@ class RuleSet {
   uint64_t next_rule_id_ = 1;
 };
 
+/// Stable original-address storage. Keep it and all replacement code/context
+/// alive until recovery AND caller-established quiescence. No implicit unhook,
+/// reset or reuse. The declared Fn does not prove the ELF target's actual ABI.
+template <typename Fn>
+class OriginalSlot {
+  static_assert(std::is_pointer_v<Fn> && std::is_function_v<std::remove_pointer_t<Fn>>,
+                "OriginalSlot requires a function pointer type");
+
+ public:
+  OriginalSlot() = default;
+  OriginalSlot(const OriginalSlot&) = delete;
+  OriginalSlot& operator=(const OriginalSlot&) = delete;
+  OriginalSlot(OriginalSlot&&) = delete;
+  OriginalSlot& operator=(OriginalSlot&&) = delete;
+  [[nodiscard]] Fn load() const noexcept {
+    return reinterpret_cast<Fn>(__atomic_load_n(&value_, __ATOMIC_ACQUIRE));
+  }
+  [[nodiscard]] void** output_address() noexcept { return &value_; }
+  [[nodiscard]] FunctionHookRequest request(const FunctionImportSelector& selector,
+                                            Fn replacement) noexcept {
+    return {selector, reinterpret_cast<void*>(replacement), &value_};
+  }
+
+ private:
+  alignas(void*) void* value_ = nullptr;
+};
 }  // namespace yukiplt
 
 #endif  // YUKIPLT_HPP_

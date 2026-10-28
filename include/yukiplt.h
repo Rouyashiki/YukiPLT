@@ -55,6 +55,7 @@ enum {
 
 typedef struct yukiplt_c_error {
   uint32_t code;
+  // INDETERMINATE may carry the first restore errno, otherwise the raise errno.
   int32_t sys_errno;
 } yukiplt_c_error;
 // 0 is invalid. A live token has one owner. Do not copy it into another owner,
@@ -112,7 +113,41 @@ enum {
   YUKIPLT_C_RELOC_SOURCE_RELA = 1,
   YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA = 2
 };
-enum { YUKIPLT_C_FEATURE_FUNCTION_IMPORTS = 1 };
+enum { YUKIPLT_C_FEATURE_FUNCTION_IMPORTS = 1, YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS = 2 };
+
+enum {
+  YUKIPLT_C_STAGE_NONE = 0,
+  YUKIPLT_C_STAGE_PREPARE = 1,
+  YUKIPLT_C_STAGE_EXPECTED_CURRENT = 2,
+  YUKIPLT_C_STAGE_RAISE = 3,
+  YUKIPLT_C_STAGE_COMMIT = 4,
+  YUKIPLT_C_STAGE_ROLLBACK = 5,
+  YUKIPLT_C_STAGE_RESTORE_PAGES = 6,
+  YUKIPLT_C_STAGE_COMPLETE = 7
+};
+typedef struct yukiplt_c_recovery_diagnostic {
+  uint32_t stage;
+  yukiplt_c_error error;
+  int32_t raise_errno;
+  int32_t restore_errno;
+  uint32_t rollback_failed;
+  uint32_t image_invalidated;
+  size_t residual_page_count;
+} yukiplt_c_recovery_diagnostic;
+typedef struct yukiplt_c_residual_page {
+  uintptr_t address;
+  uint32_t original_protection;
+  uint32_t raised_protection;
+  int32_t sys_errno;
+} yukiplt_c_residual_page;
+
+// Registry-only recorded state, not current permissions. diagnostic is required;
+// pages may be NULL with zero capacity for count-only. Copies at most capacity
+// pages, and reports the full count. Outputs remain unchanged on error.
+yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle*,
+                                         yukiplt_c_recovery_diagnostic* diagnostic,
+                                         yukiplt_c_residual_page* pages,
+                                         size_t capacity) YUKIPLT_C_NOEXCEPT;
 
 // struct_size must be set to sizeof(yukiplt_c_function_selector) (use the macro);
 // a mismatch is rejected with INVALID_ARGUMENT.  It is a layout check, not an
@@ -142,6 +177,8 @@ typedef struct yukiplt_c_function_request {
 // exceptions cross this boundary. Error values match the C++ core. No operation
 // silently succeeds after partial commit: INDETERMINATE retains a valid token.
 uint32_t yukiplt_c_abi_version(void) YUKIPLT_C_NOEXCEPT;
+// Stable literal; never allocates. Unknown numeric values return "Unknown".
+const char* yukiplt_c_error_name(uint32_t code) YUKIPLT_C_NOEXCEPT;
 yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
                                             yukiplt_c_image* out) YUKIPLT_C_NOEXCEPT;
 

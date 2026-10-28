@@ -68,15 +68,15 @@ struct LayoutBuilder {
 // ElfBuilder::BuiltImage
 
 uintptr_t ElfBuilder::BuiltImage::got_slot_addr(size_t i) const {
-  return reinterpret_cast<uintptr_t>(buffer.data() + got_offset + i * 8);
+  return reinterpret_cast<uintptr_t>(buffer.data() + got_offset + i * kNativeSlotSize);
 }
 
 uintptr_t ElfBuilder::BuiltImage::rela_slot_addr(size_t i) const {
-  return reinterpret_cast<uintptr_t>(buffer.data() + rela_got_offset + i * 8);
+  return reinterpret_cast<uintptr_t>(buffer.data() + rela_got_offset + i * kNativeSlotSize);
 }
 
 uintptr_t ElfBuilder::BuiltImage::android_slot_addr(size_t i) const {
-  return reinterpret_cast<uintptr_t>(buffer.data() + android_got_offset + i * 8);
+  return reinterpret_cast<uintptr_t>(buffer.data() + android_got_offset + i * kNativeSlotSize);
 }
 // ElfBuilder::build
 
@@ -90,7 +90,23 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   num_phdrs += 1;                  // PT_DYNAMIC
   if (use_relro_) num_phdrs += 1;  // PT_GNU_RELRO
   // 2. Program headers (at the start of the buffer).
-  size_t phdr_offset = lb.alloc(num_phdrs * sizeof(Elf64_Phdr), 8);
+  if (emit_header_) lb.alloc(sizeof(NativeElfEhdr), alignof(NativeElfEhdr));
+  size_t phdr_offset = lb.alloc(num_phdrs * sizeof(yukiplt::NativeElfPhdr), alignof(NativeElfPhdr));
+  if (emit_header_) {
+    NativeElfEhdr header{};
+    std::memcpy(header.e_ident, "\177ELF", 4);
+    header.e_ident[EI_CLASS] = YUKIPLT_ELF_CLASS;
+    header.e_ident[EI_DATA] = ELFDATA2LSB;
+    header.e_ident[EI_VERSION] = EV_CURRENT;
+    header.e_machine = kNativeMachine;
+    header.e_type = ET_DYN;
+    header.e_version = EV_CURRENT;
+    header.e_ehsize = sizeof(header);
+    header.e_phentsize = sizeof(NativeElfPhdr);
+    header.e_phoff = phdr_offset;
+    header.e_phnum = static_cast<NativeElfHalf>(num_phdrs);
+    lb.write_at(0, header);
+  }
   // 3. String table (\0 + symbol names).
   size_t strtab_offset = lb.align(1);
 
@@ -114,11 +130,11 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   // 4. Symbol table (index 0 = STN_UNDEF, then up to max_sym_index).
   size_t symtab_offset = lb.align(8);
   size_t sym_count = max_sym_index + 1;
-  lb.alloc(sym_count * sizeof(Elf64_Sym), 8);
+  lb.alloc(sym_count * sizeof(yukiplt::NativeElfSym), 8);
 
   // Fill in symbols.
   for (size_t i = 0; i < sym_count; ++i) {
-    Elf64_Sym sym{};
+    yukiplt::NativeElfSym sym{};
     sym.st_name = name_offsets[i];
     auto info_it = symbol_info_.find(static_cast<uint32_t>(i));
     sym.st_info =
@@ -128,7 +144,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     sym.st_shndx = undefined ? SHN_UNDEF : 1;
     sym.st_value = 0;
     sym.st_size = 0;
-    lb.write_at(symtab_offset + i * sizeof(Elf64_Sym), sym);
+    lb.write_at(symtab_offset + i * sizeof(yukiplt::NativeElfSym), sym);
   }
   // 5. GNU Hash table (optional).
   size_t gnu_hash_offset = 0;
@@ -156,7 +172,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
 
     // Bloom filter (one 64-bit word, set all bits for simplicity —
     // this makes every symbol pass the bloom check).
-    size_t bloom_offset = lb.append<uint64_t>(~uint64_t(0), 8);
+    size_t bloom_offset = lb.append<NativeElfAddr>(~NativeElfAddr(0), alignof(NativeElfAddr));
     (void)bloom_offset;
 
     // Buckets: for each hashed symbol, bucket[hash % nbuckets] = sym_index.
@@ -243,7 +259,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     // GOT slots: 8 bytes each, aligned to 8.  Aliased records reuse an
     // existing slot, so only owned records get their own slot.
     got_offset = lb.align(8);
-    lb.alloc(owned_slots * 8, 8);
+    lb.alloc(owned_slots * kNativeSlotSize, kNativeSlotSize);
 
     // JMPREL table.
     jmprel_offset = lb.align(8);
@@ -251,37 +267,37 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     size_t slot_idx = 0;
 
     for (const auto& js : jmpslots_) {
-      Elf64_Rela rela{};
+      yukiplt::NativeElfRelocation rela{};
       // r_offset is the vaddr of the GOT slot.
       // Since p_vaddr = 0 and load_bias = buffer base,
       // we use the offset within the buffer.
-      rela.r_offset = got_offset + slot_idx * 8;
-      rela.r_info = ELF64_R_INFO(js.sym_index, R_AARCH64_JUMP_SLOT);
-      rela.r_addend = js.addend;
+      rela.r_offset = got_offset + slot_idx * kNativeSlotSize;
+      rela.r_info = yukiplt::native_reloc_info(js.sym_index, YUKIPLT_RELOC_JUMP_SLOT);
+      set_test_addend(rela, js.addend);
       lb.append(rela, 8);
       ++slot_idx;
     }
 
     for (const auto& cr : custom_relas_) {
-      Elf64_Rela rela{};
-      rela.r_offset = got_offset + slot_idx * 8;
-      rela.r_info = ELF64_R_INFO(cr.sym_index, cr.rela_type);
-      rela.r_addend = cr.addend;
+      yukiplt::NativeElfRelocation rela{};
+      rela.r_offset = got_offset + slot_idx * kNativeSlotSize;
+      rela.r_info = yukiplt::native_reloc_info(cr.sym_index, cr.rela_type);
+      set_test_addend(rela, cr.addend);
       lb.append(rela, 8);
       ++slot_idx;
     }
 
     for (const auto& as : aliased_slots_) {
-      Elf64_Rela rela{};
+      yukiplt::NativeElfRelocation rela{};
       // Reuse the GOT slot of the target jump slot: a duplicate record.
-      rela.r_offset = got_offset + as.target_jmpslot_index * 8;
-      rela.r_info = ELF64_R_INFO(as.sym_index, R_AARCH64_JUMP_SLOT);
-      rela.r_addend = 0;
+      rela.r_offset = got_offset + as.target_jmpslot_index * kNativeSlotSize;
+      rela.r_info = yukiplt::native_reloc_info(as.sym_index, YUKIPLT_RELOC_JUMP_SLOT);
+      set_test_addend(rela, 0);
       lb.append(rela, 8);
     }
   }
 
-  size_t jmprel_size = total_relas * sizeof(Elf64_Rela);
+  size_t jmprel_size = total_relas * sizeof(yukiplt::NativeElfRelocation);
   // 7b. Separate DT_RELA table (.rela.dyn) + its own GOT slots.
   size_t rela_table_offset = 0;
   size_t rela_got_offset = 0;
@@ -289,25 +305,25 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   size_t rela_table_size = 0;
   if (rela_count > 0) {
     rela_got_offset = lb.align(8);
-    lb.alloc(rela_count * 8, 8);
+    lb.alloc(rela_count * kNativeSlotSize, kNativeSlotSize);
     rela_table_offset = lb.align(8);
     size_t slot_idx = 0;
     for (const auto& entry : rela_entries_) {
-      Elf64_Rela rela{};
-      rela.r_offset = rela_got_offset + slot_idx * 8;
-      rela.r_info = ELF64_R_INFO(entry.sym_index, entry.rela_type);
-      rela.r_addend = entry.addend;
+      yukiplt::NativeElfRelocation rela{};
+      rela.r_offset = rela_got_offset + slot_idx * kNativeSlotSize;
+      rela.r_info = yukiplt::native_reloc_info(entry.sym_index, entry.rela_type);
+      set_test_addend(rela, entry.addend);
       lb.append(rela, 8);
       ++slot_idx;
     }
     for (const auto& alias : rela_aliases_) {
-      Elf64_Rela rela{};
-      rela.r_offset = rela_got_offset + alias.target_rela_index * 8;
-      rela.r_info = ELF64_R_INFO(alias.sym_index, alias.rela_type);
-      rela.r_addend = 0;
+      yukiplt::NativeElfRelocation rela{};
+      rela.r_offset = rela_got_offset + alias.target_rela_index * kNativeSlotSize;
+      rela.r_info = yukiplt::native_reloc_info(alias.sym_index, alias.rela_type);
+      set_test_addend(rela, 0);
       lb.append(rela, 8);
     }
-    rela_table_size = rela_count * sizeof(Elf64_Rela);
+    rela_table_size = rela_count * sizeof(yukiplt::NativeElfRelocation);
   }
   // 7c. DT_ANDROID_RELA table (raw bytes) + its own GOT slots.
   size_t android_table_offset = 0;
@@ -315,7 +331,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   if (has_android_rela_) {
     if (android_rela_slots_ > 0) {
       android_got_offset = lb.align(8);
-      lb.alloc(android_rela_slots_ * 8, 8);
+      lb.alloc(android_rela_slots_ * kNativeSlotSize, kNativeSlotSize);
     }
     android_table_offset = lb.align(8);
     size_t bytes_off = lb.alloc(android_rela_bytes_.size(), 8);
@@ -327,7 +343,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   size_t dyn_offset = lb.align(8);
 
   auto add_dyn = [&](int64_t tag, uint64_t val) {
-    Elf64_Dyn d{};
+    yukiplt::NativeElfDyn d{};
     d.d_tag = tag;
     d.d_un.d_val = val;
     lb.append(d, 8);
@@ -352,19 +368,22 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     maybe_add_dyn(DT_JMPREL, jmprel_offset);
     maybe_add_dyn(DT_PLTRELSZ, jmprel_size);
     maybe_add_dyn(DT_PLTREL, pltrel_override_);
-    maybe_add_dyn(DT_RELAENT, has_relaent_override_ ? relaent_override_ : sizeof(Elf64_Rela));
+    maybe_add_dyn(detail::kDtNativeRelEnt,
+                  has_relaent_override_ ? relaent_override_ : sizeof(yukiplt::NativeElfRelocation));
   }
   if (rela_count > 0) {
-    maybe_add_dyn(/*DT_RELA=*/7, rela_table_offset);
-    maybe_add_dyn(/*DT_RELASZ=*/8, rela_table_size);
+    maybe_add_dyn(detail::kDtNativeRel, rela_table_offset);
+    maybe_add_dyn(detail::kDtNativeRelSz, rela_table_size);
     if (total_relas == 0)
-      maybe_add_dyn(DT_RELAENT, has_relaent_override_ ? relaent_override_ : sizeof(Elf64_Rela));
+      maybe_add_dyn(detail::kDtNativeRelEnt, has_relaent_override_
+                                                 ? relaent_override_
+                                                 : sizeof(yukiplt::NativeElfRelocation));
   }
   if (has_android_rela_) {
-    maybe_add_dyn(/*DT_ANDROID_RELA=*/0x60000011, android_table_offset);
-    maybe_add_dyn(/*DT_ANDROID_RELASZ=*/0x60000012, android_rela_bytes_.size());
+    maybe_add_dyn(detail::kDtNativeAndroidRel, android_table_offset);
+    maybe_add_dyn(detail::kDtNativeAndroidRelSz, android_rela_bytes_.size());
   }
-  if (emit_rel_tag_) maybe_add_dyn(/*DT_REL=*/17, 0);
+  if (emit_rel_tag_) maybe_add_dyn(detail::kDtForeignRel, 0);
 
   // DT_NULL terminator.
   if (!omit_dt_null_ && (truncate_dyn_ == 0 || dyn_count < truncate_dyn_)) add_dyn(DT_NULL, 0);
@@ -376,7 +395,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
 
   // PT_LOAD: covers entire buffer.
   {
-    Elf64_Phdr ph{};
+    yukiplt::NativeElfPhdr ph{};
     ph.p_type = PT_LOAD;
     ph.p_flags = load_flags_;
     ph.p_offset = 0;
@@ -385,13 +404,13 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     ph.p_filesz = total_size;
     ph.p_memsz = total_size;
     ph.p_align = 0x1000;
-    lb.write_at(phdr_offset + phi * sizeof(Elf64_Phdr), ph);
+    lb.write_at(phdr_offset + phi * sizeof(yukiplt::NativeElfPhdr), ph);
     ++phi;
   }
 
   // PT_DYNAMIC
   {
-    Elf64_Phdr ph{};
+    yukiplt::NativeElfPhdr ph{};
     ph.p_type = PT_DYNAMIC;
     ph.p_flags = PF_R | PF_W;
     ph.p_offset = dyn_offset;
@@ -400,13 +419,13 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     ph.p_filesz = dyn_size;
     ph.p_memsz = dyn_size;
     ph.p_align = 8;
-    lb.write_at(phdr_offset + phi * sizeof(Elf64_Phdr), ph);
+    lb.write_at(phdr_offset + phi * sizeof(yukiplt::NativeElfPhdr), ph);
     ++phi;
   }
 
   // PT_GNU_RELRO (optional)
   if (use_relro_) {
-    Elf64_Phdr ph{};
+    yukiplt::NativeElfPhdr ph{};
     ph.p_type = PT_GNU_RELRO;
     ph.p_flags = PF_R;
     ph.p_offset = 0;
@@ -415,7 +434,7 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     ph.p_filesz = total_size;
     ph.p_memsz = total_size;
     ph.p_align = 1;
-    lb.write_at(phdr_offset + phi * sizeof(Elf64_Phdr), ph);
+    lb.write_at(phdr_offset + phi * sizeof(yukiplt::NativeElfPhdr), ph);
     ++phi;
   }
 

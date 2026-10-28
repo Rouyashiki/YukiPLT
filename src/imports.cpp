@@ -55,7 +55,7 @@ Result<size_t> symbol_count(const InspectedImage& image) {
     const uint64_t words = uint64_t{2} + buckets.value() + chains.value();
     if (buckets.value() == 0 || chains.value() == 0 || words > std::numeric_limits<size_t>::max() ||
         !array_readable(image, image.sysv_hash, static_cast<size_t>(words), sizeof(uint32_t)) ||
-        !array_readable(image, image.symtab, chains.value(), sizeof(Elf64_Sym)))
+        !array_readable(image, image.symtab, chains.value(), sizeof(NativeElfSym)))
       return Error::Make(ErrorCode::kCorruptedElf);
     return static_cast<size_t>(chains.value());
   }
@@ -70,7 +70,7 @@ Result<size_t> symbol_count(const InspectedImage& image) {
       (bloom.value() & (bloom.value() - 1)) != 0)
     return Error::Make(ErrorCode::kCorruptedElf);
 
-  const uint64_t prefix = uint64_t{16} + uint64_t{bloom.value()} * 8;
+  const uint64_t prefix = uint64_t{16} + uint64_t{bloom.value()} * sizeof(NativeElfAddr);
   const uint64_t header_size = prefix + uint64_t{buckets.value()} * 4;
   if (header_size > std::numeric_limits<size_t>::max() ||
       !readable(image, image.gnu_hash, static_cast<size_t>(header_size)))
@@ -90,7 +90,7 @@ Result<size_t> symbol_count(const InspectedImage& image) {
     for (const auto& segment : image.load_segments) {
       if ((segment.flags & PF_R) && image.symtab >= segment.vaddr_begin &&
           image.symtab < segment.vaddr_end) {
-        const size_t bound = (segment.vaddr_end - image.symtab) / sizeof(Elf64_Sym);
+        const size_t bound = (segment.vaddr_end - image.symtab) / sizeof(NativeElfSym);
         if (bound == 0) return Error::Make(ErrorCode::kCorruptedElf);
         return bound;
       }
@@ -103,7 +103,7 @@ Result<size_t> symbol_count(const InspectedImage& image) {
     // terminator cannot turn into an unbounded walk or read past PT_LOAD.
     size_t index = last_bucket;
     for (;;) {
-      auto symbol = read<Elf64_Sym>(image, image.symtab, index);
+      auto symbol = read<NativeElfSym>(image, image.symtab, index);
       auto chain = read<uint32_t>(image, chain_base, index - first.value());
       if (!symbol) return symbol.error();
       if (!chain) return chain.error();
@@ -113,7 +113,7 @@ Result<size_t> symbol_count(const InspectedImage& image) {
       if (chain.value() & 1) break;
     }
   }
-  if (!array_readable(image, image.symtab, count, sizeof(Elf64_Sym)))
+  if (!array_readable(image, image.symtab, count, sizeof(NativeElfSym)))
     return Error::Make(ErrorCode::kCorruptedElf);
   return count;
 }
@@ -131,16 +131,16 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
 
   std::vector<uintptr_t> addresses;
   for (size_t i = 0; i < image.jmprel_count; ++i) {
-    auto record = read<Elf64_Rela>(image, image.jmprel, i);
+    auto record = read<NativeElfRelocation>(image, image.jmprel, i);
     if (!record) return record.error();
     const auto& rela = record.value();
-    const auto symbol_index = static_cast<uint32_t>(ELF64_R_SYM(rela.r_info));
-    if (ELF64_R_TYPE(rela.r_info) != R_AARCH64_JUMP_SLOT || symbol_index == 0) {
+    const auto symbol_index = static_cast<uint32_t>(native_reloc_symbol(rela.r_info));
+    if (native_reloc_type(rela.r_info) != YUKIPLT_RELOC_JUMP_SLOT || symbol_index == 0) {
       ++snapshot.skipped_relocations;
       continue;
     }
     if (symbol_index >= count.value()) return Error::Make(ErrorCode::kCorruptedElf);
-    auto symbol = read<Elf64_Sym>(image, image.symtab, symbol_index);
+    auto symbol = read<NativeElfSym>(image, image.symtab, symbol_index);
     if (!symbol) return symbol.error();
     const auto name_offset = symbol.value().st_name;
     if (name_offset >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
@@ -151,7 +151,7 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
     uintptr_t address;
     if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), address))
       return Error::Make(ErrorCode::kIntegerOverflow);
-    if (address % sizeof(uint64_t) != 0 || !image.addr_in_writable_load(address, sizeof(uint64_t)))
+    if (address % kNativeSlotSize != 0 || !image.addr_in_writable_load(address, kNativeSlotSize))
       return Error::Make(ErrorCode::kCorruptedElf);
 
     snapshot.imports.push_back(
@@ -206,8 +206,8 @@ struct Tags {
 Result<Tags> version_tags(const InspectedImage& image) {
   Tags tags;
   constexpr int64_t wanted[] = {DT_VERSYM, DT_VERNEED, DT_VERNEEDNUM, DT_VERDEF, DT_VERDEFNUM};
-  for (size_t i = 0; i < image.dynamic_size / sizeof(Elf64_Dyn); ++i) {
-    auto entry = read_version<Elf64_Dyn>(image, image.dynamic, i);
+  for (size_t i = 0; i < image.dynamic_size / sizeof(NativeElfDyn); ++i) {
+    auto entry = read_version<NativeElfDyn>(image, image.dynamic, i);
     if (!entry) return entry.error();
     if (entry.value().d_tag == DT_NULL) return tags;
     for (size_t j = 0; j < 5; ++j) {
@@ -246,23 +246,23 @@ Result<T> read_record(const InspectedImage& image, uintptr_t address,
 Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
                  std::vector<NamedVersion>& out, std::vector<RecordRange>& ranges) {
   for (uint64_t i = 0; i < count; ++i) {
-    auto record = read_record<Elf64_Verneed>(image, address, ranges);
+    auto record = read_record<NativeElfVerneed>(image, address, ranges);
     if (!record) return record.error();
     const auto& need = record.value();
     if (need.vn_version != 1 || need.vn_cnt == 0 || (i + 1 == count) != (need.vn_next == 0))
       return Error::Make(ErrorCode::kCorruptedElf);
     auto file = string_at(image, need.vn_file);
     if (!file) return file.error();
-    auto aux = advance(address, need.vn_aux, sizeof(Elf64_Verneed));
+    auto aux = advance(address, need.vn_aux, sizeof(NativeElfVerneed));
     if (!aux) return aux.error();
     uintptr_t next_record = 0;
     if (need.vn_next != 0) {
-      auto next = advance(address, need.vn_next, sizeof(Elf64_Verneed));
+      auto next = advance(address, need.vn_next, sizeof(NativeElfVerneed));
       if (!next) return next.error();
       next_record = next.value();
     }
     for (size_t j = 0; j < need.vn_cnt; ++j) {
-      auto item = read_record<Elf64_Vernaux>(image, aux.value(), ranges);
+      auto item = read_record<NativeElfVernaux>(image, aux.value(), ranges);
       if (!item) return item.error();
       const auto& value = item.value();
       const uint16_t index = value.vna_other & kVersionMask;
@@ -274,7 +274,7 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
         return Error::Make(ErrorCode::kCorruptedElf);
       out.push_back({index, VersionSource::kNeeded, std::move(name.value()), file.value()});
       if (value.vna_next != 0) {
-        aux = advance(aux.value(), value.vna_next, sizeof(Elf64_Vernaux));
+        aux = advance(aux.value(), value.vna_next, sizeof(NativeElfVernaux));
         if (!aux) return aux.error();
       }
     }
@@ -286,7 +286,7 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
 Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t count,
                        std::vector<NamedVersion>& out, std::vector<RecordRange>& ranges) {
   for (uint64_t i = 0; i < count; ++i) {
-    auto record = read_record<Elf64_Verdef>(image, address, ranges);
+    auto record = read_record<NativeElfVerdef>(image, address, ranges);
     if (!record) return record.error();
     const auto& definition = record.value();
     const uint16_t index = definition.vd_ndx & kVersionMask;
@@ -294,16 +294,16 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
         (index == 1) != ((definition.vd_flags & 1) != 0) ||
         (i + 1 == count) != (definition.vd_next == 0))
       return Error::Make(ErrorCode::kCorruptedElf);
-    auto aux = advance(address, definition.vd_aux, sizeof(Elf64_Verdef));
+    auto aux = advance(address, definition.vd_aux, sizeof(NativeElfVerdef));
     if (!aux) return aux.error();
     uintptr_t next_record = 0;
     if (definition.vd_next != 0) {
-      auto next = advance(address, definition.vd_next, sizeof(Elf64_Verdef));
+      auto next = advance(address, definition.vd_next, sizeof(NativeElfVerdef));
       if (!next) return next.error();
       next_record = next.value();
     }
     for (size_t j = 0; j < definition.vd_cnt; ++j) {
-      auto item = read_record<Elf64_Verdaux>(image, aux.value(), ranges);
+      auto item = read_record<NativeElfVerdaux>(image, aux.value(), ranges);
       if (!item) return item.error();
       if ((j + 1 == definition.vd_cnt) != (item.value().vda_next == 0))
         return Error::Make(ErrorCode::kCorruptedElf);
@@ -315,7 +315,7 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
         out.push_back({index, VersionSource::kDefined, std::move(name.value()), {}});
       }
       if (item.value().vda_next != 0) {
-        aux = advance(aux.value(), item.value().vda_next, sizeof(Elf64_Verdaux));
+        aux = advance(aux.value(), item.value().vda_next, sizeof(NativeElfVerdaux));
         if (!aux) return aux.error();
       }
     }
@@ -373,7 +373,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
     SymbolVersion version;
     version.table_present = t.present[0];
     if (t.present[0]) {
-      auto value = read_version<Elf64_Half>(image, versym, entry.symbol_index);
+      auto value = read_version<NativeElfHalf>(image, versym, entry.symbol_index);
       if (!value) return value.error();
       version.index = value.value() & kVersionMask;
       version.hidden = (value.value() & kHiddenBit) != 0;
@@ -384,7 +384,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
                              [](const NamedVersion& v, uint16_t index) { return v.index < index; });
         if (found == versions.end() || found->index != version.index)
           return Error::Make(ErrorCode::kCorruptedElf);
-        auto symbol = read_version<Elf64_Sym>(image, image.symtab, entry.symbol_index);
+        auto symbol = read_version<NativeElfSym>(image, image.symtab, entry.symbol_index);
         if (!symbol) return symbol.error();
         if ((symbol.value().st_shndx == SHN_UNDEF) != (found->source == VersionSource::kNeeded))
           return Error::Make(ErrorCode::kCorruptedElf);
@@ -450,19 +450,21 @@ namespace {
 
 // Resolve r_offset to a runtime slot address.
 bool resolve_slot(const InspectedImage& image, uint64_t r_offset, uintptr_t& out) noexcept {
-  return safe_add(image.load_bias, static_cast<uintptr_t>(r_offset), out);
+  uintptr_t offset;
+  return narrow_address(r_offset, offset) && safe_add(image.load_bias, offset, out);
 }
 
 }  // namespace
 
-Error decode_rela(const InspectedImage& image, RelocVisitor visit, void* context) {
+Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context) {
   if (image.rela == 0 || image.rela_size == 0) return Error::Ok();
-  if (image.rela_ent != 0 && image.rela_ent != sizeof(Elf64_Rela))
+  if (image.rela_ent != 0 && image.rela_ent != sizeof(NativeElfRelocation))
     return Error::Make(ErrorCode::kUnsupportedFormat);
-  if (image.rela_size % sizeof(Elf64_Rela) != 0) return Error::Make(ErrorCode::kCorruptedElf);
+  if (image.rela_size % sizeof(NativeElfRelocation) != 0)
+    return Error::Make(ErrorCode::kCorruptedElf);
   if (!readable(image, image.rela, image.rela_size)) return Error::Make(ErrorCode::kOutOfBounds);
 
-  size_t count = image.rela_size / sizeof(Elf64_Rela);
+  size_t count = image.rela_size / sizeof(NativeElfRelocation);
 
   // Allow overlap only when JMPREL is wholly inside the native table and shares
   // its end; decode the prefix once. Reject all other overlaps.
@@ -470,29 +472,32 @@ Error decode_rela(const InspectedImage& image, RelocVisitor visit, void* context
     uintptr_t rela_begin = image.rela;
     uintptr_t rela_end = image.rela + image.rela_size;  // readable() proved no overflow.
     uintptr_t plt_begin = image.jmprel;
-    uintptr_t plt_bytes = image.jmprel_count * sizeof(Elf64_Rela);
+    uintptr_t plt_bytes;
+    if (!safe_mul(image.jmprel_count, sizeof(NativeElfRelocation), plt_bytes))
+      return Error::Make(ErrorCode::kIntegerOverflow);
     uintptr_t plt_end;
     if (!safe_add(plt_begin, plt_bytes, plt_end)) return Error::Make(ErrorCode::kIntegerOverflow);
     const bool disjoint = plt_end <= rela_begin || plt_begin >= rela_end;
     if (!disjoint) {
-      const bool contained_with_shared_end = plt_begin >= rela_begin && plt_end == rela_end &&
-                                             (plt_begin - rela_begin) % sizeof(Elf64_Rela) == 0;
+      const bool contained_with_shared_end =
+          plt_begin >= rela_begin && plt_end == rela_end &&
+          (plt_begin - rela_begin) % sizeof(NativeElfRelocation) == 0;
       if (!contained_with_shared_end) return Error::Make(ErrorCode::kCorruptedElf);
-      count = (plt_begin - rela_begin) / sizeof(Elf64_Rela);
+      count = (plt_begin - rela_begin) / sizeof(NativeElfRelocation);
     }
   }
 
   for (size_t i = 0; i < count; ++i) {
-    Elf64_Rela rela;
-    std::memcpy(&rela, reinterpret_cast<const void*>(image.rela + i * sizeof(Elf64_Rela)),
+    NativeElfRelocation rela;
+    std::memcpy(&rela, reinterpret_cast<const void*>(image.rela + i * sizeof(NativeElfRelocation)),
                 sizeof(rela));
     DecodedReloc decoded;
     if (!resolve_slot(image, rela.r_offset, decoded.slot_address))
       return Error::Make(ErrorCode::kIntegerOverflow);
     decoded.symbol_index = reloc_sym_of(rela.r_info);
     decoded.type = reloc_type_of(rela.r_info);
-    decoded.addend = static_cast<int64_t>(rela.r_addend);
-    decoded.source = RelocSource::kRela;
+    decoded.addend = native_reloc_addend(rela);
+    decoded.source = kNativeUsesRela ? RelocSource::kRela : RelocSource::kRel;
     decoded.index = i;
     if (Error e = visit(context, decoded)) return e;
   }
@@ -561,7 +566,7 @@ constexpr uint64_t kKnownGroupFlags =
 
 }  // namespace
 
-Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void* context) {
+Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context) {
   if (image.android_rela == 0 || image.android_rela_size == 0) return Error::Ok();
   if (image.android_rela_size > kMaxPackedBytes) return Error::Make(ErrorCode::kOutOfBounds);
   if (!readable(image, image.android_rela, image.android_rela_size))
@@ -603,6 +608,8 @@ Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void*
     const bool grouped_by_info = (flags & kRelocGroupedByInfo) != 0;
     const bool group_has_addend = (flags & kRelocGroupHasAddend) != 0;
     const bool grouped_by_addend = (flags & kRelocGroupedByAddend) != 0;
+    if (!kNativeUsesRela && (group_has_addend || grouped_by_addend))
+      return Error::Make(ErrorCode::kCorruptedElf);
     // "grouped by addend" without "has addend" is contradictory.
     if (grouped_by_addend && !group_has_addend) return Error::Make(ErrorCode::kCorruptedElf);
 
@@ -646,12 +653,13 @@ Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void*
       if (!group_has_addend) addend = 0;
 
       DecodedReloc decoded;
+      if (!kNativeUsesRela && info > UINT32_MAX) return Error::Make(ErrorCode::kIntegerOverflow);
       if (!resolve_slot(image, static_cast<uint64_t>(offset), decoded.slot_address))
         return Error::Make(ErrorCode::kIntegerOverflow);
       decoded.symbol_index = reloc_sym_of(info);
       decoded.type = reloc_type_of(info);
       decoded.addend = addend;
-      decoded.source = RelocSource::kAndroidRela;
+      decoded.source = kNativeUsesRela ? RelocSource::kAndroidRela : RelocSource::kAndroidRel;
       decoded.index = static_cast<size_t>(emitted);
       if (Error e = visit(context, decoded)) return e;
       ++emitted;
@@ -676,9 +684,22 @@ RelocationSource to_public_source(RelocSource source) noexcept {
     case RelocSource::kRela:
       return RelocationSource::kRela;
     case RelocSource::kAndroidRela:
-    default:
       return RelocationSource::kAndroidRela;
+    case RelocSource::kRel:
+      return RelocationSource::kRel;
+    case RelocSource::kAndroidRel:
+      return RelocationSource::kAndroidRel;
   }
+  return RelocationSource::kJmprel;  // Internal enum is constructed only by decoders.
+}
+
+Error validate_sources(uint32_t sources) noexcept {
+  constexpr uint32_t known =
+      kSourceJmprel | kSourceRela | kSourceAndroidRela | kSourceRel | kSourceAndroidRel;
+  constexpr uint32_t native = kSourceJmprel | kSourceNativeDynamic | kSourceNativeAndroidPacked;
+  if (sources == 0 || (sources & ~known) != 0) return Error::Make(ErrorCode::kInvalidArgument);
+  if ((sources & ~native) != 0) return Error::Make(ErrorCode::kUnsupportedFormat);
+  return Error::Ok();
 }
 
 // True if [addr, addr + size) lies entirely within one readable (PF_R) LOAD.
@@ -714,10 +735,12 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
   if (symbol_index == 0 || symbol_index >= state.symbol_bound)
     return Error::Make(ErrorCode::kCorruptedElf);
   uintptr_t sym_addr;
-  if (!safe_add(image.symtab, static_cast<uintptr_t>(symbol_index) * sizeof(Elf64_Sym), sym_addr))
+  uintptr_t sym_offset;
+  if (!safe_mul(symbol_index, sizeof(NativeElfSym), sym_offset) ||
+      !safe_add(image.symtab, sym_offset, sym_addr))
     return Error::Make(ErrorCode::kIntegerOverflow);
-  if (!readable(image, sym_addr, sizeof(Elf64_Sym))) return Error::Make(ErrorCode::kOutOfBounds);
-  Elf64_Sym sym;
+  if (!readable(image, sym_addr, sizeof(NativeElfSym))) return Error::Make(ErrorCode::kOutOfBounds);
+  NativeElfSym sym;
   std::memcpy(&sym, reinterpret_cast<const void*>(sym_addr), sizeof(sym));
   if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
   const char* begin = reinterpret_cast<const char*>(image.strtab + sym.st_name);
@@ -734,13 +757,12 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
 // real source and type); every other record is only counted, so a large table
 // of RELATIVE or other relocations costs no memory.
 Error keep(ScanState& state, const DecodedReloc& reloc) {
-  if ((reloc.type != kRAarch64JumpSlot && reloc.type != kRAarch64GlobDat) ||
-      reloc.symbol_index == 0) {
+  if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
     ++state.result.skipped_relocations;
     return Error::Ok();
   }
-  if (reloc.slot_address % sizeof(uint64_t) != 0 ||
-      !state.image.addr_in_writable_load(reloc.slot_address, sizeof(uint64_t)))
+  if (reloc.slot_address % kNativeSlotSize != 0 ||
+      !state.image.addr_in_writable_load(reloc.slot_address, kNativeSlotSize))
     return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = ensure_symbols(state)) return e;
   FunctionReloc record;
@@ -764,13 +786,13 @@ Error visit_record(void* context, const DecodedReloc& reloc) {
 }  // namespace
 
 Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources) {
-  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
-    return Error::Make(ErrorCode::kInvalidArgument);
+  if (Error e = validate_sources(sources)) return e;
   // Scanning DT_RELA or DT_ANDROID_RELA refuses an image whose relocation tags
   // are unusable (a repeated tag, a pointer without its size, an overflowing
   // address, or a REL form).  A DT_JMPREL-only scan does not read those tables
   // and, like the legacy path, ignores them.
-  if (image.reloc_tags_unusable && (sources & (kSourceRela | kSourceAndroidRela)) != 0)
+  if (image.reloc_tags_unusable &&
+      (sources & (kSourceNativeDynamic | kSourceNativeAndroidPacked)) != 0)
     return Error::Make(ErrorCode::kUnsupportedFormat);
 
   RawFunctionSnapshot result;
@@ -778,28 +800,31 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
 
   if ((sources & kSourceJmprel) != 0 && image.jmprel_count != 0) {
     // inspect() bounded the table within a LOAD; reading it also needs PF_R.
-    if (!readable(image, image.jmprel, image.jmprel_count * sizeof(Elf64_Rela)))
-      return Error::Make(ErrorCode::kOutOfBounds);
+    uintptr_t table_bytes;
+    if (!safe_mul(image.jmprel_count, sizeof(NativeElfRelocation), table_bytes))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    if (!readable(image, image.jmprel, table_bytes)) return Error::Make(ErrorCode::kOutOfBounds);
     for (size_t i = 0; i < image.jmprel_count; ++i) {
-      Elf64_Rela rela;
-      std::memcpy(&rela, reinterpret_cast<const void*>(image.jmprel + i * sizeof(Elf64_Rela)),
+      NativeElfRelocation rela;
+      std::memcpy(&rela,
+                  reinterpret_cast<const void*>(image.jmprel + i * sizeof(NativeElfRelocation)),
                   sizeof(rela));
       DecodedReloc reloc;
       if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), reloc.slot_address))
         return Error::Make(ErrorCode::kIntegerOverflow);
       reloc.symbol_index = reloc_sym_of(rela.r_info);
       reloc.type = reloc_type_of(rela.r_info);
-      reloc.addend = static_cast<int64_t>(rela.r_addend);
+      reloc.addend = native_reloc_addend(rela);
       reloc.source = RelocSource::kJmprel;
       reloc.index = i;
       if (Error e = keep(state, reloc)) return e;
     }
   }
-  if (sources & kSourceRela) {
-    if (Error e = decode_rela(image, visit_record, &state)) return e;
+  if (sources & kSourceNativeDynamic) {
+    if (Error e = decode_dynamic_relocations(image, visit_record, &state)) return e;
   }
-  if (sources & kSourceAndroidRela) {
-    if (Error e = decode_android_rela(image, visit_record, &state)) return e;
+  if (sources & kSourceNativeAndroidPacked) {
+    if (Error e = decode_android_packed(image, visit_record, &state)) return e;
   }
 
   // Duplicate slot addresses across all scanned sources are malformed.
@@ -835,9 +860,10 @@ Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& i
 
 Error validate_function_selector(const FunctionImportSelector& selector) noexcept {
   if (Error e = validate_selector(selector.base)) return e;
-  if (selector.sources == 0 ||
-      (selector.sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
+  if (static_cast<uint8_t>(selector.index_source) >
+      static_cast<uint8_t>(RelocationSource::kAndroidRel))
     return Error::Make(ErrorCode::kInvalidArgument);
+  if (Error e = validate_sources(selector.sources)) return e;
   if (selector.types == 0 || (selector.types & ~(kTypeJumpSlot | kTypeGlobDat)) != 0)
     return Error::Make(ErrorCode::kInvalidArgument);
   return Error::Ok();
@@ -852,22 +878,26 @@ uint32_t source_bit(RelocationSource source) noexcept {
     case RelocationSource::kRela:
       return kSourceRela;
     case RelocationSource::kAndroidRela:
-    default:
       return kSourceAndroidRela;
+    case RelocationSource::kRel:
+      return kSourceRel;
+    case RelocationSource::kAndroidRel:
+      return kSourceAndroidRel;
   }
+  return 0;
 }
 
 uint32_t type_bit(uint32_t relocation_type) noexcept {
-  if (relocation_type == kRAarch64JumpSlot) return kTypeJumpSlot;
-  if (relocation_type == kRAarch64GlobDat) return kTypeGlobDat;
+  if (relocation_type == kRelJumpSlot) return kTypeJumpSlot;
+  if (relocation_type == kRelGlobDat) return kTypeGlobDat;
   return 0;
 }
 
 // A record is acceptable to hook only as JUMP_SLOT, or as GLOB_DAT with addend
 // zero, symbol type STT_FUNC and an undefined (imported) symbol.
 bool is_acceptable(const FunctionReloc& record) noexcept {
-  if (record.entry.relocation_type == kRAarch64JumpSlot) return true;
-  if (record.entry.relocation_type != kRAarch64GlobDat) return false;
+  if (record.entry.relocation_type == kRelJumpSlot) return true;
+  if (record.entry.relocation_type != kRelGlobDat) return false;
   return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined;
 }
 

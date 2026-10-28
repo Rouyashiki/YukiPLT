@@ -7,6 +7,7 @@
 #include <new>
 #include <stdexcept>
 
+#include "common.hpp"
 #include "imports.hpp"
 #include "system_images.hpp"
 #include "yukiplt.hpp"
@@ -39,6 +40,67 @@ ImportSelector exact_selector(const VersionedImport& chosen) noexcept {
   result.relocation_index = chosen.import.relocation_index;
   return result;
 }
+#if defined(__linux__) || defined(__ANDROID__)
+// Older x86 kernels link vDSO at a high virtual address, then map it lower.
+// dlpi_addr represents a negative displacement modulo ElfW(Addr). Anchor this
+// kernel-owned image with AT_SYSINFO_EHDR, without allowing arbitrary wrapped
+// arithmetic in custom images or in transaction paths.
+Result<bool> system_contains_address(const ImageView& view, uintptr_t address) {
+  auto ordinary = detail::image_contains_address(view, address);
+  if (ordinary || ordinary.error().code != ErrorCode::kIntegerOverflow) return ordinary;
+#if defined(AT_SYSINFO_EHDR)
+  const uintptr_t base = getauxval(AT_SYSINFO_EHDR);
+  if (base == 0) return ordinary;
+  // The auxiliary vector supplies a readable, process-lifetime ELF header.
+  // Offsets inside that header remain untrusted.
+  NativeElfEhdr header;
+  std::memcpy(&header, reinterpret_cast<const void*>(base), sizeof(header));
+  uintptr_t phdr_address;
+  if (std::memcmp(header.e_ident, "\177ELF", 4) != 0 ||
+      header.e_ident[EI_CLASS] != YUKIPLT_ELF_CLASS || header.e_ident[EI_DATA] != ELFDATA2LSB ||
+      header.e_machine != kNativeMachine || header.e_type != ET_DYN ||
+      header.e_phentsize != sizeof(NativeElfPhdr) || header.e_phnum != view.phdr_count ||
+      !detail::safe_add(base, header.e_phoff, phdr_address) ||
+      phdr_address != reinterpret_cast<uintptr_t>(view.phdr_table))
+    return ordinary;
+  const NativeElfPhdr* anchor = nullptr;
+  for (size_t i = 0; i < view.phdr_count; ++i) {
+    const auto& ph = view.phdr_table[i];
+    if (ph.p_type == PT_LOAD && ph.p_offset == 0 && (ph.p_flags & PF_R) &&
+        ph.p_filesz >= sizeof(NativeElfEhdr)) {
+      if (anchor) return Error::Make(ErrorCode::kCorruptedElf);
+      anchor = &ph;
+    }
+  }
+  if (!anchor || static_cast<NativeElfAddr>(base - anchor->p_vaddr) != view.load_bias)
+    return ordinary;
+  bool found = false;
+  for (size_t i = 0; i < view.phdr_count; ++i) {
+    const auto& ph = view.phdr_table[i];
+    if (ph.p_type != PT_LOAD) continue;
+    if (ph.p_filesz > ph.p_memsz) return Error::Make(ErrorCode::kCorruptedElf);
+    uintptr_t virtual_end;
+    if (!detail::safe_add(ph.p_vaddr, ph.p_memsz, virtual_end))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    uintptr_t begin;
+    if (ph.p_vaddr >= anchor->p_vaddr) {
+      if (!detail::safe_add(base, ph.p_vaddr - anchor->p_vaddr, begin))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+    } else {
+      const uintptr_t delta = anchor->p_vaddr - ph.p_vaddr;
+      if (delta > base) return Error::Make(ErrorCode::kIntegerOverflow);
+      begin = base - delta;
+    }
+    uintptr_t end;
+    if (!detail::safe_add(begin, ph.p_memsz, end)) return Error::Make(ErrorCode::kIntegerOverflow);
+    if (address >= begin && address < end) found = true;
+  }
+  return found;
+#else
+  return ordinary;
+#endif
+}
+#endif
 }  // namespace
 
 Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
@@ -120,7 +182,7 @@ Result<NamedImage> find_image_containing(const void* address) {
         auto& c = *static_cast<Context*>(opaque);
         ImageView view{static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum,
                        0};
-        auto contains = detail::image_contains_address(view, c.address);
+        auto contains = system_contains_address(view, c.address);
         if (!contains) {
           c.error = contains.error();
           return 1;
@@ -381,11 +443,17 @@ FunctionImportSelector exact_function_selector(const FunctionImport& chosen) noe
     case RelocationSource::kAndroidRela:
       result.sources = kSourceAndroidRela;
       break;
+    case RelocationSource::kRel:
+      result.sources = kSourceRel;
+      break;
+    case RelocationSource::kAndroidRel:
+      result.sources = kSourceAndroidRel;
+      break;
   }
   result.index_source = chosen.source;
-  result.types = chosen.relocation_type == detail::kRAarch64JumpSlot  ? kTypeJumpSlot
-                 : chosen.relocation_type == detail::kRAarch64GlobDat ? kTypeGlobDat
-                                                                      : 0;
+  result.types = chosen.relocation_type == detail::kRelJumpSlot  ? kTypeJumpSlot
+                 : chosen.relocation_type == detail::kRelGlobDat ? kTypeGlobDat
+                                                                 : 0;
   return result;
 }
 Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targets, size_t count,

@@ -96,7 +96,7 @@ struct InspectedImage {
 
 // Inspect bounded native ELF metadata. The caller keeps the mapping and
 // program-header table valid throughout the call.
-Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* phdr_table,
+Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr* phdr_table,
                                         size_t phdr_count);
 
 /// Compute the GNU hash of a symbol name (dl_new_hash).
@@ -157,14 +157,25 @@ constexpr int64_t kDtRelrSz = 0x23;
 constexpr int64_t kDtAndroidRelr = 0x6fffe000;
 constexpr int64_t kDtAndroidRelrSz = 0x6fffe001;
 
+constexpr int64_t kDtNativeRel = kNativeUsesRela ? kDtRela : kDtRel;
+constexpr int64_t kDtNativeRelSz = kNativeUsesRela ? kDtRelaSz : kDtRelSz;
+constexpr int64_t kDtNativeRelEnt = kNativeUsesRela ? kDtRelaEnt : kDtRelEnt;
+constexpr int64_t kDtNativeAndroidRel = kNativeUsesRela ? kDtAndroidRela : kDtAndroidRel;
+constexpr int64_t kDtNativeAndroidRelSz = kNativeUsesRela ? kDtAndroidRelaSz : kDtAndroidRelSz;
+constexpr int64_t kDtForeignRel = kNativeUsesRela ? kDtRel : kDtRela;
+constexpr int64_t kDtForeignRelSz = kNativeUsesRela ? kDtRelSz : kDtRelaSz;
+constexpr int64_t kDtForeignRelEnt = kNativeUsesRela ? kDtRelEnt : kDtRelaEnt;
+constexpr int64_t kDtForeignAndroidRel = kNativeUsesRela ? kDtAndroidRel : kDtAndroidRela;
+constexpr int64_t kDtForeignAndroidRelSz = kNativeUsesRela ? kDtAndroidRelSz : kDtAndroidRelaSz;
+
 // AArch64 dynamic relocation types.
-constexpr uint32_t kRAarch64Abs64 = 257;
-constexpr uint32_t kRAarch64GlobDat = 1025;
-constexpr uint32_t kRAarch64JumpSlot = 1026;
-constexpr uint32_t kRAarch64Relative = 1027;
+constexpr uint32_t kRelAbsolute = kNativeAbsolute;
+constexpr uint32_t kRelGlobDat = kNativeGlobDat;
+constexpr uint32_t kRelJumpSlot = kNativeJumpSlot;
+constexpr uint32_t kRelRelative = kNativeRelative;
 constexpr uint32_t kRAarch64TlsTprel = 1030;
 constexpr uint32_t kRAarch64TlsDesc = 1031;
-constexpr uint32_t kRAarch64IRelative = 1032;
+constexpr uint32_t kRelIRelative = kNativeIRelative;
 
 // ELF symbol types (st_info low nibble).
 constexpr uint8_t kSttNotype = 0;
@@ -192,23 +203,23 @@ constexpr uint64_t kMaxPackedRelocations = uint64_t{1} << 22;
 constexpr size_t kMaxPackedBytes = size_t{64} << 20;
 
 inline uint32_t reloc_type_of(uint64_t r_info) noexcept {
-  return static_cast<uint32_t>(ELF64_R_TYPE(r_info));
+  return static_cast<uint32_t>(native_reloc_type(r_info));
 }
 inline uint32_t reloc_sym_of(uint64_t r_info) noexcept {
-  return static_cast<uint32_t>(ELF64_R_SYM(r_info));
+  return static_cast<uint32_t>(native_reloc_symbol(r_info));
 }
 
 // Stream native and APS2 relocations through validated readable LOADs.
 // On failure the caller discards all collected records. Legacy JMPREL uses imports.cpp.
 
 /// Where a relocation record was found.
-enum class RelocSource : uint8_t { kJmprel, kRela, kAndroidRela };
+enum class RelocSource : uint8_t { kJmprel, kRela, kAndroidRela, kRel, kAndroidRel };
 
 /// One decoded RELA-form relocation (the fields the function-import path needs).
 struct DecodedReloc {
   uintptr_t slot_address = 0;  ///< Runtime address of the GOT slot (r_offset + bias).
-  uint32_t symbol_index = 0;   ///< ELF64_R_SYM(r_info).
-  uint32_t type = 0;           ///< ELF64_R_TYPE(r_info).
+  uint32_t symbol_index = 0;   ///< native_reloc_symbol(r_info).
+  uint32_t type = 0;           ///< native_reloc_type(r_info).
   int64_t addend = 0;          ///< r_addend.
   RelocSource source = RelocSource::kRela;
   size_t index = 0;  ///< Index within its own source table (decode order for APS2).
@@ -221,11 +232,11 @@ using RelocVisitor = Error (*)(void* context, const DecodedReloc& record);
 
 // Validate native relocation entry size, readable interval and slot arithmetic.
 // Visit all types; omit only a wholly contained JMPREL tail with the same end.
-Error decode_rela(const InspectedImage& image, RelocVisitor visit, void* context);
+Error decode_dynamic_relocations(const InspectedImage& image, RelocVisitor visit, void* context);
 
 // Decode bounded APS2. Reject malformed SLEB128 and offset/addend overflow;
 // allow only zero padding after the declared records.
-Error decode_android_rela(const InspectedImage& image, RelocVisitor visit, void* context);
+Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context);
 
 }  // namespace yukiplt::detail
 

@@ -182,7 +182,7 @@ class Txn {
   /// observed (e.g. pages left raised by an earlier failed commit).
   ///
   /// Reads the memory map exactly once.  Fails, without writing anything, if:
-  ///   - kInvalidArgument   no slots and no pages, a slot is not 8-byte
+  ///   - kInvalidArgument   no slots and no pages, a slot is not native-pointer
   ///                        aligned, a slot appears twice, an extra page is
   ///                        unaligned, or the page size is unusable;
   ///   - kOutOfBounds       some page is unmapped or split across VMAs;
@@ -277,7 +277,7 @@ std::mutex& op_mutex() noexcept;
 /// Single-slot wrapper over Txn; acquires op_mutex().
 ///
 /// Errors:
-///   - kInvalidArgument      slot not 8-byte aligned.
+///   - kInvalidArgument      slot not native-pointer aligned.
 ///   - kOutOfBounds          slot not inside a writable PT_LOAD segment of
 ///                           `image`, or no single VMA covers its page.
 ///   - kVmaUnavailable       /proc/self/maps could not be read or parsed.

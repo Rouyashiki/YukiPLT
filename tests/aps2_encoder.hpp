@@ -20,7 +20,7 @@ constexpr uint64_t kAps2GroupHasAddend = 8;
 
 struct Aps2Reloc {
   int64_t offset_delta = 0;  ///< Added to the running offset for this entry.
-  uint64_t info = 0;         ///< ELF64_R_INFO(sym, type).
+  uint64_t info = 0;         ///< yukiplt::native_reloc_info(sym, type).
   int64_t addend_delta = 0;  ///< Added to the running addend (if has-addend).
 };
 

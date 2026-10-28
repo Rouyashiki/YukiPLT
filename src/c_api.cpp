@@ -27,7 +27,7 @@ yukiplt_c_recovery_diagnostic converted(const RecoveryDiagnostic& value) noexcep
           value.residual_page_count};
 }
 ImageView view(const yukiplt_c_image& image) noexcept {
-  return {image.load_bias, static_cast<const Elf64_Phdr*>(image.program_headers),
+  return {image.load_bias, static_cast<const NativeElfPhdr*>(image.program_headers),
           image.program_header_count, image.instance_token};
 }
 ImportSelector selector(const yukiplt_c_selector& source) noexcept {
@@ -45,6 +45,10 @@ RelocationSource reloc_source(uint32_t index_source) noexcept {
       return RelocationSource::kRela;
     case YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA:
       return RelocationSource::kAndroidRela;
+    case YUKIPLT_C_RELOC_SOURCE_REL:
+      return RelocationSource::kRel;
+    case YUKIPLT_C_RELOC_SOURCE_ANDROID_REL:
+      return RelocationSource::kAndroidRel;
     case YUKIPLT_C_RELOC_SOURCE_JMPREL:
     default:
       return RelocationSource::kJmprel;
@@ -56,7 +60,7 @@ RelocationSource reloc_source(uint32_t index_source) noexcept {
 bool function_selector(const yukiplt_c_function_selector& source,
                        FunctionImportSelector& out) noexcept {
   if (source.struct_size != sizeof(yukiplt_c_function_selector)) return false;
-  if (source.index_source > YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA) return false;
+  if (source.index_source > YUKIPLT_C_RELOC_SOURCE_ANDROID_REL) return false;
   if (!valid_enums(source.base)) return false;
   out.base = selector(source.base);
   out.sources = source.sources;
@@ -209,7 +213,8 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS ||
          feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES ||
          feature_id == YUKIPLT_C_FEATURE_EXPECTED_CURRENT ||
-         feature_id == YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY;
+         feature_id == YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY ||
+         (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         const yukiplt_c_function_selector* target,

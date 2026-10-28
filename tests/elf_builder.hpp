@@ -18,9 +18,36 @@
 #include <string>
 #include <vector>
 
+#include "elf.hpp"
 #include "yukiplt.hpp"
 
 namespace yukiplt::test {
+
+inline const char* synthetic_maps_line(bool read_only) {
+#if YUKIPLT_ELF_BITS == 64
+  return read_only ? "1000-fffffffffffff000 r--p 0000 00:00 0"
+                   : "1000-fffffffffffff000 rw-p 0000 00:00 0";
+#else
+  return read_only ? "1000-fffff000 r--p 0000 00:00 0" : "1000-fffff000 rw-p 0000 00:00 0";
+#endif
+}
+
+inline void set_test_addend(NativeElfRelocation& relocation, int64_t addend) {
+#if YUKIPLT_USES_RELA
+  relocation.r_addend = addend;
+#else
+  (void)relocation;
+  // Native REL binding entries have effective addend zero.
+  (void)addend;
+#endif
+}
+
+inline NativeElfRelocation test_relocation(uintptr_t offset, NativeElfAddr info) {
+  NativeElfRelocation result{};
+  result.r_offset = offset;
+  result.r_info = info;
+  return result;
+}
 
 /// Build a minimal ELF image in memory for testing the inspector.
 ///
@@ -53,6 +80,11 @@ class ElfBuilder {
   };
 
   // --- Configuration ---
+
+  ElfBuilder& with_elf_header() {
+    emit_header_ = true;
+    return *this;
+  }
 
   ElfBuilder& add_symbol(const char* name, uint32_t index) {
     symbols_.push_back({name, index});
@@ -107,14 +139,14 @@ class ElfBuilder {
 
   /// Make the DT_RELA table fully contain the JMPREL table, sharing the same end
   /// address, as some linkers emit (DT_RELASZ covering the PLT relocations).
-  /// (Overlap decoding is covered directly against decode_rela in the tests; the
+  /// (Overlap decoding is covered directly against decode_dynamic_relocations in the tests; the
   /// builder lays the two tables out separately, so this flag is reserved.)
   ElfBuilder& set_rela_includes_jmprel(bool enable = true) {
     rela_includes_jmprel_ = enable;
     return *this;
   }
 
-  /// Override DT_RELAENT (default sizeof(Elf64_Rela)).
+  /// Override DT_RELAENT (default sizeof(yukiplt::NativeElfRelocation)).
   ElfBuilder& set_relaent(uint64_t value) {
     relaent_override_ = value;
     has_relaent_override_ = true;
@@ -153,7 +185,7 @@ class ElfBuilder {
     return *this;
   }
 
-  /// Override DT_SYMENT (default: sizeof(Elf64_Sym)).
+  /// Override DT_SYMENT (default: sizeof(yukiplt::NativeElfSym)).
   ElfBuilder& set_syment(uint64_t val) {
     syment_override_ = val;
     return *this;
@@ -226,8 +258,8 @@ class ElfBuilder {
 
     uintptr_t load_bias() const { return reinterpret_cast<uintptr_t>(buffer.data()); }
 
-    const Elf64_Phdr* phdr_table() const {
-      return reinterpret_cast<const Elf64_Phdr*>(buffer.data() + phdr_offset);
+    const yukiplt::NativeElfPhdr* phdr_table() const {
+      return reinterpret_cast<const yukiplt::NativeElfPhdr*>(buffer.data() + phdr_offset);
     }
 
     /// Address of the GOT slot for the i-th JUMP_SLOT relocation.
@@ -290,11 +322,12 @@ class ElfBuilder {
   bool has_relaent_override_ = false;
   bool emit_rel_tag_ = false;
   bool use_gnu_hash_ = true;
+  bool emit_header_ = false;
   bool use_sysv_hash_ = false;
   bool use_relro_ = false;
   size_t truncate_dyn_ = 0;
-  uint64_t pltrel_override_ = DT_RELA;
-  uint64_t syment_override_ = sizeof(Elf64_Sym);
+  uint64_t pltrel_override_ = detail::kDtNativeRel;
+  uint64_t syment_override_ = sizeof(yukiplt::NativeElfSym);
   uint64_t load_vaddr_override_ = 0;
   bool has_load_vaddr_override_ = false;
   bool omit_symtab_ = false;

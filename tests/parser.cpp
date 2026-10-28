@@ -33,7 +33,7 @@ TEST(ElfInspector, RejectsDynamicReadWithoutReadableLoadAndUnalignedEntries) {
   ElfBuilder builder;
   auto image = builder.build();
   image.buffer.resize(image.buffer.size() + 8);
-  auto* headers = const_cast<Elf64_Phdr*>(image.phdr_table());
+  auto* headers = const_cast<yukiplt::NativeElfPhdr*>(image.phdr_table());
   for (size_t i = 0; i < image.phdr_count; ++i) {
     auto& header = headers[i];
     if (header.p_type == PT_LOAD) header.p_memsz += 8;
@@ -96,7 +96,7 @@ TEST(Imports, RejectsInvalidAndUnterminatedNames) {
     if (unterminated) {
       std::memset(reinterpret_cast<void*>(inspected.value().strtab), 'x', inspected.value().strsz);
     } else {
-      write_at<uint32_t>(inspected.value().symtab + 2 * sizeof(Elf64_Sym),
+      write_at<uint32_t>(inspected.value().symtab + 2 * sizeof(yukiplt::NativeElfSym),
                          static_cast<uint32_t>(inspected.value().strsz));
     }
     auto result = inspect_imports(view_of(image));
@@ -113,8 +113,9 @@ TEST(Imports, RejectsMisalignedOutOfRangeAndOverflowingSlots) {
     const uintptr_t offset = mode == 0   ? image.got_offset + 1
                              : mode == 1 ? image.buffer.size() + 8
                                          : std::numeric_limits<uintptr_t>::max();
-    write_at<Elf64_Rela>(inspected.value().jmprel,
-                         {offset, ELF64_R_INFO(2, R_AARCH64_JUMP_SLOT), 0});
+    write_at<yukiplt::NativeElfRelocation>(
+        inspected.value().jmprel,
+        test::test_relocation(offset, yukiplt::native_reloc_info(2, YUKIPLT_RELOC_JUMP_SLOT)));
     auto result = inspect_imports(view_of(image));
     ASSERT_FALSE(result);
     EXPECT_EQ(result.error().code,
@@ -183,13 +184,13 @@ size_t live_groups() {
   return detail::Registry::instance().live_count();
 }
 
-constexpr uint32_t kAll = kSourceJmprel | kSourceRela | kSourceAndroidRela;
+constexpr uint32_t kAll = kSourceJmprel | kSourceNativeDynamic | kSourceNativeAndroidPacked;
 
 }  // namespace
 
 namespace {
 
-constexpr uint64_t kGlobDatSym1 = ELF64_R_INFO(1, R_AARCH64_GLOB_DAT);
+constexpr uint64_t kGlobDatSym1 = yukiplt::native_reloc_info(1, YUKIPLT_RELOC_GLOB_DAT);
 
 struct RawAps2 {
   std::vector<uint8_t> bytes;
@@ -206,7 +207,7 @@ struct RawAps2 {
 
   Error decode() {
     visited = 0;
-    return detail::decode_android_rela(
+    return detail::decode_android_packed(
         image,
         [](void* context, const detail::DecodedReloc&) {
           ++*static_cast<size_t*>(context);
@@ -273,38 +274,12 @@ TEST(FunctionImportsAps2, OverlongOrOutOfRangeSlebRejected) {
     test::append_sleb128(bytes, static_cast<int64_t>(kGlobDatSym1));
     test::append_sleb128(bytes, extreme);
     RawAps2 raw(bytes);
-    EXPECT_FALSE(raw.decode()) << extreme;
+    if (kNativeUsesRela)
+      EXPECT_FALSE(raw.decode()) << extreme;
+    else
+      EXPECT_EQ(raw.decode().code, ErrorCode::kCorruptedElf);
   }
 }
-
-namespace {
-Elf64_Dyn* find_dyn(ElfBuilder::BuiltImage& image, int64_t tag) {
-  const Elf64_Phdr* ph = image.phdr_table();
-  for (size_t i = 0; i < image.phdr_count; ++i) {
-    if (ph[i].p_type != PT_DYNAMIC) continue;
-    auto* d = reinterpret_cast<Elf64_Dyn*>(image.load_bias() + ph[i].p_vaddr);
-    for (; d->d_tag != DT_NULL; ++d)
-      if (d->d_tag == tag) return d;
-  }
-  return nullptr;
-}
-}  // namespace
-
-namespace {
-
-Error decode_rela(const detail::InspectedImage& img, std::vector<detail::DecodedReloc>& out) {
-  return detail::decode_rela(img, collect_into, &out);
-}
-
-Elf64_Rela glob_dat(uint32_t sym, uint64_t slot_vaddr) {
-  Elf64_Rela r{};
-  r.r_offset = slot_vaddr;
-  r.r_info = ELF64_R_INFO(sym, R_AARCH64_GLOB_DAT);
-  r.r_addend = 0;
-  return r;
-}
-
-}  // namespace
 
 namespace {
 FunctionImportSelector sel(const char* symbol, uint32_t sources = kAll,
@@ -392,7 +367,7 @@ void* const kReplB = reinterpret_cast<void*>(uintptr_t{0xB000});
 TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModification) {
   ElfBuilder b;
   b.add_symbol("gfunc", 1).set_symbol_undefined(1);
-  b.add_rela(1, R_AARCH64_GLOB_DAT, 0);
+  b.add_rela(1, YUKIPLT_RELOC_GLOB_DAT, 0);
   set_backing(b.build());
   wr(image.rela_slot_addr(0), 0);
 
@@ -411,7 +386,7 @@ TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
   b.add_symbol("good", 1);
   b.add_symbol("bad", 2).set_symbol_undefined(2).set_symbol_type(2, STT_OBJECT);
   b.add_jump_slot(1);
-  b.add_rela(2, R_AARCH64_GLOB_DAT, 0);
+  b.add_rela(2, YUKIPLT_RELOC_GLOB_DAT, 0);
   set_backing(b.build());
   wr(image.got_slot_addr(0), 0x1111);
   wr(image.rela_slot_addr(0), 0x2222);

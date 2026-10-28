@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <new>
 #include <type_traits>
 #include <utility>
@@ -25,6 +26,18 @@ inline bool safe_add(uintptr_t a, uintptr_t b, uintptr_t& result) noexcept {
 inline bool safe_add64(uint64_t a, uint64_t b, uint64_t& result) noexcept {
   result = a + b;
   return result >= a;
+}
+
+inline bool safe_mul(uintptr_t a, uintptr_t b, uintptr_t& result) noexcept {
+  if (b != 0 && a > std::numeric_limits<uintptr_t>::max() / b) return false;
+  result = a * b;
+  return true;
+}
+
+inline bool narrow_address(uint64_t value, uintptr_t& result) noexcept {
+  if (value > std::numeric_limits<uintptr_t>::max()) return false;
+  result = static_cast<uintptr_t>(value);
+  return true;
 }
 
 // Inline process state without exit-time destruction; late handles and threads

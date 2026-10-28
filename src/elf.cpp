@@ -100,12 +100,12 @@ struct DynamicInfo {
 /// Parse the dynamic section, extracting the tags we care about.
 /// The dynamic section is at [dyn_addr, dyn_addr + dyn_size) in memory.
 static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn_size) {
-  if (dyn_size < sizeof(Elf64_Dyn) || dyn_size % sizeof(Elf64_Dyn) != 0 ||
-      dyn_addr % alignof(Elf64_Dyn) != 0)
+  if (dyn_size < sizeof(NativeElfDyn) || dyn_size % sizeof(NativeElfDyn) != 0 ||
+      dyn_addr % alignof(NativeElfDyn) != 0)
     return Error::Make(ErrorCode::kCorruptedElf);
 
-  const size_t max_entries = dyn_size / sizeof(Elf64_Dyn);
-  const auto* dyn = reinterpret_cast<const Elf64_Dyn*>(dyn_addr);
+  const size_t max_entries = dyn_size / sizeof(NativeElfDyn);
+  const auto* dyn = reinterpret_cast<const NativeElfDyn*>(dyn_addr);
 
   DynamicInfo info;
   bool found_null = false;
@@ -154,36 +154,37 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
         info.dt_pltrel = d.d_un.d_val;
         info.has_pltrel = true;
         break;
-      case DT_RELAENT:
+      case kDtNativeRelEnt:
+        if (info.has_relaent) info.reloc_tags_unusable = true;
         info.dt_relaent = d.d_un.d_val;
         info.has_relaent = true;
         break;
-      case kDtRela:
+      case kDtNativeRel:
         if (info.has_rela) info.reloc_tags_unusable = true;
         info.dt_rela = d.d_un.d_ptr;
         info.has_rela = true;
         break;
-      case kDtRelaSz:
+      case kDtNativeRelSz:
         if (info.has_relasz) info.reloc_tags_unusable = true;
         info.dt_relasz = d.d_un.d_val;
         info.has_relasz = true;
         break;
-      case kDtAndroidRela:
+      case kDtNativeAndroidRel:
         if (info.has_android_rela) info.reloc_tags_unusable = true;
         info.dt_android_rela = d.d_un.d_ptr;
         info.has_android_rela = true;
         break;
-      case kDtAndroidRelaSz:
+      case kDtNativeAndroidRelSz:
         if (info.has_android_relasz) info.reloc_tags_unusable = true;
         info.dt_android_relasz = d.d_un.d_val;
         info.has_android_relasz = true;
         break;
-      case kDtRel:
-      case kDtRelSz:
-      case kDtRelEnt:
-      case kDtAndroidRel:
-      case kDtAndroidRelSz:
-        // ELF REL (no addend) is never valid on AArch64.  Its presence makes
+      case kDtForeignRel:
+      case kDtForeignRelSz:
+      case kDtForeignRelEnt:
+      case kDtForeignAndroidRel:
+      case kDtForeignAndroidRelSz:
+        // A foreign REL/RELA form is not usable by this native ABI.  Its presence makes
         // the opt-in relocation path refuse the image; hook() still ignores it.
         info.reloc_tags_unusable = true;
         break;
@@ -201,17 +202,23 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
 }
 // Main inspection
 
-Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* phdr_table,
+Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr* phdr_table,
                                         size_t phdr_count) {
   if (phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
   if (phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  uintptr_t phdr_bytes, phdr_end;
+  if (!safe_mul(phdr_count, sizeof(NativeElfPhdr), phdr_bytes) ||
+      !safe_add(reinterpret_cast<uintptr_t>(phdr_table), phdr_bytes, phdr_end))
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  if (reinterpret_cast<uintptr_t>(phdr_table) % alignof(NativeElfPhdr))
+    return Error::Make(ErrorCode::kInvalidArgument);
 
   InspectedImage image;
   image.load_bias = load_bias;
 
   // Collect PT_LOAD, PT_DYNAMIC, PT_GNU_RELRO.
-  const Elf64_Phdr* dyn_phdr = nullptr;
-  const Elf64_Phdr* relro_phdr = nullptr;
+  const NativeElfPhdr* dyn_phdr = nullptr;
+  const NativeElfPhdr* relro_phdr = nullptr;
 
   for (size_t i = 0; i < phdr_count; ++i) {
     const auto& ph = phdr_table[i];
@@ -255,6 +262,29 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
 
   if (dyn_phdr == nullptr) return Error::Make(ErrorCode::kInvalidImage);  // No PT_DYNAMIC
 
+  // A PHDR-only custom view may omit the ELF header. If a readable, file-backed
+  // LOAD at offset zero contains an ELF magic, validate its native ABI before
+  // reading any dynamic metadata. PHDR alone cannot prove machine or class.
+  for (size_t i = 0; i < phdr_count; ++i) {
+    const auto& ph = phdr_table[i];
+    if (ph.p_type != PT_LOAD || ph.p_offset != 0 || !(ph.p_flags & PF_R) ||
+        ph.p_filesz < sizeof(NativeElfEhdr))
+      continue;
+    uintptr_t address;
+    if (!safe_add(load_bias, ph.p_vaddr, address)) return Error::Make(ErrorCode::kIntegerOverflow);
+    if (!image.addr_in_load(address, sizeof(NativeElfEhdr))) continue;
+    NativeElfEhdr header;
+    std::memcpy(&header, reinterpret_cast<const void*>(address), sizeof(header));
+    const auto* ident = header.e_ident;
+    if (ident[0] != 0x7f || ident[1] != 'E' || ident[2] != 'L' || ident[3] != 'F') continue;
+    if (ident[EI_CLASS] != YUKIPLT_ELF_CLASS || ident[EI_DATA] != ELFDATA2LSB ||
+        header.e_machine != kNativeMachine || header.e_type != ET_DYN)
+      return Error::Make(ErrorCode::kUnsupportedFormat);
+    if (ident[EI_VERSION] != EV_CURRENT || header.e_version != EV_CURRENT ||
+        header.e_ehsize != sizeof(NativeElfEhdr) || header.e_phentsize != sizeof(NativeElfPhdr))
+      return Error::Make(ErrorCode::kCorruptedElf);
+  }
+
   // Validate and compute PT_DYNAMIC runtime range.
   uintptr_t dyn_begin;
   if (!safe_add(load_bias, static_cast<uintptr_t>(dyn_phdr->p_vaddr), dyn_begin))
@@ -295,31 +325,33 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
   if (!dinfo.has_strtab) return Error::Make(ErrorCode::kCorruptedElf);
   if (!dinfo.has_strsz) return Error::Make(ErrorCode::kCorruptedElf);
 
-  // Validate DT_SYMENT == sizeof(Elf64_Sym).
-  if (dinfo.has_syment && dinfo.dt_syment != sizeof(Elf64_Sym))
+  // Validate DT_SYMENT == sizeof(NativeElfSym).
+  if (dinfo.has_syment && dinfo.dt_syment != sizeof(NativeElfSym))
     return Error::Make(ErrorCode::kUnsupportedFormat);
 
   // bionic keeps relative d_ptr; glibc may adjust it. Treat DT_SYMTAB as
   // adjusted when its raw address already lies within a runtime LOAD.
   {
     uintptr_t raw_symtab = static_cast<uintptr_t>(dinfo.dt_symtab);
-    image.dptr_adjusted = image.addr_in_load(raw_symtab, sizeof(Elf64_Sym));
+    image.dptr_adjusted = image.addr_in_load(raw_symtab, sizeof(NativeElfSym));
   }
 
   // Helper: resolve a d_ptr to a runtime address.
   auto resolve_ptr = [&](uint64_t d_ptr, uintptr_t& out) -> bool {
+    uintptr_t native;
+    if (!narrow_address(d_ptr, native)) return false;
     if (image.dptr_adjusted) {
-      out = static_cast<uintptr_t>(d_ptr);
+      out = native;
       return true;
     }
-    return safe_add(load_bias, static_cast<uintptr_t>(d_ptr), out);
+    return safe_add(load_bias, native, out);
   };
 
   // Resolve and validate address-type tags.
 
   // SYMTAB
   if (!resolve_ptr(dinfo.dt_symtab, image.symtab)) return Error::Make(ErrorCode::kIntegerOverflow);
-  if (!image.addr_in_load(image.symtab, sizeof(Elf64_Sym)))
+  if (!image.addr_in_load(image.symtab, sizeof(NativeElfSym)))
     return Error::Make(ErrorCode::kCorruptedElf);
 
   // STRTAB + STRSZ
@@ -351,22 +383,21 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
 
   // JMPREL + PLTRELSZ (optional — an image may have no PLT relocations)
   if (dinfo.has_jmprel && dinfo.has_pltrelsz) {
-    // Validate DT_PLTREL == DT_RELA (AArch64 requires RELA).
-    if (dinfo.has_pltrel && dinfo.dt_pltrel != DT_RELA)
+    // Validate DT_PLTREL matches the native REL/RELA format.
+    if (dinfo.has_pltrel && dinfo.dt_pltrel != static_cast<uint64_t>(kDtNativeRel))
       return Error::Make(ErrorCode::kUnsupportedFormat);
 
-    // Validate DT_RELAENT if present.
-    if (dinfo.has_relaent && dinfo.dt_relaent != sizeof(Elf64_Rela))
-      return Error::Make(ErrorCode::kUnsupportedFormat);
+    // REL/RELAENT describes the ordinary dynamic table and is validated only
+    // when that optional path is scanned. JMPREL uses the native ABI format.
 
-    // Validate PLTRELSZ is a multiple of sizeof(Elf64_Rela).
-    if (dinfo.dt_pltrelsz == 0 || dinfo.dt_pltrelsz % sizeof(Elf64_Rela) != 0)
+    // Validate PLTRELSZ is a multiple of sizeof(NativeElfRelocation).
+    if (dinfo.dt_pltrelsz == 0 || dinfo.dt_pltrelsz % sizeof(NativeElfRelocation) != 0)
       return Error::Make(ErrorCode::kCorruptedElf);
 
     if (!resolve_ptr(dinfo.dt_jmprel, image.jmprel))
       return Error::Make(ErrorCode::kIntegerOverflow);
 
-    image.jmprel_count = static_cast<size_t>(dinfo.dt_pltrelsz / sizeof(Elf64_Rela));
+    image.jmprel_count = static_cast<size_t>(dinfo.dt_pltrelsz / sizeof(NativeElfRelocation));
 
     // Validate the entire JMPREL table is within a PT_LOAD segment.
     if (!image.addr_in_load(image.jmprel, static_cast<size_t>(dinfo.dt_pltrelsz)))
@@ -377,6 +408,8 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const Elf64_Phdr* p
   // Malformed optional tables must not reject the legacy JUMP_SLOT path.
   image.reloc_tags_unusable = dinfo.reloc_tags_unusable;
   image.rela_ent = static_cast<size_t>(dinfo.dt_relaent);
+  if (dinfo.has_relaent && dinfo.dt_relaent != sizeof(NativeElfRelocation))
+    image.reloc_tags_unusable = true;
   if (dinfo.has_rela != dinfo.has_relasz) image.reloc_tags_unusable = true;
   if (dinfo.has_android_rela != dinfo.has_android_relasz) image.reloc_tags_unusable = true;
   if (dinfo.has_rela && dinfo.has_relasz) {
@@ -421,11 +454,35 @@ uint32_t elf_hash_value(const char* name) noexcept {
 
 /// Read a T from a runtime address, verifying it falls within a load segment.
 template <typename T>
-static Expected<T, Error> read_checked(const InspectedImage& image, uintptr_t addr) {
-  if (!image.addr_in_load(addr, sizeof(T))) return Error::Make(ErrorCode::kOutOfBounds);
+static Expected<T, Error> read_checked(const InspectedImage& image, uintptr_t addr,
+                                       size_t index = 0) {
+  uintptr_t bytes;
+  if (!safe_mul(index, sizeof(T), bytes) || !safe_add(addr, bytes, addr))
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  uintptr_t end;
+  if (!safe_add(addr, sizeof(T), end)) return Error::Make(ErrorCode::kIntegerOverflow);
+  bool readable = false;
+  for (const auto& segment : image.load_segments)
+    if ((segment.flags & PF_R) && addr >= segment.vaddr_begin && end <= segment.vaddr_end)
+      readable = true;
+  if (!readable) return Error::Make(ErrorCode::kOutOfBounds);
   T val;
   std::memcpy(&val, reinterpret_cast<const void*>(addr), sizeof(T));
   return val;
+}
+
+static Expected<const char*, Error> symbol_name(const InspectedImage& image, uint32_t offset) {
+  if (offset >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
+  uintptr_t end;
+  if (!safe_add(image.strtab, image.strsz, end)) return Error::Make(ErrorCode::kIntegerOverflow);
+  bool readable = false;
+  for (const auto& segment : image.load_segments)
+    if ((segment.flags & PF_R) && image.strtab >= segment.vaddr_begin && end <= segment.vaddr_end)
+      readable = true;
+  if (!readable) return Error::Make(ErrorCode::kOutOfBounds);
+  const char* name = reinterpret_cast<const char*>(image.strtab + offset);
+  if (!std::memchr(name, 0, image.strsz - offset)) return Error::Make(ErrorCode::kCorruptedElf);
+  return name;
 }
 // GNU Hash lookup
 
@@ -440,9 +497,9 @@ Expected<std::optional<uint32_t>, Error> gnu_hash_lookup(const InspectedImage& i
 
   // Read header.
   auto r_nbuckets = read_checked<uint32_t>(image, base);
-  auto r_symoffset = read_checked<uint32_t>(image, base + 4);
-  auto r_bloom_size = read_checked<uint32_t>(image, base + 8);
-  auto r_bloom_shift = read_checked<uint32_t>(image, base + 12);
+  auto r_symoffset = read_checked<uint32_t>(image, base, 1);
+  auto r_bloom_size = read_checked<uint32_t>(image, base, 2);
+  auto r_bloom_shift = read_checked<uint32_t>(image, base, 3);
 
   if (!r_nbuckets || !r_symoffset || !r_bloom_size || !r_bloom_shift)
     return Error::Make(ErrorCode::kCorruptedElf);
@@ -456,40 +513,38 @@ Expected<std::optional<uint32_t>, Error> gnu_hash_lookup(const InspectedImage& i
     return Error::Make(ErrorCode::kCorruptedElf);
 
   // Compute layout addresses.
-  uintptr_t bloom_addr = base + 16;
-  uintptr_t buckets_addr = bloom_addr + static_cast<uintptr_t>(bloom_size) * 8;
-  uintptr_t chains_addr = buckets_addr + static_cast<uintptr_t>(nbuckets) * 4;
-
-  // Overflow checks.
-  if (bloom_addr < base || buckets_addr < bloom_addr || chains_addr < buckets_addr)
+  uintptr_t bloom_addr, buckets_addr, chains_addr, bloom_bytes, bucket_bytes;
+  if (!safe_add(base, 16, bloom_addr) ||
+      !safe_mul(bloom_size, sizeof(NativeElfAddr), bloom_bytes) ||
+      !safe_mul(nbuckets, sizeof(uint32_t), bucket_bytes) ||
+      !safe_add(bloom_addr, bloom_bytes, buckets_addr) ||
+      !safe_add(buckets_addr, bucket_bytes, chains_addr))
     return Error::Make(ErrorCode::kIntegerOverflow);
 
   // Validate bloom array bounds.
-  if (!image.addr_in_load(bloom_addr, static_cast<size_t>(bloom_size) * 8))
-    return Error::Make(ErrorCode::kCorruptedElf);
+  if (!image.addr_in_load(bloom_addr, bloom_bytes)) return Error::Make(ErrorCode::kCorruptedElf);
 
   // Validate bucket array bounds.
-  if (!image.addr_in_load(buckets_addr, static_cast<size_t>(nbuckets) * 4))
-    return Error::Make(ErrorCode::kCorruptedElf);
+  if (!image.addr_in_load(buckets_addr, bucket_bytes)) return Error::Make(ErrorCode::kCorruptedElf);
 
   uint32_t h = gnu_hash_value(name);
 
   // Bloom filter check.
   {
-    uint32_t word_idx = (h / 64) % bloom_size;
-    auto r_bloom = read_checked<uint64_t>(image, bloom_addr + static_cast<uintptr_t>(word_idx) * 8);
+    constexpr uint32_t bits = sizeof(NativeElfAddr) * 8;
+    uint32_t word_idx = (h / bits) % bloom_size;
+    auto r_bloom = read_checked<NativeElfAddr>(image, bloom_addr, word_idx);
     if (!r_bloom) return r_bloom.error();
-    uint64_t bloom_word = r_bloom.value();
-
-    uint64_t mask = (uint64_t(1) << (h % 64)) | (uint64_t(1) << ((h >> bloom_shift) % 64));
+    NativeElfAddr bloom_word = r_bloom.value();
+    NativeElfAddr mask =
+        (NativeElfAddr{1} << (h % bits)) | (NativeElfAddr{1} << ((h >> bloom_shift) % bits));
     if ((bloom_word & mask) != mask)
       return std::optional<uint32_t>(std::nullopt);  // Definitely not present.
   }
 
   // Bucket lookup.
   uint32_t bucket_idx = h % nbuckets;
-  auto r_sym_idx =
-      read_checked<uint32_t>(image, buckets_addr + static_cast<uintptr_t>(bucket_idx) * 4);
+  auto r_sym_idx = read_checked<uint32_t>(image, buckets_addr, bucket_idx);
   if (!r_sym_idx) return r_sym_idx.error();
   uint32_t sym_idx = r_sym_idx.value();
 
@@ -502,33 +557,25 @@ Expected<std::optional<uint32_t>, Error> gnu_hash_lookup(const InspectedImage& i
 
   for (;;) {
     uint32_t chain_idx = sym_idx - symoffset;
-    auto r_chain =
-        read_checked<uint32_t>(image, chains_addr + static_cast<uintptr_t>(chain_idx) * 4);
+    auto r_chain = read_checked<uint32_t>(image, chains_addr, chain_idx);
     if (!r_chain) return r_chain.error();
     uint32_t chain_val = r_chain.value();
 
     if ((chain_val & ~uint32_t(1)) == h1) {
       // Hash matches — compare the actual symbol name.
-      uintptr_t sym_addr = image.symtab + static_cast<uintptr_t>(sym_idx) * sizeof(Elf64_Sym);
-      auto r_sym = read_checked<Elf64_Sym>(image, sym_addr);
+      auto r_sym = read_checked<NativeElfSym>(image, image.symtab, sym_idx);
       if (!r_sym) return r_sym.error();
-      const Elf64_Sym& sym = r_sym.value();
+      const NativeElfSym& sym = r_sym.value();
 
-      // Validate name offset.
-      if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
-
-      const char* sym_name = reinterpret_cast<const char*>(image.strtab + sym.st_name);
-
-      // Verify the string is NUL-terminated within strsz.
-      size_t max_len = image.strsz - sym.st_name;
-      if (strnlen(sym_name, max_len) == max_len) return Error::Make(ErrorCode::kCorruptedElf);
-
-      if (std::strcmp(sym_name, name) == 0) return std::optional<uint32_t>(sym_idx);
+      auto text = symbol_name(image, sym.st_name);
+      if (!text) return text.error();
+      if (std::strcmp(text.value(), name) == 0) return std::optional<uint32_t>(sym_idx);
     }
 
     // End of chain?
     if (chain_val & 1) break;
 
+    if (sym_idx == UINT32_MAX) return Error::Make(ErrorCode::kIntegerOverflow);
     ++sym_idx;
   }
 
@@ -545,7 +592,7 @@ Expected<std::optional<uint32_t>, Error> sysv_hash_lookup(const InspectedImage& 
   uintptr_t base = image.sysv_hash;
 
   auto r_nbucket = read_checked<uint32_t>(image, base);
-  auto r_nchain = read_checked<uint32_t>(image, base + 4);
+  auto r_nchain = read_checked<uint32_t>(image, base, 1);
   if (!r_nbucket || !r_nchain) return Error::Make(ErrorCode::kCorruptedElf);
 
   uint32_t nbucket = r_nbucket.value();
@@ -553,24 +600,20 @@ Expected<std::optional<uint32_t>, Error> sysv_hash_lookup(const InspectedImage& 
 
   if (nbucket == 0) return Error::Make(ErrorCode::kCorruptedElf);
 
-  uintptr_t bucket_addr = base + 8;
-  uintptr_t chain_addr = bucket_addr + static_cast<uintptr_t>(nbucket) * 4;
-
-  // Overflow checks.
-  if (bucket_addr < base || chain_addr < bucket_addr)
+  uintptr_t bucket_addr, chain_addr, bucket_bytes, chain_bytes;
+  if (!safe_add(base, 8, bucket_addr) || !safe_mul(nbucket, sizeof(uint32_t), bucket_bytes) ||
+      !safe_mul(nchain, sizeof(uint32_t), chain_bytes) ||
+      !safe_add(bucket_addr, bucket_bytes, chain_addr))
     return Error::Make(ErrorCode::kIntegerOverflow);
 
   // Validate arrays.
-  if (!image.addr_in_load(bucket_addr, static_cast<size_t>(nbucket) * 4))
-    return Error::Make(ErrorCode::kCorruptedElf);
-  if (!image.addr_in_load(chain_addr, static_cast<size_t>(nchain) * 4))
-    return Error::Make(ErrorCode::kCorruptedElf);
+  if (!image.addr_in_load(bucket_addr, bucket_bytes)) return Error::Make(ErrorCode::kCorruptedElf);
+  if (!image.addr_in_load(chain_addr, chain_bytes)) return Error::Make(ErrorCode::kCorruptedElf);
 
   uint32_t h = elf_hash_value(name);
   uint32_t bucket_idx = h % nbucket;
 
-  auto r_sym_idx =
-      read_checked<uint32_t>(image, bucket_addr + static_cast<uintptr_t>(bucket_idx) * 4);
+  auto r_sym_idx = read_checked<uint32_t>(image, bucket_addr, bucket_idx);
   if (!r_sym_idx) return r_sym_idx.error();
   uint32_t sym_idx = r_sym_idx.value();
 
@@ -580,22 +623,16 @@ Expected<std::optional<uint32_t>, Error> sysv_hash_lookup(const InspectedImage& 
     if (sym_idx >= nchain) return Error::Make(ErrorCode::kCorruptedElf);
 
     // Read symbol.
-    uintptr_t sym_addr = image.symtab + static_cast<uintptr_t>(sym_idx) * sizeof(Elf64_Sym);
-    auto r_sym = read_checked<Elf64_Sym>(image, sym_addr);
+    auto r_sym = read_checked<NativeElfSym>(image, image.symtab, sym_idx);
     if (!r_sym) return r_sym.error();
-    const Elf64_Sym& sym = r_sym.value();
+    const NativeElfSym& sym = r_sym.value();
 
-    // Validate and compare name.
-    if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
-
-    const char* sym_name = reinterpret_cast<const char*>(image.strtab + sym.st_name);
-    size_t max_len = image.strsz - sym.st_name;
-    if (strnlen(sym_name, max_len) == max_len) return Error::Make(ErrorCode::kCorruptedElf);
-
-    if (std::strcmp(sym_name, name) == 0) return std::optional<uint32_t>(sym_idx);
+    auto text = symbol_name(image, sym.st_name);
+    if (!text) return text.error();
+    if (std::strcmp(text.value(), name) == 0) return std::optional<uint32_t>(sym_idx);
 
     // Next in chain.
-    auto r_next = read_checked<uint32_t>(image, chain_addr + static_cast<uintptr_t>(sym_idx) * 4);
+    auto r_next = read_checked<uint32_t>(image, chain_addr, sym_idx);
     if (!r_next) return r_next.error();
     sym_idx = r_next.value();
   }

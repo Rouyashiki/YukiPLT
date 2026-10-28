@@ -21,7 +21,7 @@
 ///
 /// On Linux/Android, <elf.h> provides these.  On other hosts (Windows, macOS)
 /// portable definitions are provided for other hosts.
-/// All values come from the ELF specification and AArch64 ELF ABI.
+/// Values come from the ELF specification and supported architecture ELF ABIs.
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <elf.h>
@@ -37,6 +37,67 @@ using Elf64_Word = uint32_t;
 using Elf64_Sword = int32_t;
 using Elf64_Xword = uint64_t;
 using Elf64_Sxword = int64_t;
+
+using Elf32_Addr = uint32_t;
+using Elf32_Off = uint32_t;
+using Elf32_Half = uint16_t;
+using Elf32_Word = uint32_t;
+using Elf32_Sword = int32_t;
+
+struct Elf32_Ehdr {
+  unsigned char e_ident[16];
+  Elf32_Half e_type;
+  Elf32_Half e_machine;
+  Elf32_Word e_version;
+  Elf32_Addr e_entry;
+  Elf32_Off e_phoff;
+  Elf32_Off e_shoff;
+  Elf32_Word e_flags;
+  Elf32_Half e_ehsize;
+  Elf32_Half e_phentsize;
+  Elf32_Half e_phnum;
+  Elf32_Half e_shentsize;
+  Elf32_Half e_shnum;
+  Elf32_Half e_shstrndx;
+};
+struct Elf32_Phdr {
+  Elf32_Word p_type;
+  Elf32_Off p_offset;
+  Elf32_Addr p_vaddr;
+  Elf32_Addr p_paddr;
+  Elf32_Word p_filesz;
+  Elf32_Word p_memsz;
+  Elf32_Word p_flags;
+  Elf32_Word p_align;
+};
+struct Elf32_Dyn {
+  Elf32_Sword d_tag;
+  union {
+    Elf32_Word d_val;
+    Elf32_Addr d_ptr;
+  } d_un;
+};
+struct Elf32_Sym {
+  Elf32_Word st_name;
+  Elf32_Addr st_value;
+  Elf32_Word st_size;
+  unsigned char st_info;
+  unsigned char st_other;
+  Elf32_Half st_shndx;
+};
+struct Elf32_Rel {
+  Elf32_Addr r_offset;
+  Elf32_Word r_info;
+};
+struct Elf32_Rela {
+  Elf32_Addr r_offset;
+  Elf32_Word r_info;
+  Elf32_Sword r_addend;
+};
+struct Elf64_Rel {
+  Elf64_Addr r_offset;
+  Elf64_Xword r_info;
+};
 
 // --- ELF Header ---
 #define EI_NIDENT 16
@@ -112,6 +173,7 @@ struct Elf64_Rela {
 #define ELFMAG3 'F'
 
 #define ELFCLASS64 2
+#define ELFCLASS32 1
 #define ELFDATA2LSB 1
 #define EV_CURRENT 1
 
@@ -145,6 +207,9 @@ struct Elf64_Rela {
 #define DT_RELAENT 9
 #define DT_STRSZ 10
 #define DT_SYMENT 11
+#define DT_REL 17
+#define DT_RELSZ 18
+#define DT_RELENT 19
 #define DT_PLTREL 20
 #define DT_JMPREL 23
 
@@ -184,6 +249,11 @@ struct Elf64_Verdaux {
   Elf64_Word vda_next;
 };
 
+using Elf32_Verneed = Elf64_Verneed;
+using Elf32_Vernaux = Elf64_Vernaux;
+using Elf32_Verdef = Elf64_Verdef;
+using Elf32_Verdaux = Elf64_Verdaux;
+
 // --- Relocation info macros ---
 #define ELF64_R_SYM(info) ((info) >> 32)
 #define ELF64_R_TYPE(info) ((info) & 0xffffffffULL)
@@ -209,9 +279,73 @@ struct Elf64_Verdaux {
 
 #endif  // __linux__ || __ANDROID__
 
-/// \brief YukiPLT error types.
-
 namespace yukiplt {
+
+// The spelling changes with the compilation ABI; the ARM64 aliases are the
+// original ELF64 types, preserving the existing public layout and type identity.
+#if YUKIPLT_ELF_BITS == 64
+using NativeElfEhdr = Elf64_Ehdr;
+using NativeElfPhdr = Elf64_Phdr;
+using NativeElfDyn = Elf64_Dyn;
+using NativeElfSym = Elf64_Sym;
+using NativeElfAddr = Elf64_Addr;
+using NativeElfRel = Elf64_Rel;
+using NativeElfRela = Elf64_Rela;
+using NativeElfRelocation = Elf64_Rela;
+using NativeElfVerneed = Elf64_Verneed;
+using NativeElfVernaux = Elf64_Vernaux;
+using NativeElfVerdef = Elf64_Verdef;
+using NativeElfVerdaux = Elf64_Verdaux;
+#else
+using NativeElfEhdr = Elf32_Ehdr;
+using NativeElfPhdr = Elf32_Phdr;
+using NativeElfDyn = Elf32_Dyn;
+using NativeElfSym = Elf32_Sym;
+using NativeElfAddr = Elf32_Addr;
+using NativeElfRel = Elf32_Rel;
+using NativeElfRela = Elf32_Rela;
+using NativeElfRelocation = Elf32_Rel;
+using NativeElfVerneed = Elf32_Verneed;
+using NativeElfVernaux = Elf32_Vernaux;
+using NativeElfVerdef = Elf32_Verdef;
+using NativeElfVerdaux = Elf32_Verdaux;
+#endif
+using NativeElfHalf = uint16_t;
+using NativeElfWord = uint32_t;
+
+inline constexpr bool kNativeUsesRela = YUKIPLT_USES_RELA != 0;
+inline constexpr size_t kNativeSlotSize = YUKIPLT_ELF_BITS / 8;
+inline constexpr uint16_t kNativeMachine = YUKIPLT_ELF_MACHINE;
+inline constexpr uint32_t kNativeJumpSlot = YUKIPLT_RELOC_JUMP_SLOT;
+inline constexpr uint32_t kNativeGlobDat = YUKIPLT_RELOC_GLOB_DAT;
+inline constexpr uint32_t kNativeRelative = YUKIPLT_RELOC_RELATIVE;
+inline constexpr uint32_t kNativeIRelative = YUKIPLT_RELOC_IRELATIVE;
+inline constexpr uint32_t kNativeAbsolute = YUKIPLT_RELOC_ABSOLUTE;
+
+constexpr uint32_t native_reloc_symbol(uint64_t info) noexcept {
+  return static_cast<uint32_t>(info >> (kNativeUsesRela ? 32 : 8));
+}
+constexpr uint32_t native_reloc_type(uint64_t info) noexcept {
+  return static_cast<uint32_t>(info & (kNativeUsesRela ? UINT64_C(0xffffffff) : UINT64_C(0xff)));
+}
+constexpr NativeElfAddr native_reloc_info(uint32_t symbol, uint32_t type) noexcept {
+  return static_cast<NativeElfAddr>((uint64_t{symbol} << (kNativeUsesRela ? 32 : 8)) |
+                                    (type & (kNativeUsesRela ? UINT32_MAX : UINT32_C(0xff))));
+}
+constexpr int64_t native_reloc_addend(const NativeElfRelocation& reloc) noexcept {
+#if YUKIPLT_USES_RELA
+  return reloc.r_addend;
+#else
+  // Android REL JUMP_SLOT/GLOB_DAT do not consume an implicit GOT addend.
+  (void)reloc;
+  return 0;
+#endif
+}
+
+static_assert(sizeof(uintptr_t) == kNativeSlotSize, "Native ABI and pointer width disagree");
+static_assert(sizeof(NativeElfAddr) == kNativeSlotSize);
+
+/// \brief YukiPLT error types.
 
 // Fixed C/C++ error values; new codes append without reuse. Use diagnosed
 // causes and errno to distinguish failures. Retry and recovery also depend on
@@ -516,7 +650,7 @@ class [[nodiscard]] Expected<void, E> {
 
 }  // namespace yukiplt::detail
 
-/// \brief YukiPLT public API — PLT/GOT hooking for ARM64 ELF.
+/// \brief YukiPLT public API — PLT/GOT hooking for native Android ELF.
 ///
 /// ## Quick start
 ///
@@ -536,7 +670,8 @@ class [[nodiscard]] Expected<void, E> {
 ///
 /// ## Semantics
 ///
-/// - Android runtime support starts at API 23 (Android 6.0), ARM64 only.
+/// - Android API23+: ARM64/ARM32 guaranteed; x86_64/x86 environment-dependent.
+///   Each binary handles only its process's native ABI; other ISAs are rejected.
 ///   Android API 21 and 22 are not supported.
 ///
 /// - PLT hooks only intercept calls that go through the target image's GOT.
@@ -631,13 +766,13 @@ using Result = detail::Expected<T, Error>;
 // caller-managed custom loads. Mislabeling bypasses or fails system validation.
 // The view carries neither a path nor a load generation.
 struct ImageView {
-  uintptr_t load_bias;           ///< Runtime load bias (dlpi_addr).
-  const Elf64_Phdr* phdr_table;  ///< Program header table address.
-  size_t phdr_count;             ///< Number of program headers.
-  uint64_t instance_token = 0;   ///< 0 = system-linker image; else custom load id.
+  uintptr_t load_bias;                       ///< Runtime load bias (dlpi_addr).
+  const yukiplt::NativeElfPhdr* phdr_table;  ///< Program header table address.
+  size_t phdr_count;                         ///< Number of program headers.
+  uint64_t instance_token = 0;               ///< 0 = system-linker image; else custom load id.
 };
 
-/// One named R_AARCH64_JUMP_SLOT record, copied from DT_JMPREL.
+/// One named YUKIPLT_RELOC_JUMP_SLOT record, copied from DT_JMPREL.
 /// Addresses and indices are diagnostic metadata, not an installation token.
 struct ImportInfo {
   std::string symbol;
@@ -825,16 +960,28 @@ enum RelocationSourceBit : uint32_t {
   kSourceJmprel = 1u << 0,       ///< DT_JMPREL (PLT relocations).
   kSourceRela = 1u << 1,         ///< DT_RELA (.rela.dyn).
   kSourceAndroidRela = 1u << 2,  ///< DT_ANDROID_RELA (APS2 packed).
+  kSourceRel = 1u << 3,          ///< DT_REL (.rel.dyn), native REL ABIs only.
+  kSourceAndroidRel = 1u << 4,   ///< DT_ANDROID_REL (APS2 packed), native REL ABIs only.
 };
+
+inline constexpr uint32_t kSourceNativeDynamic = kNativeUsesRela ? kSourceRela : kSourceRel;
+inline constexpr uint32_t kSourceNativeAndroidPacked =
+    kNativeUsesRela ? kSourceAndroidRela : kSourceAndroidRel;
 
 /// Which relocation types to accept (a bitmask over these bits).
 enum RelocationTypeBit : uint32_t {
-  kTypeJumpSlot = 1u << 0,  ///< R_AARCH64_JUMP_SLOT.
-  kTypeGlobDat = 1u << 1,   ///< R_AARCH64_GLOB_DAT (function, addend 0, UND FUNC).
+  kTypeJumpSlot = 1u << 0,  ///< YUKIPLT_RELOC_JUMP_SLOT.
+  kTypeGlobDat = 1u << 1,   ///< YUKIPLT_RELOC_GLOB_DAT (function, addend 0, UND FUNC).
 };
 
 /// The table a decoded function import came from.
-enum class RelocationSource : uint8_t { kJmprel, kRela, kAndroidRela };
+enum class RelocationSource : uint8_t {
+  kJmprel = 0,
+  kRela = 1,
+  kAndroidRela = 2,
+  kRel = 3,
+  kAndroidRel = 4
+};
 
 /// One function import, with its relocation source and type.  `base` carries the
 /// name, symbol index, version metadata and slot address; `base.import`'s
@@ -842,7 +989,7 @@ enum class RelocationSource : uint8_t { kJmprel, kRela, kAndroidRela };
 struct FunctionImport {
   VersionedImport base;
   RelocationSource source = RelocationSource::kJmprel;
-  uint32_t relocation_type = 0;  ///< R_AARCH64_* value as found.
+  uint32_t relocation_type = 0;  ///< Native relocation value as found.
   uint8_t symbol_type = 0;       ///< ELF symbol type (STT_*).
 };
 

@@ -44,12 +44,12 @@ struct VersionedElf {
     ElfBuilder builder;
     builder.add_symbol("versioned", 1).add_symbol("versioned", 2).add_jump_slot(1).add_jump_slot(2);
     image = builder.build();
-    std::vector<Elf64_Dyn> tags;
+    std::vector<yukiplt::NativeElfDyn> tags;
     const auto phdr = image.phdr_table()[1];
     size_t old_strings = 0;
     size_t old_string_size = 0;
-    for (size_t offset = phdr.p_vaddr;; offset += sizeof(Elf64_Dyn)) {
-      auto tag = get<Elf64_Dyn>(offset);
+    for (size_t offset = phdr.p_vaddr;; offset += sizeof(yukiplt::NativeElfDyn)) {
+      auto tag = get<yukiplt::NativeElfDyn>(offset);
       if (tag.d_tag == DT_NULL) break;
       if (tag.d_tag == DT_SYMTAB) symtab = tag.d_un.d_ptr;
       if (tag.d_tag == DT_STRTAB) old_strings = tag.d_un.d_ptr;
@@ -69,35 +69,36 @@ struct VersionedElf {
     const auto file = add_string("libversions.so");
     strings = image.buffer.size();
     image.buffer.insert(image.buffer.end(), str.begin(), str.end());
-    versym = append<Elf64_Half>(0);
-    append<Elf64_Half>(2 | 0x8000);
-    append<Elf64_Half>(3);
+    versym = append<yukiplt::NativeElfHalf>(0);
+    append<yukiplt::NativeElfHalf>(2 | 0x8000);
+    append<yukiplt::NativeElfHalf>(3);
     if (!definition) {
-      need = append<Elf64_Verneed>({1, 2, file, sizeof(Elf64_Verneed), 0});
-      append<Elf64_Vernaux>({detail::elf_hash_value("VERSION_1"), 0, 2,
-                             static_cast<uint32_t>(version_name[0]), sizeof(Elf64_Vernaux)});
-      append<Elf64_Vernaux>(
+      need = append<yukiplt::NativeElfVerneed>({1, 2, file, sizeof(yukiplt::NativeElfVerneed), 0});
+      append<yukiplt::NativeElfVernaux>({detail::elf_hash_value("VERSION_1"), 0, 2,
+                                         static_cast<uint32_t>(version_name[0]),
+                                         sizeof(yukiplt::NativeElfVernaux)});
+      append<yukiplt::NativeElfVernaux>(
           {detail::elf_hash_value("VERSION_2"), 0, 3, static_cast<uint32_t>(version_name[1]), 0});
       for (size_t i : {size_t{1}, size_t{2}}) {
-        auto symbol = get<Elf64_Sym>(symtab + i * sizeof(Elf64_Sym));
+        auto symbol = get<yukiplt::NativeElfSym>(symtab + i * sizeof(yukiplt::NativeElfSym));
         symbol.st_shndx = SHN_UNDEF;
-        put(symtab + i * sizeof(Elf64_Sym), symbol);
+        put(symtab + i * sizeof(yukiplt::NativeElfSym), symbol);
       }
     } else {
-      need = append<Elf64_Verdef>({1, 0, 2, 1, detail::elf_hash_value("VERSION_1"),
-                                   sizeof(Elf64_Verdef),
-                                   sizeof(Elf64_Verdef) + sizeof(Elf64_Verdaux)});
-      append<Elf64_Verdaux>({static_cast<uint32_t>(version_name[0]), 0});
-      append<Elf64_Verdef>(
-          {1, 0, 3, 1, detail::elf_hash_value("VERSION_2"), sizeof(Elf64_Verdef), 0});
-      append<Elf64_Verdaux>({static_cast<uint32_t>(version_name[1]), 0});
+      need = append<yukiplt::NativeElfVerdef>(
+          {1, 0, 2, 1, detail::elf_hash_value("VERSION_1"), sizeof(yukiplt::NativeElfVerdef),
+           sizeof(yukiplt::NativeElfVerdef) + sizeof(yukiplt::NativeElfVerdaux)});
+      append<yukiplt::NativeElfVerdaux>({static_cast<uint32_t>(version_name[0]), 0});
+      append<yukiplt::NativeElfVerdef>(
+          {1, 0, 3, 1, detail::elf_hash_value("VERSION_2"), sizeof(yukiplt::NativeElfVerdef), 0});
+      append<yukiplt::NativeElfVerdaux>({static_cast<uint32_t>(version_name[1]), 0});
     }
     for (auto& tag : tags) {
       if (tag.d_tag == DT_STRTAB) tag.d_un.d_ptr = strings;
       if (tag.d_tag == DT_STRSZ) tag.d_un.d_val = str.size();
     }
     auto tag = [](int64_t kind, uint64_t value) {
-      Elf64_Dyn result{};
+      yukiplt::NativeElfDyn result{};
       result.d_tag = kind;
       result.d_un.d_val = value;
       return result;
@@ -108,18 +109,18 @@ struct VersionedElf {
     tags.push_back(tag(DT_NULL, 0));
     dynamic = append(tags[0]);
     for (size_t i = 1; i < tags.size(); ++i) append(tags[i]);
-    auto load = get<Elf64_Phdr>(0);
+    auto load = get<yukiplt::NativeElfPhdr>(0);
     load.p_memsz = load.p_filesz = image.buffer.size();
     put(0, load);
     auto dyn = phdr;
     dyn.p_vaddr = dyn.p_offset = dynamic;
-    dyn.p_memsz = dyn.p_filesz = tags.size() * sizeof(Elf64_Dyn);
-    put(sizeof(Elf64_Phdr), dyn);
+    dyn.p_memsz = dyn.p_filesz = tags.size() * sizeof(yukiplt::NativeElfDyn);
+    put(sizeof(yukiplt::NativeElfPhdr), dyn);
   }
 
   void change_tag(int64_t wanted, int64_t replacement, uint64_t value) {
-    for (size_t offset = dynamic;; offset += sizeof(Elf64_Dyn)) {
-      auto tag = get<Elf64_Dyn>(offset);
+    for (size_t offset = dynamic;; offset += sizeof(yukiplt::NativeElfDyn)) {
+      auto tag = get<yukiplt::NativeElfDyn>(offset);
       if (tag.d_tag == DT_NULL) return;
       if (tag.d_tag != wanted) continue;
       tag.d_tag = replacement;

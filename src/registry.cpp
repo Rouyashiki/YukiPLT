@@ -38,9 +38,12 @@ bool Registry::slot_is_live(uintptr_t addr) const noexcept {
 }
 
 namespace {
-// Fibonacci hashing of a GOT slot address (8-byte aligned, so drop low bits).
+// Fibonacci hashing of a GOT slot address; retain the distinguishing bit of
+// adjacent 4-byte slots on a 32-bit process.
 inline size_t slot_hash(uintptr_t addr, size_t mask) noexcept {
-  return static_cast<size_t>((static_cast<uint64_t>(addr >> 3) * 0x9E3779B97F4A7C15ull) >> 17) &
+  return static_cast<size_t>((static_cast<uint64_t>(addr >> (sizeof(uintptr_t) == 8 ? 3 : 2)) *
+                              0x9E3779B97F4A7C15ull) >>
+                             17) &
          mask;
 }
 }  // namespace

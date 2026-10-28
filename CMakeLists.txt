@@ -11,7 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(YUKIPLT_COMPILE_OPTIONS -Wall -Wextra -Wpedantic -Werror)
 
 if(ANDROID)
-    set(_yukiplt_abis arm64-v8a)
+    set(_yukiplt_abis arm64-v8a armeabi-v7a x86_64 x86)
     if(NOT ANDROID_ABI IN_LIST _yukiplt_abis)
         message(FATAL_ERROR "Unsupported Android ABI: ${ANDROID_ABI}")
     endif()

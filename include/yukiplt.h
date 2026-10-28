@@ -7,6 +7,56 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Native ABI selection shared by C and C++ callers.
+
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define YUKIPLT_ELF_BITS 64
+#define YUKIPLT_ELF_MACHINE 183
+#define YUKIPLT_RELOC_JUMP_SLOT 1026
+#define YUKIPLT_RELOC_GLOB_DAT 1025
+#define YUKIPLT_RELOC_RELATIVE 1027
+#define YUKIPLT_RELOC_IRELATIVE 1032
+#define YUKIPLT_RELOC_ABSOLUTE 257
+#elif defined(__arm__) || defined(_M_ARM)
+#define YUKIPLT_ELF_BITS 32
+#define YUKIPLT_ELF_MACHINE 40
+#define YUKIPLT_RELOC_JUMP_SLOT 22
+#define YUKIPLT_RELOC_GLOB_DAT 21
+#define YUKIPLT_RELOC_RELATIVE 23
+#define YUKIPLT_RELOC_IRELATIVE 160
+#define YUKIPLT_RELOC_ABSOLUTE 2
+#elif defined(__x86_64__) || defined(_M_X64)
+#define YUKIPLT_ELF_BITS 64
+#define YUKIPLT_ELF_MACHINE 62
+#define YUKIPLT_RELOC_JUMP_SLOT 7
+#define YUKIPLT_RELOC_GLOB_DAT 6
+#define YUKIPLT_RELOC_RELATIVE 8
+#define YUKIPLT_RELOC_IRELATIVE 37
+#define YUKIPLT_RELOC_ABSOLUTE 1
+#elif defined(__i386__) || defined(_M_IX86)
+#define YUKIPLT_ELF_BITS 32
+#define YUKIPLT_ELF_MACHINE 3
+#define YUKIPLT_RELOC_JUMP_SLOT 7
+#define YUKIPLT_RELOC_GLOB_DAT 6
+#define YUKIPLT_RELOC_RELATIVE 8
+#define YUKIPLT_RELOC_IRELATIVE 42
+#define YUKIPLT_RELOC_ABSOLUTE 1
+#else
+#error "YukiPLT supports only ARM64, ARM32, x86_64 and x86"
+#endif
+
+#if YUKIPLT_ELF_BITS == 64
+#define YUKIPLT_USES_RELA 1
+#define YUKIPLT_ELF_CLASS 2
+#else
+#define YUKIPLT_USES_RELA 0
+#define YUKIPLT_ELF_CLASS 1
+#endif
+
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
+#error "YukiPLT supports only little-endian targets"
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #define YUKIPLT_C_NOEXCEPT noexcept
@@ -65,7 +115,7 @@ typedef struct yukiplt_c_handle {
 } yukiplt_c_handle;
 typedef struct yukiplt_c_image {
   uintptr_t load_bias;
-  const void* program_headers;  // ELF64 Program Headers, kept readable by caller.
+  const void* program_headers;  // Native ABI Program Headers, kept readable by caller.
   size_t program_header_count;
   uint64_t instance_token;  // 0: system linker; otherwise unique custom load.
 } yukiplt_c_image;
@@ -93,32 +143,41 @@ typedef struct yukiplt_c_slot_report {
 
 // --- Function GLOB_DAT / APS2 (opt-in, added in ABI v1; see yukiplt.h) ---
 //
-// These extend selection/installation to R_AARCH64_GLOB_DAT function slots in
+// These extend selection/installation to GLOB_DAT function slots in
 // DT_RELA and DT_ANDROID_RELA, alongside JUMP_SLOT.  They are strictly opt-in:
 // the caller names the relocation sources and types.  v1's existing structs and
 // functions are unchanged; a caller probes availability with
 // yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS).
 enum {
-  YUKIPLT_C_SOURCE_JMPREL = 1u << 0,       // DT_JMPREL (PLT).
-  YUKIPLT_C_SOURCE_RELA = 1u << 1,         // DT_RELA (.rela.dyn).
-  YUKIPLT_C_SOURCE_ANDROID_RELA = 1u << 2  // DT_ANDROID_RELA (APS2 packed).
+  YUKIPLT_C_SOURCE_JMPREL = 1u << 0,        // DT_JMPREL (PLT).
+  YUKIPLT_C_SOURCE_RELA = 1u << 1,          // DT_RELA (.rela.dyn).
+  YUKIPLT_C_SOURCE_ANDROID_RELA = 1u << 2,  // DT_ANDROID_RELA (APS2 packed).
+  YUKIPLT_C_SOURCE_REL = 1u << 3,
+  YUKIPLT_C_SOURCE_ANDROID_REL = 1u << 4,
+  YUKIPLT_C_SOURCE_NATIVE_DYNAMIC =
+      YUKIPLT_USES_RELA ? YUKIPLT_C_SOURCE_RELA : YUKIPLT_C_SOURCE_REL,
+  YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED =
+      YUKIPLT_USES_RELA ? YUKIPLT_C_SOURCE_ANDROID_RELA : YUKIPLT_C_SOURCE_ANDROID_REL
 };
 enum {
-  YUKIPLT_C_TYPE_JUMP_SLOT = 1u << 0,  // R_AARCH64_JUMP_SLOT.
-  YUKIPLT_C_TYPE_GLOB_DAT = 1u << 1    // R_AARCH64_GLOB_DAT (function, addend 0, UND FUNC).
+  YUKIPLT_C_TYPE_JUMP_SLOT = 1u << 0,  // JUMP_SLOT.
+  YUKIPLT_C_TYPE_GLOB_DAT = 1u << 1    // GLOB_DAT (function, addend 0, UND FUNC).
 };
 // Scopes a relocation_index filter to one table (matches the source bits' order).
 enum {
   YUKIPLT_C_RELOC_SOURCE_JMPREL = 0,
   YUKIPLT_C_RELOC_SOURCE_RELA = 1,
-  YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA = 2
+  YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA = 2,
+  YUKIPLT_C_RELOC_SOURCE_REL = 3,
+  YUKIPLT_C_RELOC_SOURCE_ANDROID_REL = 4
 };
 enum {
   YUKIPLT_C_FEATURE_FUNCTION_IMPORTS = 1,
   YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS = 2,
   YUKIPLT_C_FEATURE_ERROR_NAMES = 3,
   YUKIPLT_C_FEATURE_EXPECTED_CURRENT = 4,
-  YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY = 5
+  YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY = 5,
+  YUKIPLT_C_FEATURE_REL_IMPORTS = 6
 };
 
 enum {
@@ -170,7 +229,8 @@ typedef struct yukiplt_c_function_selector {
 } yukiplt_c_function_selector;
 #define YUKIPLT_C_FUNCTION_SELECTOR(name)                                             \
   {(uint32_t)sizeof(yukiplt_c_function_selector),                                     \
-   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_RELA | YUKIPLT_C_SOURCE_ANDROID_RELA,   \
+   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
+       YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
    YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
    YUKIPLT_C_SELECTOR(name)}
 typedef struct yukiplt_c_function_request {
@@ -179,7 +239,7 @@ typedef struct yukiplt_c_function_request {
   void** out_original;
 } yukiplt_c_function_request;
 
-// ABI v1 targets ARM64 Android API23+. No STL, allocation ownership or C++
+// ABI v1 targets native ARM64/ARM32/x86_64/x86 Android API23+. No STL, allocation ownership or C++
 // exceptions cross this boundary. Error values match the C++ core. No operation
 // silently succeeds after partial commit: INDETERMINATE retains a valid token.
 uint32_t yukiplt_c_abi_version(void) YUKIPLT_C_NOEXCEPT;

@@ -336,7 +336,7 @@ const PlatformOps& system_ops() noexcept {
 
 Expected<void, Error> patch_slot(uintptr_t slot_addr, uintptr_t expected_old, uintptr_t desired_new,
                                  const InspectedImage& image) {
-  if (slot_addr % 8 != 0) return Error::Make(ErrorCode::kInvalidArgument);
+  if (slot_addr % sizeof(uintptr_t) != 0) return Error::Make(ErrorCode::kInvalidArgument);
 
   // The slot's ELF identity must check out: it lies inside a writable (PF_W)
   // PT_LOAD segment of the image we were asked to patch.  (Page *permission*
@@ -384,12 +384,12 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   if ((slot_count > 0 && slots == nullptr) || (extra_count > 0 && extra_pages == nullptr))
     return Error::Make(ErrorCode::kNullPointer);
 
-  // Slots: 8-byte aligned (so a slot never straddles a page and the CAS is
+  // Slots: pointer aligned (so a slot never straddles a page and the CAS is
   // a single aligned access) and unique.
   slots_.clear();
   slots_.reserve(slot_count);
   for (size_t i = 0; i < slot_count; ++i) {
-    if (slots[i] % 8 != 0) return Error::Make(ErrorCode::kInvalidArgument);
+    if (slots[i] % sizeof(uintptr_t) != 0) return Error::Make(ErrorCode::kInvalidArgument);
     slots_.push_back(slots[i]);
   }
   std::sort(slots_.begin(), slots_.end());

@@ -433,7 +433,7 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
     ps.report_index = i;
     // Only a GLOB_DAT slot must refuse a zero current value; a JUMP_SLOT slot is
     // installed regardless (its lazy stub value is non-zero and legitimate).
-    ps.reject_zero_original = record.relocation_type == detail::kRAarch64GlobDat;
+    ps.reject_zero_original = record.relocation_type == detail::kRelGlobDat;
     if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
       ps.require_current = reqs[i].require_current;
       ps.expected_current = reqs[i].expected_current;
@@ -1101,8 +1101,11 @@ Result<VersionedImport> find_import(const ImageView& image, const ImportSelector
 Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, uint32_t sources) {
   // Validate the source mask before any image access: a zero or out-of-range
   // mask is a programming error, not an image problem.
-  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela)) != 0)
+  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela | kSourceRel |
+                                   kSourceAndroidRel)) != 0)
     return Error::Make(ErrorCode::kInvalidArgument);
+  if (sources & ~(kSourceJmprel | kSourceNativeDynamic | kSourceNativeAndroidPacked))
+    return Error::Make(ErrorCode::kUnsupportedFormat);
   return inspect_metadata<FunctionImportSnapshot>(
       image, [&](const InspectedImage& inspected) -> Result<FunctionImportSnapshot> {
         return detail::snapshot_function_imports(inspected, sources);

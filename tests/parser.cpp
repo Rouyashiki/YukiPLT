@@ -50,6 +50,39 @@ TEST(ElfInspector, RejectsDynamicReadWithoutReadableLoadAndUnalignedEntries) {
             ErrorCode::kCorruptedElf);
 }
 
+TEST(ElfInspector, ProgramHeaderViewMustMatchTheElfHeader) {
+  ElfBuilder b;
+  b.with_elf_header().add_symbol("f", 1).add_jump_slot(1).set_relro(true);
+  auto img = b.build();
+  ASSERT_TRUE(inspect(img.load_bias(), img.phdr_table(), img.phdr_count).has_value());
+
+  auto short_view = inspect(img.load_bias(), img.phdr_table(), img.phdr_count - 1);
+  ASSERT_FALSE(short_view.has_value());
+  EXPECT_EQ(short_view.error().code, ErrorCode::kCorruptedElf);
+
+  std::vector<yukiplt::NativeElfPhdr> copy(img.phdr_table(), img.phdr_table() + img.phdr_count);
+  EXPECT_TRUE(inspect(img.load_bias(), copy.data(), copy.size()).has_value());
+
+  auto shifted = img;
+  const size_t table_bytes = img.phdr_count * sizeof(yukiplt::NativeElfPhdr);
+  const size_t moved = (img.buffer.size() + 15) & ~size_t{15};
+  shifted.buffer.resize(moved + table_bytes, 0);
+  std::memcpy(shifted.buffer.data() + moved, shifted.buffer.data() + img.phdr_offset, table_bytes);
+  auto* load = reinterpret_cast<yukiplt::NativeElfPhdr*>(shifted.buffer.data() + moved);
+  ASSERT_EQ(load[0].p_type, static_cast<uint32_t>(PT_LOAD));
+  load[0].p_filesz = load[0].p_memsz = shifted.buffer.size();
+
+  std::memcpy(shifted.buffer.data() + img.phdr_offset, load, table_bytes);
+  ASSERT_TRUE(inspect(shifted.load_bias(),
+                      reinterpret_cast<const yukiplt::NativeElfPhdr*>(shifted.buffer.data() +
+                                                                      img.phdr_offset),
+                      img.phdr_count)
+                  .has_value());
+  auto moved_view = inspect(shifted.load_bias(), load, img.phdr_count);
+  ASSERT_FALSE(moved_view.has_value());
+  EXPECT_EQ(moved_view.error().code, ErrorCode::kCorruptedElf);
+}
+
 TEST(ElfInspector, MissingDtNull) {
   ElfBuilder b;
   b.add_symbol("f", 1);

@@ -132,14 +132,25 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
   if (!count) return count.error();
   if (!readable(image, image.strtab, image.strsz)) return Error::Make(ErrorCode::kOutOfBounds);
 
+  // Every non-NONE DT_JMPREL record is a write to its destination, named or
+  // not, so all of them take part in the duplicate-slot check — the same rule
+  // the function-import scan applies to the tables it reads.  (This legacy
+  // path reads only DT_JMPREL and has no scan budget; see yukiplt.h.)
   std::vector<uintptr_t> addresses;
   for (size_t i = 0; i < image.jmprel_count; ++i) {
     auto record = read<NativeElfRelocation>(image, image.jmprel, i);
     if (!record) return record.error();
     const auto& rela = record.value();
     const auto symbol_index = static_cast<uint32_t>(native_reloc_symbol(rela.r_info));
-    if (native_reloc_type(rela.r_info) != YUKIPLT_RELOC_JUMP_SLOT || symbol_index == 0) {
+    const auto type = native_reloc_type(rela.r_info);
+    if (type != YUKIPLT_RELOC_JUMP_SLOT || symbol_index == 0) {
       ++snapshot.skipped_relocations;
+      if (type != 0) {
+        uintptr_t destination;
+        if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), destination))
+          return Error::Make(ErrorCode::kIntegerOverflow);
+        addresses.push_back(destination);
+      }
       continue;
     }
     if (symbol_index >= count.value()) return Error::Make(ErrorCode::kCorruptedElf);
@@ -254,7 +265,14 @@ Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionSca
   if ((next != scan.ranges.end() && next->first < end) ||
       (next != scan.ranges.begin() && std::prev(next)->second > address))
     return Error::Make(ErrorCode::kCorruptedElf);
-  if (Error e = scan.budget.take_objects<std::pair<uintptr_t, uintptr_t>>(1)) return e;
+  // Charge a node-based map entry at its real cost: the pair plus the parent,
+  // left, right links and color a red-black tree node carries (R-10).
+  struct RangeNodeCost {
+    void* links[3];
+    uintptr_t color;
+    std::pair<uintptr_t, uintptr_t> value;
+  };
+  if (Error e = scan.budget.take_objects<RangeNodeCost>(1)) return e;
   scan.ranges.emplace_hint(next, address, end);
   return value;
 }
@@ -738,6 +756,9 @@ struct ScanState {
   const InspectedImage& image;
   RawFunctionSnapshot& result;
   ScanBudget& budget;
+  /// Destination of every non-NONE record.  Duplicates are detected as each
+  /// record is decoded (AGENTS: checked early, before later records or
+  /// version metadata are materialized), so this is an ordered set.
   std::set<uintptr_t> slots;
   size_t symbol_bound = 0;
   bool symbols_ready = false;
@@ -791,7 +812,14 @@ Error keep(ScanState& state, const DecodedReloc& reloc) {
   if (reloc.type != 0) {
     if (state.slots.find(reloc.slot_address) != state.slots.end())
       return Error::Make(ErrorCode::kCorruptedElf);
-    if (Error e = state.budget.take_objects<uintptr_t>(1)) return e;
+    // Charge the set entry at its node size, not just the 8-byte key (R-10):
+    // a red-black node carries parent/left/right links and a color.
+    struct SlotNodeCost {
+      void* links[3];
+      uintptr_t color;
+      uintptr_t key;
+    };
+    if (Error e = state.budget.take_objects<SlotNodeCost>(1)) return e;
     state.slots.insert(reloc.slot_address);
   }
   if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
@@ -868,6 +896,7 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
   if (sources & kSourceNativeAndroidPacked) {
     if (Error e = decode_android_packed(image, visit_record, &state, &budget)) return e;
   }
+  state.slots = {};
 
   // Attach version metadata over the whole set, preserving order.
   std::vector<ImportInfo> infos;

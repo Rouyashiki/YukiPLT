@@ -258,6 +258,16 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
     if (ident[EI_VERSION] != EV_CURRENT || header.e_version != EV_CURRENT ||
         header.e_ehsize != sizeof(NativeElfEhdr) || header.e_phentsize != sizeof(NativeElfPhdr))
       return Error::Make(ErrorCode::kCorruptedElf);
+    // Require the image's PHDR count. An in-image table must match a canonical
+    // e_phoff copy in a zero-offset LOAD; external copied tables are allowed.
+    if (header.e_phnum != phdr_count) return Error::Make(ErrorCode::kCorruptedElf);
+    const auto table = reinterpret_cast<uintptr_t>(phdr_table);
+    if (image.addr_in_load(table, phdr_count * sizeof(NativeElfPhdr))) {
+      uintptr_t expected;
+      if (!safe_add(address, static_cast<uintptr_t>(header.e_phoff), expected))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+      if (expected != table) return Error::Make(ErrorCode::kCorruptedElf);
+    }
   }
 
   // Validate and compute PT_DYNAMIC runtime range.

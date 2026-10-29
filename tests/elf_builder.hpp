@@ -197,8 +197,8 @@ class ElfBuilder {
     return *this;
   }
 
-  /// Truncate the dynamic section to this many entries (for testing).
-  /// 0 means no truncation.
+  /// Keep only the first `max_entries` dynamic tags, still followed by DT_NULL
+  /// (for testing missing tags).  0 means no truncation.
   ElfBuilder& truncate_dynamic(size_t max_entries) {
     truncate_dyn_ = max_entries;
     return *this;
@@ -246,6 +246,17 @@ class ElfBuilder {
   /// GOT in a segment that is not writable.
   ElfBuilder& set_load_flags(uint32_t flags) {
     load_flags_ = flags;
+    return *this;
+  }
+
+  /// Emit two PT_LOADs instead of one: a read-only first LOAD with the headers,
+  /// strings, symbols and hash tables, and a second LOAD starting at the
+  /// relocation tables and GOT (through the dynamic section) with `flags`.
+  /// Exercises "slot must lie in a PF_W LOAD" against a real neighbor that is
+  /// writable or not, instead of flipping the flags of one whole image.
+  ElfBuilder& set_split_got_load(uint32_t flags) {
+    split_got_load_ = true;
+    got_load_flags_ = flags;
     return *this;
   }
 
@@ -324,6 +335,8 @@ class ElfBuilder {
   bool use_gnu_hash_ = true;
   bool emit_header_ = false;
   bool use_sysv_hash_ = false;
+  bool split_got_load_ = false;
+  uint32_t got_load_flags_ = 0;
   bool use_relro_ = false;
   size_t truncate_dyn_ = 0;
   uint64_t pltrel_override_ = detail::kDtNativeRel;

@@ -18,8 +18,8 @@ static uint32_t gnu_hash(const char* name) {
   return h;
 }
 
-/// Compute SysV ELF hash.
-[[maybe_unused]]
+/// Compute SysV ELF hash.  The builder's own copy of the gABI algorithm, so
+/// the bucket a symbol is placed in does not depend on the code under test.
 static uint32_t elf_hash(const char* name) {
   uint32_t h = 0;
   for (const unsigned char* p = reinterpret_cast<const unsigned char*>(name); *p; ++p) {
@@ -86,9 +86,9 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   // Reserve generous space upfront to avoid excessive reallocs.
   lb.buf.resize(4096, 0);
   // 1. Determine the number of phdrs.
-  size_t num_phdrs = 1;            // PT_LOAD
-  num_phdrs += 1;                  // PT_DYNAMIC
-  if (use_relro_) num_phdrs += 1;  // PT_GNU_RELRO
+  size_t num_phdrs = split_got_load_ ? 2 : 1;  // PT_LOAD(s)
+  num_phdrs += 1;                              // PT_DYNAMIC
+  if (use_relro_) num_phdrs += 1;              // PT_GNU_RELRO
   // 2. Program headers (at the start of the buffer).
   if (emit_header_) lb.alloc(sizeof(NativeElfEhdr), alignof(NativeElfEhdr));
   size_t phdr_offset = lb.alloc(num_phdrs * sizeof(yukiplt::NativeElfPhdr), alignof(NativeElfPhdr));
@@ -217,43 +217,37 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   if (use_sysv_hash_) {
     sysv_hash_offset = lb.align(4);
 
-    uint32_t nbucket = 1;
+    // Several buckets, so lookup only succeeds if the reader computes the
+    // same hash and therefore the same bucket as this independent builder.
+    const uint32_t nbucket = 7;
     uint32_t nchain = static_cast<uint32_t>(sym_count);
 
     lb.append<uint32_t>(nbucket, 4);
     lb.append<uint32_t>(nchain, 4);
 
-    // buckets[nbucket]
     size_t buckets_off = lb.alloc(nbucket * sizeof(uint32_t), 4);
-    // chains[nchain]
     size_t chains_off = lb.alloc(nchain * sizeof(uint32_t), 4);
 
-    // Build single-bucket chain.
-    // bucket[0] = first symbol with hash % 1 == 0 (all of them).
-    // We chain all symbols through the chain array.
-    // chain[i] = next symbol in the chain, or STN_UNDEF (0) for end.
-
-    // Find which symbols exist and sort by index.
-    std::vector<uint32_t> sym_indices;
-    for (const auto& s : symbols_) sym_indices.push_back(s.sym_index);
-    std::sort(sym_indices.begin(), sym_indices.end());
-
-    if (!sym_indices.empty()) {
-      uint32_t first = sym_indices[0];
-      lb.write_at(buckets_off, first);
-
-      // Chain: each symbol points to the next, last points to 0.
-      for (size_t i = 0; i < sym_indices.size(); ++i) {
-        uint32_t idx = sym_indices[i];
-        uint32_t next = (i + 1 < sym_indices.size()) ? sym_indices[i + 1] : 0;
-        lb.write_at(chains_off + idx * sizeof(uint32_t), next);
-      }
-    } else {
-      uint32_t zero = 0;
-      lb.write_at(buckets_off, zero);
+    // Each bucket heads a chain of the symbols hashing to it, in index order;
+    // chain[i] links to the next symbol of the same bucket, 0 ends it.
+    std::vector<std::pair<uint32_t, std::string>> named;
+    for (const auto& sym : symbols_) named.emplace_back(sym.sym_index, sym.name);
+    std::sort(named.begin(), named.end());
+    std::vector<uint32_t> tail(nbucket, 0);
+    for (const auto& [index, name] : named) {
+      const uint32_t bucket = elf_hash(name.c_str()) % nbucket;
+      if (tail[bucket] == 0)
+        lb.write_at(buckets_off + bucket * sizeof(uint32_t), index);
+      else
+        lb.write_at(chains_off + tail[bucket] * sizeof(uint32_t), index);
+      lb.write_at(chains_off + index * sizeof(uint32_t), uint32_t{0});
+      tail[bucket] = index;
     }
   }
   // 7. JMPREL table (PLT relocations) + GOT slots.
+  // With a split layout the second LOAD starts here, on its own page-aligned
+  // offset so the two segments never share a byte.
+  const size_t second_load_offset = split_got_load_ ? lb.align(0x1000) : 0;
   size_t owned_slots = jmpslots_.size() + custom_relas_.size();
   size_t total_relas = owned_slots + aliased_slots_.size();
   size_t jmprel_offset = 0;
@@ -389,27 +383,43 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
   }
   if (emit_rel_tag_) maybe_add_dyn(detail::kDtForeignRel, 0);
 
-  // DT_NULL terminator.
-  if (!omit_dt_null_ && (truncate_dyn_ == 0 || dyn_count < truncate_dyn_)) add_dyn(DT_NULL, 0);
+  // DT_NULL terminator.  Truncation drops tags, not the terminator: a
+  // truncated table is still well formed, so a test reaches the missing-tag
+  // check instead of the missing-DT_NULL one (use omit_dt_null for that).
+  if (!omit_dt_null_) add_dyn(DT_NULL, 0);
 
   size_t dyn_size = lb.pos - dyn_offset;
   // 9. Fill in program headers.
   size_t total_size = lb.pos;
   size_t phi = 0;
 
-  // PT_LOAD: covers entire buffer.
+  // PT_LOAD: covers the entire buffer, or the two halves of a split layout.
   {
+    const uint64_t base = has_load_vaddr_override_ ? load_vaddr_override_ : 0;
     yukiplt::NativeElfPhdr ph{};
     ph.p_type = PT_LOAD;
-    ph.p_flags = load_flags_;
+    ph.p_flags = split_got_load_ ? PF_R : load_flags_;
     ph.p_offset = 0;
-    ph.p_vaddr = has_load_vaddr_override_ ? load_vaddr_override_ : 0;
+    ph.p_vaddr = base;
     ph.p_paddr = ph.p_vaddr;
-    ph.p_filesz = total_size;
-    ph.p_memsz = total_size;
+    ph.p_filesz = split_got_load_ ? second_load_offset : total_size;
+    ph.p_memsz = ph.p_filesz;
     ph.p_align = 0x1000;
     lb.write_at(phdr_offset + phi * sizeof(yukiplt::NativeElfPhdr), ph);
     ++phi;
+    if (split_got_load_) {
+      yukiplt::NativeElfPhdr got{};
+      got.p_type = PT_LOAD;
+      got.p_flags = got_load_flags_;
+      got.p_offset = second_load_offset;
+      got.p_vaddr = base + second_load_offset;
+      got.p_paddr = got.p_vaddr;
+      got.p_filesz = total_size - second_load_offset;
+      got.p_memsz = got.p_filesz;
+      got.p_align = 0x1000;
+      lb.write_at(phdr_offset + phi * sizeof(yukiplt::NativeElfPhdr), got);
+      ++phi;
+    }
   }
 
   // PT_DYNAMIC

@@ -322,24 +322,36 @@ inline constexpr uint32_t kNativeRelative = YUKIPLT_RELOC_RELATIVE;
 inline constexpr uint32_t kNativeIRelative = YUKIPLT_RELOC_IRELATIVE;
 inline constexpr uint32_t kNativeAbsolute = YUKIPLT_RELOC_ABSOLUTE;
 
+// r_info layout is a property of the ELF class, not of REL vs RELA: ELF64
+// packs (symbol << 32 | type), ELF32 packs (symbol << 8 | type) with a 24-bit
+// symbol and an 8-bit type.  Every supported ABI pairs ELF64 with RELA and
+// ELF32 with REL; the assertion below keeps that pairing from silently
+// changing what the helpers decode.
+inline constexpr bool kNativeElf64 = YUKIPLT_ELF_BITS == 64;
+static_assert(kNativeElf64 == kNativeUsesRela,
+              "r_info helpers assume ELF64 uses RELA and ELF32 uses REL");
+
 constexpr uint32_t native_reloc_symbol(uint64_t info) noexcept {
-  return static_cast<uint32_t>(info >> (kNativeUsesRela ? 32 : 8));
+  return static_cast<uint32_t>(info >> (kNativeElf64 ? 32 : 8));
 }
 constexpr uint32_t native_reloc_type(uint64_t info) noexcept {
-  return static_cast<uint32_t>(info & (kNativeUsesRela ? UINT64_C(0xffffffff) : UINT64_C(0xff)));
+  return static_cast<uint32_t>(info & (kNativeElf64 ? UINT64_C(0xffffffff) : UINT64_C(0xff)));
 }
-// Preconditions on ELF32: symbol fits 24 bits and type fits 8 bits.
-// Use try_native_reloc_info() when either input is untrusted.
-constexpr NativeElfAddr native_reloc_info(uint32_t symbol, uint32_t type) noexcept {
-  return static_cast<NativeElfAddr>((uint64_t{symbol} << (kNativeUsesRela ? 32 : 8)) |
-                                    (type & (kNativeUsesRela ? UINT32_MAX : UINT32_C(0xff))));
-}
-// Leaves output unchanged if an ELF32 field cannot be represented.
+// Encode r_info, or leave output unchanged and return false if an ELF32 field
+// cannot be represented (symbol above 24 bits or type above 8 bits).
 constexpr bool try_native_reloc_info(uint32_t symbol, uint32_t type,
                                      NativeElfAddr& output) noexcept {
-  if (!kNativeUsesRela && (symbol > UINT32_C(0xffffff) || type > UINT32_C(0xff))) return false;
-  output = native_reloc_info(symbol, type);
+  if (!kNativeElf64 && (symbol > UINT32_C(0xffffff) || type > UINT32_C(0xff))) return false;
+  output = static_cast<NativeElfAddr>((uint64_t{symbol} << (kNativeElf64 ? 32 : 8)) | type);
   return true;
+}
+// Encode r_info for fields known to be representable.  An unrepresentable
+// ELF32 field yields 0 (R_*_NONE with symbol 0) instead of a silently
+// truncated value, so a mistaken caller builds an inert record, never a
+// different symbol.  Use try_native_reloc_info() for untrusted input.
+constexpr NativeElfAddr native_reloc_info(uint32_t symbol, uint32_t type) noexcept {
+  NativeElfAddr output = 0;
+  return try_native_reloc_info(symbol, type, output) ? output : NativeElfAddr{0};
 }
 constexpr int64_t native_reloc_addend(const NativeElfRelocation& reloc) noexcept {
 #if YUKIPLT_USES_RELA

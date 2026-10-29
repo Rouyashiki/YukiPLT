@@ -3,6 +3,9 @@
 
 {
   global:
+    /* Exact optional name. The singleton glob also links non-CFI builds with
+     * --no-undefined-version; it cannot match an extra suffix or prefix. */
+    __cfi_chec[k];
     yukiplt_c_*;
     extern "C++" {
       "yukiplt::image_from_soname(char const*)";

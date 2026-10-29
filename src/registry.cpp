@@ -97,7 +97,7 @@ Registry::Registry() noexcept {
   // Keep bit 31 of the salt clear and every record index below 2^31 (claim()
   // enforces it): then index ^ low32(salt) never has bit 31 set where
   // low32(~salt) does, so no issued id can equal kInvalidId.
-  salt_ = salt & ~(uint64_t{1} << 31);
+  salt_ = salt & kSaltMask;
   salt_ready_ = true;
 }
 
@@ -221,7 +221,7 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
 
   if (free_list_.empty()) {
     // Indices stay below 2^31 so a salted id can never equal kInvalidId.
-    if (records_.size() >= (size_t{1} << 31)) throw std::length_error("Registry capacity");
+    if (records_.size() >= kIndexLimit) throw std::length_error("Registry capacity");
     // Keep the free list able to hold every record without a later allocation,
     // so freeing a record (finish_restore/release) never throws. Reserve before
     // adding the record, so either allocation can fail without losing it.

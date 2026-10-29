@@ -240,6 +240,11 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
   // A PHDR-only custom view may omit the ELF header. If a readable, file-backed
   // LOAD at offset zero contains an ELF magic, validate its native ABI before
   // reading any dynamic metadata. PHDR alone cannot prove machine or class.
+  bool saw_header = false;
+  bool matched_header_table = false;
+  uintptr_t canonical_phoff = 0;
+  const auto table = reinterpret_cast<uintptr_t>(phdr_table);
+  const bool table_in_image = image.addr_in_load(table, phdr_bytes);
   for (size_t i = 0; i < phdr_count; ++i) {
     const auto& ph = phdr_table[i];
     if (ph.p_type != PT_LOAD || ph.p_offset != 0 || !(ph.p_flags & PF_R) ||
@@ -261,14 +266,23 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
     // Require the image's PHDR count. An in-image table must match a canonical
     // e_phoff copy in a zero-offset LOAD; external copied tables are allowed.
     if (header.e_phnum != phdr_count) return Error::Make(ErrorCode::kCorruptedElf);
-    const auto table = reinterpret_cast<uintptr_t>(phdr_table);
-    if (image.addr_in_load(table, phdr_count * sizeof(NativeElfPhdr))) {
-      uintptr_t expected;
-      if (!safe_add(address, static_cast<uintptr_t>(header.e_phoff), expected))
-        return Error::Make(ErrorCode::kIntegerOverflow);
-      if (expected != table) return Error::Make(ErrorCode::kCorruptedElf);
-    }
+    // Offset-zero aliases describe the same file. A valid matching copy must
+    // not hide a contradictory offset in another readable header. Validate
+    // the file-table arithmetic even for an external copied PHDR view, but do
+    // not require every alias to map the table: an alias may cover Ehdr only.
+    const auto phoff = static_cast<uintptr_t>(header.e_phoff);
+    uintptr_t file_table_end, expected;
+    if (!safe_add(phoff, phdr_bytes, file_table_end) || !safe_add(address, phoff, expected))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    if (phoff < sizeof(NativeElfEhdr) || phoff % alignof(NativeElfPhdr) != 0 ||
+        (saw_header && canonical_phoff != phoff))
+      return Error::Make(ErrorCode::kCorruptedElf);
+    canonical_phoff = phoff;
+    saw_header = true;
+    matched_header_table |= expected == table;
   }
+  if (saw_header && table_in_image && !matched_header_table)
+    return Error::Make(ErrorCode::kCorruptedElf);
 
   // Validate and compute PT_DYNAMIC runtime range.
   uintptr_t dyn_begin;

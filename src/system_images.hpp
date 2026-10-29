@@ -41,21 +41,29 @@ HookResult hook_function_imports_ex_at(const ImageView& image, const char* expec
 /// return an empty string.
 Result<std::string> system_image_path(const ImageView& image);
 
-/// Re-verify an installed group without writing anything.  Under the linker
-/// lock (system image) or the op lock (custom image), confirm that the group's
-/// image still carries the identity it was installed with — bias, program
-/// headers and, when `expected_path` is non-null, its path — and that every
-/// slot the group wrote still holds its replacement.  Returns:
-///   Ok                       identity and every written slot unchanged;
-///   kImageInvalidated        the identity is no longer loaded (cause
-///                            kIdentityMismatch); the handle is NOT consumed;
-///   kSlotModifiedExternally  a slot no longer holds the replacement (cause
-///                            kSlotDrift); `report` names the first such slot;
-///   kVmaUnavailable/kOutOfBounds  a slot could not be read;
-///   kInvalidArgument         a stale handle.
-/// Matching does not prove the same instance: a same-address reload with the
-/// same path and the same slot values is indistinguishable (ABA).
-Error verify_installed_at(const HookHandle& handle, const char* expected_path, SlotReport* report);
+/// One RuleSet single-slot binding to revalidate. All pointers are borrowed for
+/// this call. Both paths are required for a system image; an empty string is a
+/// recorded name, never a request to omit validation. The result does not
+/// consume a handle or change its Registry state.
+struct InstalledBindingVerification {
+  const HookHandle* handle = nullptr;
+  ImageView image;
+  const char* bound_path = nullptr;
+  const char* enumerated_path = nullptr;
+  Error error;
+  SlotReport report;
+};
+
+struct BindingVerificationStatistics {
+  size_t enumerations = 0;
+  size_t maps_reads = 0;
+};
+
+// Prepare all grouping before enumeration; inside each linker callback take
+// op_mutex and read maps once. Paths must agree. Errors preserve ownership;
+// preparation failure forbids installs. Matching addresses/paths cannot exclude ABA.
+Error verify_installed_bindings(InstalledBindingVerification* entries, size_t count,
+                                BindingVerificationStatistics* statistics = nullptr);
 
 }  // namespace yukiplt::detail
 

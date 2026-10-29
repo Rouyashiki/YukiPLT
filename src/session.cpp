@@ -140,11 +140,8 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
             c.images.push_back(
                 {{static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum, 0},
                  path});
-          } catch (const std::bad_alloc&) {
-            c.error = Error::Make(ErrorCode::kOutOfMemory);
-            return 1;
-          } catch (const std::length_error&) {
-            c.error = Error::Make(ErrorCode::kIntegerOverflow);
+          } catch (...) {
+            c.error = detail::current_exception_error();
             return 1;
           }
           return 0;
@@ -153,8 +150,8 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
     if (ctx.error) return ctx.error;
     if (ctx.images.empty()) return Error::Make(ErrorCode::kImageNotFound);
     return std::move(ctx.images);
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 #else
   return Error::Make(ErrorCode::kUnsupportedFormat);
@@ -180,23 +177,20 @@ Result<NamedImage> find_image_containing(const void* address) {
   dl_iterate_phdr(
       [](dl_phdr_info* info, size_t, void* opaque) -> int {
         auto& c = *static_cast<Context*>(opaque);
-        ImageView view{static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum,
-                       0};
-        auto contains = system_contains_address(view, c.address);
-        if (!contains) {
-          c.error = contains.error();
-          return 1;
-        }
-        if (!contains.value()) return 0;
-        ++c.matches;
-        if (c.matches != 1) return 0;
         try {
+          ImageView view{static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum,
+                         0};
+          auto contains = system_contains_address(view, c.address);
+          if (!contains) {
+            c.error = contains.error();
+            return 1;
+          }
+          if (!contains.value()) return 0;
+          ++c.matches;
+          if (c.matches != 1) return 0;
           c.found = {view, info->dlpi_name ? info->dlpi_name : ""};
-        } catch (const std::bad_alloc&) {
-          c.error = Error::Make(ErrorCode::kOutOfMemory);
-          return 1;
-        } catch (const std::length_error&) {
-          c.error = Error::Make(ErrorCode::kIntegerOverflow);
+        } catch (...) {
+          c.error = detail::current_exception_error();
           return 1;
         }
         return 0;
@@ -326,10 +320,8 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
     }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 }
 
@@ -354,10 +346,8 @@ Result<HookSession> prepare_session(const HookPlan& plan) {
       session.targets_.push_back({target, nullptr, {}, {}});
     }
     return session;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 }
 
@@ -558,10 +548,8 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
     }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 }
 Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& plan) {
@@ -585,10 +573,8 @@ Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& pla
       session.targets_.push_back({target, nullptr, {}, {}});
     }
     return session;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 }
 

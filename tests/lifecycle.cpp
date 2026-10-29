@@ -2,6 +2,7 @@
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
 #include <gtest/gtest.h>
+#include <link.h>
 
 #include <algorithm>
 #include <atomic>
@@ -9,7 +10,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -308,16 +311,21 @@ struct RulesFixture : testing::Test {
   uintptr_t end_page = 0;
   bool writable = false;
   size_t enumeration_calls = 0;
+  size_t maps_calls = 0;
+  size_t protect_calls = 0;
 
   static RulesFixture* current;
 
   detail::PlatformOps ops{
       [](void* p, uintptr_t, size_t, int prot) {
-        static_cast<RulesFixture*>(p)->writable = (prot & detail::kProtWrite) != 0;
+        auto& self = *static_cast<RulesFixture*>(p);
+        ++self.protect_calls;
+        self.writable = (prot & detail::kProtWrite) != 0;
         return 0;
       },
       [](void* p, detail::MapsCoverage& coverage) {
         auto& self = *static_cast<RulesFixture*>(p);
+        ++self.maps_calls;
         const size_t ps = detail::page_size();
 
         std::vector<std::pair<uintptr_t, uintptr_t>> ranges;

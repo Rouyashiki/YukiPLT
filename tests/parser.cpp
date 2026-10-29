@@ -334,9 +334,10 @@ struct FuncInstallFixture : testing::Test {
   ElfBuilder::BuiltImage image;
   uintptr_t first_page = 0;
   uintptr_t end_page = 0;
-  bool writable = false;
+  std::vector<int> page_protections;
   size_t protect_calls = 0;
-  size_t fail_protect_at = 0;
+  uintptr_t fail_restore_page = 0;
+  bool restore_failure_injected = false;
   size_t maps_calls = 0;
   size_t cas_calls = 0;
 
@@ -346,21 +347,34 @@ struct FuncInstallFixture : testing::Test {
   void* outputs[4]{};
 
   detail::PlatformOps ops{
-      [](void* p, uintptr_t, size_t, int prot) {
+      [](void* p, uintptr_t page, size_t length, int prot) {
         auto& self = *static_cast<FuncInstallFixture*>(p);
         ++self.protect_calls;
-        if (self.protect_calls == self.fail_protect_at) return EACCES;
-        self.writable = (prot & detail::kProtWrite) != 0;
+        const size_t ps = detail::page_size();
+        if (page < self.first_page || page >= self.end_page || page % ps != 0 || length == 0 ||
+            length % ps != 0 || length > self.end_page - page)
+          return EINVAL;
+        if (page == self.fail_restore_page && prot == detail::kProtRead &&
+            !self.restore_failure_injected) {
+          self.restore_failure_injected = true;
+          return EACCES;
+        }
+        for (size_t offset = 0; offset < length; offset += ps)
+          self.page_protections[(page - self.first_page + offset) / ps] = prot;
         return 0;
       },
       [](void* p, detail::MapsCoverage& coverage) {
         auto& self = *static_cast<FuncInstallFixture*>(p);
         ++self.maps_calls;
         char line[128];
-        std::snprintf(line, sizeof(line), "%zx-%zx %s 00000000 00:00 0",
-                      static_cast<size_t>(self.first_page), static_cast<size_t>(self.end_page),
-                      self.writable ? "rw-p" : "r--p");
-        coverage.feed_line(line, std::strlen(line));
+        const size_t ps = detail::page_size();
+        for (size_t i = 0; i < self.page_protections.size(); ++i) {
+          const uintptr_t page = self.first_page + i * ps;
+          std::snprintf(line, sizeof(line), "%zx-%zx %s 00000000 00:00 0",
+                        static_cast<size_t>(page), static_cast<size_t>(page + ps),
+                        (self.page_protections[i] & detail::kProtWrite) ? "rw-p" : "r--p");
+          coverage.feed_line(line, std::strlen(line));
+        }
         return coverage.finish();
       },
       [](void*, uintptr_t address) {
@@ -368,6 +382,8 @@ struct FuncInstallFixture : testing::Test {
       },
       [](void* p, uintptr_t address, uintptr_t* expected, uintptr_t desired) {
         auto& self = *static_cast<FuncInstallFixture*>(p);
+        EXPECT_EQ(self.page_protections[(address - self.first_page) / detail::page_size()],
+                  detail::kProtRead | detail::kProtWrite);
         if (++self.cas_calls == self.race_before_cas && self.race_slot_addr != 0)
           __atomic_store_n(reinterpret_cast<uintptr_t*>(self.race_slot_addr), self.race_value,
                            __ATOMIC_RELEASE);
@@ -382,7 +398,9 @@ struct FuncInstallFixture : testing::Test {
     ASSERT_NE(ps, 0u);
     first_page = image.load_bias() & ~(ps - 1);
     end_page = (image.load_bias() + image.buffer.size() + ps - 1) & ~(ps - 1);
+    page_protections.assign((end_page - first_page) / ps, detail::kProtRead);
   }
+
   void SetUp() override { detail::set_active_ops(&ops); }
   void TearDown() override { detail::set_active_ops(nullptr); }
 

@@ -3,6 +3,7 @@
 
 #include "yukiplt.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -859,7 +860,13 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   // Mirror each recorded stage into the caller's immediate diagnostic too.
   auto record = [&](const RecoveryDiagnostic& value) {
     reg.record_diagnostic(id, value);
-    if (diagnostic) *diagnostic = value;
+    if (diagnostic) {
+      *diagnostic = value;
+      // Preflight failures can retain residue from an earlier attempt too.
+      // Use the same allocation-free Registry snapshot as query_recovery().
+      RecoveryDiagnostic recorded;
+      if (reg.recovery_snapshot(id, recorded, nullptr, 0).ok()) *diagnostic = recorded;
+    }
   };
   const auto previous_state =
       reg.is_installed(id) ? GroupState::kInstalled : GroupState::kIndeterminate;
@@ -1064,7 +1071,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
         Error::Sys(ErrorCode::kIndeterminate, restore_errno != 0 ? restore_errno : r.raise_errno),
         !pages_clean ? ErrorCause::kProtectFailed : ErrorCause::kCasConflict);
     record({!pages_clean ? OperationStage::kRestorePages : OperationStage::kRollback, error,
-            r.raise_errno, restore_errno, rollback_failed});
+            r.raise_errno, restore_errno, rollback_failed, false, pn});
     return error;
   }
 
@@ -1332,66 +1339,150 @@ Result<std::string> detail::system_image_path(const ImageView& image) {
   }
 }
 
-Error detail::verify_installed_at(const HookHandle& handle, const char* expected_path,
-                                  SlotReport* report) {
-  if (!handle.valid())
-    return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kHandleInvalid);
-  const uint64_t id = detail_api::id(handle);
+Error detail::verify_installed_bindings(InstalledBindingVerification* entries, size_t count,
+                                        BindingVerificationStatistics* statistics) {
+  if (statistics) *statistics = {};
+  if (count == 0) return Error::Ok();
+  if (entries == nullptr) return Error::Make(ErrorCode::kNullPointer);
   try {
-    ImageIdentity image;
-    {
-      std::lock_guard<std::mutex> lock(detail::op_mutex());
-      Error peek = peek_image(id, image);
-      if (peek) return detail::with_cause(peek, ErrorCause::kHandleInvalid);
-    }
-    // Under the locks: re-read the group and compare every written slot.
-    auto check = [&]() -> Error {
-      ImageIdentity current;
-      SlotRecord recs[kMaxBatch];
-      size_t n = 0;
-      Error snap = Registry::instance().snapshot(id, current, recs, kMaxBatch, &n);
-      if (snap) return detail::with_cause(snap, ErrorCause::kHandleInvalid);
-      if (n > kMaxBatch) n = kMaxBatch;
-      const size_t ps = detail::page_size();
-      if (ps == 0)
-        return detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
-                                  ErrorCause::kPlatform);
-      uintptr_t addrs[kMaxBatch];
-      for (size_t i = 0; i < n; ++i) addrs[i] = recs[i].address;
-      Txn txn(detail::active_ops(), ps);
-      // A read-only maps check: prepare() changes no protection.
-      Error prep = txn.prepare(addrs, n);
-      if (prep) return prep;
-      for (size_t i = 0; i < n; ++i) {
-        if (!recs[i].ever_written) continue;
-        uintptr_t live = 0;
-        txn.load(recs[i].address, live);
-        if (live == recs[i].replacement) continue;
-        if (report) {
-          report->address = recs[i].address;
-          report->value_before = recs[i].replacement;
-          report->value_observed = live;
-          report->status = SlotStatus::kConflict;
-        }
-        return detail::with_cause(Error::Make(ErrorCode::kSlotModifiedExternally),
-                                  ErrorCause::kSlotDrift);
+    struct Work {
+      size_t index;
+      SlotRecord slot;
+      bool eligible = false;
+    };
+    struct Group {
+      ImageView image;
+      size_t begin;
+      size_t end;
+    };
+    const auto less_image = [](const ImageView& a, const ImageView& b) {
+      if (a.load_bias != b.load_bias) return a.load_bias < b.load_bias;
+      if (a.phdr_table != b.phdr_table)
+        return reinterpret_cast<uintptr_t>(a.phdr_table) <
+               reinterpret_cast<uintptr_t>(b.phdr_table);
+      return a.phdr_count < b.phdr_count;
+    };
+    std::vector<Work> work;
+    std::vector<Group> groups;
+    std::vector<uintptr_t> addresses;
+    work.reserve(count);
+    groups.reserve(count);
+    addresses.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      auto& entry = entries[i];
+      entry.report = {};
+      entry.error = Error::Make(ErrorCode::kImageInvalidated);
+      if (entry.handle == nullptr || !entry.handle->valid() || entry.image.instance_token != 0 ||
+          entry.bound_path == nullptr || entry.enumerated_path == nullptr) {
+        entry.error = Error::Make(ErrorCode::kInvalidArgument);
+        continue;
       }
+      work.push_back({i, {}});
+    }
+    std::sort(work.begin(), work.end(), [&](const Work& a, const Work& b) {
+      return less_image(entries[a.index].image, entries[b.index].image);
+    });
+    for (size_t begin = 0; begin < work.size();) {
+      const auto& image = entries[work[begin].index].image;
+      size_t end = begin + 1;
+      while (end < work.size() && !less_image(image, entries[work[end].index].image)) ++end;
+      groups.push_back({image, begin, end});
+      begin = end;
+    }
+    if (groups.empty()) return Error::Ok();
+#if defined(__linux__) || defined(__ANDROID__)
+    auto verify_image = [&](const ImageView& live, const char* path) -> Error {
+      auto found = std::lower_bound(groups.begin(), groups.end(), live,
+                                    [&](const Group& group, const ImageView& image) {
+                                      return less_image(group.image, image);
+                                    });
+      if (found == groups.end() || less_image(live, found->image)) return Error::Ok();
+      // Every Registry read and slot read occurs while this image is held by
+      // the linker callback. Never enumerate with op_mutex already held.
+      std::lock_guard<std::mutex> lock(detail::op_mutex());
+      addresses.clear();
+      for (size_t i = found->begin; i < found->end; ++i) {
+        auto& item = work[i];
+        auto& entry = entries[item.index];
+        if (std::strcmp(entry.bound_path, entry.enumerated_path) != 0 ||
+            std::strcmp(entry.bound_path, path) != 0)
+          continue;
+        ImageIdentity recorded;
+        size_t slots = 0;
+        entry.error = Registry::instance().snapshot(detail_api::id(*entry.handle), recorded,
+                                                    &item.slot, 1, &slots);
+        if (entry.error) continue;
+        if (recorded.invalidated || recorded.instance_token != 0 ||
+            recorded.load_bias != live.load_bias ||
+            recorded.phdr_addr != reinterpret_cast<uintptr_t>(live.phdr_table) ||
+            recorded.phdr_count != live.phdr_count) {
+          entry.error = Error::Make(ErrorCode::kImageInvalidated);
+          continue;
+        }
+        if (slots != 1) {
+          entry.error = Error::Make(ErrorCode::kInvalidArgument);
+          continue;
+        }
+        item.eligible = true;
+        addresses.push_back(item.slot.address);  // capacity reserved before enumeration
+      }
+      if (addresses.empty()) return Error::Ok();
+      std::sort(addresses.begin(), addresses.end());
+      addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
+      const size_t ps = detail::page_size();
+      Txn transaction(detail::active_ops(), ps);
+      Error prepared;
+      if (ps == 0) {
+        prepared = Error::Make(ErrorCode::kUnsupportedFormat);
+      } else {
+        if (statistics) ++statistics->maps_reads;
+        prepared = transaction.prepare(addresses.data(), addresses.size());
+      }
+      if (prepared.code == ErrorCode::kOutOfMemory) return prepared;
+      for (size_t i = found->begin; i < found->end; ++i) {
+        const auto& item = work[i];
+        if (!item.eligible) continue;
+        auto& entry = entries[item.index];
+        entry.error = prepared;
+        if (prepared || !item.slot.ever_written) continue;
+        uintptr_t value = 0;
+        transaction.load(item.slot.address, value);
+        if (value != item.slot.replacement) {
+          entry.error = Error::Make(ErrorCode::kSlotModifiedExternally);
+          entry.report.address = item.slot.address;
+          entry.report.value_before = item.slot.replacement;
+          entry.report.value_observed = value;
+          entry.report.status = SlotStatus::kConflict;
+        }
+      }
+      // The read-only transaction (including its maps) dies here. Installation
+      // is a separate operation and must prepare from new maps of its own.
       return Error::Ok();
     };
-    if (image.instance_token == 0 && !image.invalidated) {
-      Error result = Error::Ok();
-      const bool matched =
-          run_on_system_image(image, [&](const ImageView&) { result = check(); }, expected_path);
-      if (!matched)
-        return detail::with_cause(Error::Make(ErrorCode::kImageInvalidated),
-                                  ErrorCause::kIdentityMismatch);
-      return result;
-    }
-    if (image.invalidated)
-      return detail::with_cause(Error::Make(ErrorCode::kImageInvalidated),
-                                ErrorCause::kIdentityMismatch);
-    std::lock_guard<std::mutex> lock(detail::op_mutex());
-    return check();
+    struct Context {
+      decltype(verify_image)* verify;
+      Error error;
+    } context{&verify_image, {}};
+    if (statistics) ++statistics->enumerations;
+    dl_iterate_phdr(
+        [](dl_phdr_info* info, size_t, void* opaque) -> int {
+          auto& ctx = *static_cast<Context*>(opaque);
+          try {
+            ctx.error = (*ctx.verify)(
+                {static_cast<uintptr_t>(info->dlpi_addr), info->dlpi_phdr, info->dlpi_phnum, 0},
+                info->dlpi_name == nullptr ? "" : info->dlpi_name);
+            if (ctx.error) return 1;
+          } catch (...) {
+            ctx.error = detail::current_exception_error();
+            return 1;
+          }
+          return 0;
+        },
+        &context);
+    return context.error;
+#else
+    return Error::Ok();  // No system images can match on this Host platform.
+#endif
   } catch (...) {
     return detail::current_exception_error();
   }
@@ -1533,36 +1624,64 @@ namespace {
 // Trivially destructible, so no thread-exit destructor is registered.
 thread_local ErrorCause t_cause = ErrorCause::kNone;
 
-bool consistent(ErrorCode code, ErrorCause cause) noexcept {
+constexpr uint32_t bit(ErrorCause cause) noexcept {
+  return uint32_t{1} << static_cast<uint32_t>(cause);
+}
+static_assert(static_cast<uint32_t>(ErrorCause::kSlotDrift) < 32);
+
+struct CausePolicy {
+  ErrorCause fallback = ErrorCause::kNone;
+  uint32_t accepted = 0;
+  ErrorCause with_errno = ErrorCause::kNone;
+};
+
+// One exhaustive table owns both compatibility and the fallback cause. A new
+// ErrorCode without a policy is a -Wswitch error in the project build.
+constexpr CausePolicy policy(ErrorCode code) noexcept {
+  using C = ErrorCause;
   switch (code) {
     case ErrorCode::kOutOfBounds:
-      return cause == ErrorCause::kMetadataBounds || cause == ErrorCause::kScanBudget ||
-             cause == ErrorCause::kMapsCoverage;
+      return {C::kMetadataBounds,
+              bit(C::kMetadataBounds) | bit(C::kScanBudget) | bit(C::kMapsCoverage)};
     case ErrorCode::kInvalidArgument:
-      return cause == ErrorCause::kInvalidRequest || cause == ErrorCause::kHandleInvalid ||
-             cause == ErrorCause::kOwnImage || cause == ErrorCause::kDuplicateTarget ||
-             cause == ErrorCause::kOutputAlias || cause == ErrorCause::kReplacementIsCurrent ||
-             cause == ErrorCause::kOriginalCapacity || cause == ErrorCause::kHostCallback;
+      return {C::kInvalidRequest, bit(C::kInvalidRequest) | bit(C::kHandleInvalid) |
+                                      bit(C::kOwnImage) | bit(C::kDuplicateTarget) |
+                                      bit(C::kOutputAlias) | bit(C::kReplacementIsCurrent) |
+                                      bit(C::kOriginalCapacity) | bit(C::kHostCallback)};
     case ErrorCode::kNullPointer:
-      return cause == ErrorCause::kInvalidRequest;
+      return {C::kInvalidRequest, bit(C::kInvalidRequest)};
     case ErrorCode::kPermissionDenied:
-      return cause == ErrorCause::kVmaPolicy || cause == ErrorCause::kProtectFailed;
+      return {C::kVmaPolicy, bit(C::kVmaPolicy) | bit(C::kProtectFailed), C::kProtectFailed};
     case ErrorCode::kSlotOwnershipConflict:
-      return cause == ErrorCause::kExpectedCurrent || cause == ErrorCause::kCasConflict;
+      return {C::kCasConflict, bit(C::kExpectedCurrent) | bit(C::kCasConflict)};
     case ErrorCode::kUnsupportedFormat:
-      return cause == ErrorCause::kInternalException || cause == ErrorCause::kHostCallback ||
-             cause == ErrorCause::kRandomSource || cause == ErrorCause::kPlatform;
+      return {C::kNone, bit(C::kInternalException) | bit(C::kHostCallback) | bit(C::kRandomSource) |
+                            bit(C::kPlatform)};
     case ErrorCode::kVmaUnavailable:
-      return cause == ErrorCause::kMapsUnavailable;
+      return {C::kMapsUnavailable, bit(C::kMapsUnavailable)};
     case ErrorCode::kIndeterminate:
-      return cause == ErrorCause::kProtectFailed || cause == ErrorCause::kCasConflict;
+      return {C::kNone, bit(C::kProtectFailed) | bit(C::kCasConflict)};
     case ErrorCode::kImageInvalidated:
-      return cause == ErrorCause::kIdentityMismatch;
+      return {C::kNone, bit(C::kIdentityMismatch)};
     case ErrorCode::kSlotModifiedExternally:
-      return cause == ErrorCause::kSlotDrift;
-    default:
-      return false;
+      return {C::kNone, bit(C::kSlotDrift)};
+    case ErrorCode::kOutOfMemory:
+      return {C::kNone, bit(C::kHostCallback)};
+    case ErrorCode::kSuccess:
+    case ErrorCode::kInvalidImage:
+    case ErrorCode::kCorruptedElf:
+    case ErrorCode::kUnsupportedRelocation:
+    case ErrorCode::kSymbolNotFound:
+    case ErrorCode::kNoHashTable:
+    case ErrorCode::kAmbiguousSymbol:
+    case ErrorCode::kAlreadyHooked:
+    case ErrorCode::kNotInstalled:
+    case ErrorCode::kIntegerOverflow:
+    case ErrorCode::kImageNotFound:
+    case ErrorCode::kAmbiguousImage:
+      return {};
   }
+  return {};  // Unknown external numeric value: never infer a cause.
 }
 }  // namespace
 
@@ -1576,22 +1695,11 @@ CauseScope::~CauseScope() { t_cause = saved_; }
 
 ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept {
   if (error.ok()) return ErrorCause::kNone;
-  if (noted != ErrorCause::kNone && consistent(error.code, noted)) return noted;
-  switch (error.code) {
-    case ErrorCode::kOutOfBounds:
-      return ErrorCause::kMetadataBounds;
-    case ErrorCode::kInvalidArgument:
-    case ErrorCode::kNullPointer:
-      return ErrorCause::kInvalidRequest;
-    case ErrorCode::kPermissionDenied:
-      return error.sys_errno != 0 ? ErrorCause::kProtectFailed : ErrorCause::kVmaPolicy;
-    case ErrorCode::kVmaUnavailable:
-      return ErrorCause::kMapsUnavailable;
-    case ErrorCode::kSlotOwnershipConflict:
-      return ErrorCause::kCasConflict;
-    default:
-      return ErrorCause::kNone;
-  }
+  const auto rule = policy(error.code);
+  const auto value = static_cast<uint32_t>(noted);
+  if (value < 32 && (rule.accepted & (uint32_t{1} << value))) return noted;
+  return error.sys_errno != 0 && rule.with_errno != ErrorCause::kNone ? rule.with_errno
+                                                                      : rule.fallback;
 }
 
 }  // namespace yukiplt::detail

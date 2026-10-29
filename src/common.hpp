@@ -252,16 +252,24 @@ ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept;
 // IntegerOverflow, others to UnsupportedFormat with InternalException.
 // Host callbacks use OutOfMemory or UnsupportedFormat with HostCallback.
 
+enum class ExceptionOrigin { kInternal, kHostCallback };
+
 /// Map the exception currently being handled.  Call only inside a catch block.
-inline Error current_exception_error() noexcept {
+inline Error current_exception_error(ExceptionOrigin origin = ExceptionOrigin::kInternal) noexcept {
   try {
     throw;
   } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
+    const auto error = Error::Make(ErrorCode::kOutOfMemory);
+    return origin == ExceptionOrigin::kHostCallback ? with_cause(error, ErrorCause::kHostCallback)
+                                                    : error;
   } catch (const std::length_error&) {
+    if (origin == ExceptionOrigin::kHostCallback)
+      return with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kHostCallback);
     return Error::Make(ErrorCode::kIntegerOverflow);
   } catch (...) {
-    return with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kInternalException);
+    return with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
+                      origin == ExceptionOrigin::kHostCallback ? ErrorCause::kHostCallback
+                                                               : ErrorCause::kInternalException);
   }
 }
 

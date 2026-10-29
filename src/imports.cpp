@@ -1141,14 +1141,8 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
           Result<bool> keep = Error::Make(ErrorCode::kUnsupportedFormat);
           try {
             keep = predicate(candidate, context);
-          } catch (const std::bad_alloc&) {
-            return detail::with_cause(Error::Make(ErrorCode::kOutOfMemory),
-                                      ErrorCause::kHostCallback);
           } catch (...) {
-            // Documented containment (candidates.h): any other host exception is
-            // kUnsupportedFormat; the cause attributes it to the callback.
-            return detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
-                                      ErrorCause::kHostCallback);
+            return detail::current_exception_error(detail::ExceptionOrigin::kHostCallback);
           }
           if (!keep)
             return keep.error().ok() ? detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
@@ -1174,5 +1168,19 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
   } catch (...) {
     return detail::current_exception_error();
   }
+}
+
+Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
+    const NamedImage* images, size_t count, const CandidateSelection& selection,
+    OperationDiagnostic* diagnostic) {
+  detail::CauseScope scope;
+  auto result = expand_function_candidates(images, count, selection);
+  if (diagnostic) {
+    *diagnostic = {};
+    diagnostic->error = result ? Error::Ok() : result.error();
+    diagnostic->stage = result ? OperationStage::kComplete : OperationStage::kPrepare;
+    diagnostic->cause = detail::resolve_cause(diagnostic->error, detail::noted_cause());
+  }
+  return result;
 }
 }  // namespace yukiplt

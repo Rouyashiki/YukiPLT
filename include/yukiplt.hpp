@@ -1236,7 +1236,9 @@ enum class ErrorCause : uint32_t {
   kSlotDrift = 21,
 };
 
-/// Version of OperationDiagnostic.  Newer versions only append fields.
+/// Output identifier for this frozen OperationDiagnostic layout. It is not a
+/// caller buffer size or an append-in-place extension mechanism. New layouts
+/// require a new type and entry point; existing functions always write v1.
 inline constexpr uint32_t kOperationDiagnosticVersion = 1;
 
 /// Immediate result of one operation, written by the *_diagnosed entry points
@@ -1563,7 +1565,7 @@ enum class RuleState : uint8_t {
 struct RuleBinding {
   uint64_t rule_id = 0;
   ImageView image{};          ///< Instance identity (bias/phdr/phnum/token).
-  std::string path;           ///< Diagnostic, from the image enumerator.
+  std::string path;           ///< Owning path used by the binding's installation.
   size_t original_index = 0;  ///< Slot in the rule's out_originals array.
   RuleState state = RuleState::kPending;
   Error error;
@@ -1736,8 +1738,8 @@ class RuleSet {
                            const char* expected_path, RuleSummary& summary,
                            RuleOperationEvent* event = nullptr);
   // Re-verify an installed system-image binding found again by refresh().
-  void verify_binding(size_t index, const char* expected_path, RuleSummary& summary,
-                      RuleOperationEvent* event);
+  void record_verification(size_t index, Error error, RuleSummary& summary,
+                           RuleOperationEvent& event);
   Error prepare_undo_report(RuleOperationReport& report, uint64_t rule_id, const ImageView* image,
                             RuleOperationStage stage) const;
   void finish_undo_report(RuleOperationReport& report) const;
@@ -1825,6 +1827,13 @@ struct CandidateSelection {
 /// cannot be undone. Caller keeps supplied images stable for snapshot acquisition.
 YUKIPLT_API Result<std::vector<FunctionCandidate>> expand_function_candidates(
     const NamedImage* images, size_t count, const CandidateSelection& selection);
+/// Same result and callback error codes as expand_function_candidates. When
+/// non-null, diagnostic is written on every return; callback exceptions and
+/// invalid Result<bool> values have cause kHostCallback. Nested diagnosed calls
+/// from the predicate cannot leak their cause into this operation.
+YUKIPLT_API Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
+    const NamedImage* images, size_t count, const CandidateSelection& selection,
+    OperationDiagnostic* diagnostic);
 
 /// Stable original-address storage. Keep it and all replacement code/context
 /// alive until recovery AND caller-established quiescence. No implicit unhook,

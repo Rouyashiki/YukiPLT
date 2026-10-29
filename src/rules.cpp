@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "common.hpp"
 #include "imports.hpp"
 #include "system_images.hpp"
 #include "yukiplt.hpp"
@@ -149,10 +150,8 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
     for (auto& existing : rules_) rebind_selector(existing);
     ++next_rule_id_;
     return rules_.back().id;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return detail::current_exception_error();
   }
 }
 
@@ -240,10 +239,6 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     const RuleState st = bindings_[existing].state;
     if (st == RuleState::kPending || st == RuleState::kInstallFailed) {
       retry_in_place = true;
-    } else if (st == RuleState::kInstalled && expected_path != nullptr &&
-               image.instance_token == 0) {
-      verify_binding(existing, expected_path, summary, event);
-      return;
     } else if (st != RuleState::kReleased && st != RuleState::kInvalidated) {
       return;
     }
@@ -258,6 +253,7 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   // Prepare the binding and index before installation can publish ownership.
   // Superseded bindings remain history but leave the current index.
   RuleBinding pending;
+  std::string retry_path;
   auto record_prepare_failure = [&](Error error) {
     ++summary.attempted;
     ++summary.failed;
@@ -270,24 +266,25 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
       event->recovery = {};
     }
   };
-  if (new_binding) {
-    try {
+  try {
+    if (new_binding) {
       pending.rule_id = rule.id;
       pending.image = image;
-      if (path != nullptr) pending.path = path;  // diagnostic copy, may allocate
+      if (path != nullptr) pending.path = path;
       pending.original_index = slot_index;
       // Grow geometrically: reserving exactly size()+1 would reallocate (and move
       // every binding and handle) on each new binding, making refresh quadratic.
       reserve_for_one_more(bindings_);
       reserve_for_one_more(handles_);
       binding_index_[key_of(rule.id, image)] = bindings_.size();
-    } catch (const std::bad_alloc&) {
-      record_prepare_failure(Error::Make(ErrorCode::kOutOfMemory));
-      return;  // Cannot track a new binding; do not install one.
-    } catch (const std::length_error&) {
-      record_prepare_failure(Error::Make(ErrorCode::kIntegerOverflow));
-      return;
+    } else if (path != nullptr) {
+      // Prepare before install: updating a successful retry must not allocate
+      // after the core has acquired ownership or published an original value.
+      retry_path = path;
     }
+  } catch (...) {
+    record_prepare_failure(detail::current_exception_error());
+    return;
   }
 
   ++summary.attempted;
@@ -310,6 +307,7 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     bindings_.push_back(std::move(pending));  // reserved above: no throw
     handles_.push_back(std::move(result.handle));
   } else {
+    if (result.ok() || result.handle.valid()) bindings_[existing].path.swap(retry_path);
     bindings_[existing].state = install_state(result);
     bindings_[existing].error = result.error;
     bindings_[existing].install_report = report;
@@ -337,24 +335,18 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
 
 // Recheck retained system bindings under the linker lock without writing.
 // A mismatch preserves handle and ownership; third-party values are never adopted.
-void RuleSet::verify_binding(size_t index, const char* expected_path, RuleSummary& summary,
-                             RuleOperationEvent* event) {
-  SlotReport report{};
-  const Error error = detail::verify_installed_at(handles_[index], expected_path, &report);
+void RuleSet::record_verification(size_t index, Error error, RuleSummary& summary,
+                                  RuleOperationEvent& event) {
+  event.binding_index = index;
+  event.state = bindings_[index].state;
+  event.error = error;
+  event.recovery = {};
+  if (handles_[index].valid()) read_recovery(handles_[index], event.recovery);
+  bindings_[index].error = error;
   if (!error) return;
   ++summary.attempted;
   ++summary.failed;
-  bindings_[index].error = error;
-  if (event) {
-    event->attempted = true;
-    event->stage = RuleOperationStage::kVerify;
-    event->error = error;
-    event->state = bindings_[index].state;
-    event->binding_index = index;
-    event->recovery = {};
-    event->recovery.error = error;
-    if (handles_[index].valid()) read_recovery(handles_[index], event->recovery);
-  }
+  event.attempted = true;
 }
 
 RuleSummary RuleSet::refresh() {
@@ -514,6 +506,8 @@ RuleSummary report_failure(RuleOperationReport& report, Error error, size_t reta
 
 RuleSummary RuleSet::refresh(RuleOperationReport& report) {
   reset_report(report);
+  std::vector<detail::InstalledBindingVerification> verification;
+  std::vector<size_t> verification_events;
   try {
     // Finish enumeration and all diagnostic string allocation before the first
     // installation. An enumeration error belongs to its rule, not to an unload.
@@ -541,13 +535,39 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
         }
       }
     }
-  } catch (const std::bad_alloc&) {
-    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory), 0);
-  } catch (const std::length_error&) {
-    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow), 0);
+    // No binding/handle storage changes until the batch has returned: its
+    // pointers refer to the existing owning strings and handles. The batch's
+    // own allocation/exception failure also precedes every installation.
+    verification.reserve(report.events.size());
+    verification_events.reserve(report.events.size());
+    for (size_t i = 0; i < report.events.size(); ++i) {
+      auto& event = report.events[i];
+      if (event.stage == RuleOperationStage::kEnumerate || event.image.instance_token != 0)
+        continue;
+      const size_t index = find_binding(event.rule_id, event.image);
+      if (index == ~size_t{0} || bindings_[index].state != RuleState::kInstalled) continue;
+      event.stage = RuleOperationStage::kVerify;
+      event.binding_index = index;
+      verification.push_back({&handles_[index],
+                              event.image,
+                              bindings_[index].path.c_str(),
+                              event.path.c_str(),
+                              {},
+                              {}});
+      verification_events.push_back(i);
+    }
+    if (Error error = detail::verify_installed_bindings(verification.data(), verification.size()))
+      return report_failure(report, error, 0);
+  } catch (...) {
+    return report_failure(report, detail::current_exception_error(), 0);
   }
   RuleSummary summary;
+  for (size_t i = 0; i < verification.size(); ++i) {
+    auto& event = report.events[verification_events[i]];
+    record_verification(event.binding_index, verification[i].error, summary, event);
+  }
   for (auto& event : report.events) {
+    if (event.stage == RuleOperationStage::kVerify) continue;
     if (event.stage == RuleOperationStage::kEnumerate) {
       if (event.error.code != ErrorCode::kImageNotFound) ++summary.failed;
       continue;
@@ -582,18 +602,13 @@ RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
       event.stage = RuleOperationStage::kInstall;
       report.events.push_back(std::move(event));
     }
-  } catch (const std::bad_alloc&) {
+  } catch (...) {
+    const Error error = detail::current_exception_error();
     size_t retained = 0;
     for (const auto& rule : rules_)
       if (!rule.removed && filter_matches(rule.filter, image, path))
         retained += retained_for(rule.id, &image);
-    return report_failure(report, Error::Make(ErrorCode::kOutOfMemory), retained);
-  } catch (const std::length_error&) {
-    size_t retained = 0;
-    for (const auto& rule : rules_)
-      if (!rule.removed && filter_matches(rule.filter, image, path))
-        retained += retained_for(rule.id, &image);
-    return report_failure(report, Error::Make(ErrorCode::kIntegerOverflow), retained);
+    return report_failure(report, error, retained);
   }
   RuleSummary summary;
   for (auto& event : report.events)
@@ -623,10 +638,8 @@ Error RuleSet::prepare_undo_report(RuleOperationReport& report, uint64_t rule_id
       report.events.push_back(std::move(event));
     }
     return Error::Ok();
-  } catch (const std::bad_alloc&) {
-    report.preparation_error = Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    report.preparation_error = Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    report.preparation_error = detail::current_exception_error();
   }
   report.events.clear();
   return report.preparation_error;

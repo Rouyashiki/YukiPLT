@@ -70,6 +70,11 @@ struct PageResidueRecord {
 class Registry {
  public:
   static constexpr uint64_t kInvalidId = ~uint64_t(0);
+  static constexpr uint32_t kIndexLimit = uint32_t{1} << 31;
+  static constexpr uint64_t kSaltMask = ~uint64_t{kIndexLimit};
+  static_assert((kSaltMask & kIndexLimit) == 0);
+  static_assert(((uint64_t{kIndexLimit - 1} | kSaltMask) & kIndexLimit) == 0);
+  static_assert((kInvalidId & kIndexLimit) != 0);
 
   static Registry& instance();
 

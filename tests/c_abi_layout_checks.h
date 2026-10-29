@@ -16,10 +16,50 @@ YK_STATIC_ASSERT(YUKIPLT_C_SOURCE_REL == 8 && YUKIPLT_C_SOURCE_ANDROID_REL == 16
 YK_STATIC_ASSERT(YUKIPLT_C_RELOC_SOURCE_RELA == 1 && YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA == 2);
 YK_STATIC_ASSERT(YUKIPLT_C_RELOC_SOURCE_REL == 3 && YUKIPLT_C_RELOC_SOURCE_ANDROID_REL == 4);
 YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_REL_IMPORTS == 6);
+YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_ERROR_CAUSES == 7);
+YK_STATIC_ASSERT(YUKIPLT_C_CAUSE_NONE == 0 && YUKIPLT_C_CAUSE_PLATFORM == 19);
+YK_STATIC_ASSERT(YUKIPLT_C_CAUSE_SLOT_DRIFT == 21);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_error) == 8 && sizeof(yukiplt_c_handle) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_error, sys_errno) == 4);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, base) == 16);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, error) == 4);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, image_invalidated) == 24);
+// Field order of every by-value structure: same-width field swaps must fail.
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, symbol) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, version_match) == sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, version) == 2 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, dependency) == 3 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, hidden) == 4 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_selector, relocation_index) == 5 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_request, target) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_request, replacement) == sizeof(yukiplt_c_selector));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_request, out_original) ==
+                 sizeof(yukiplt_c_selector) + sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_slot_report, address) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_slot_report, value_before) == sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_slot_report, value_observed) == 2 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_slot_report, status) == 3 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_image, load_bias) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_image, program_headers) == sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_image, program_header_count) == 2 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, struct_size) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, sources) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, types) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, index_source) == 12);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request, target) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request, replacement) ==
+                 sizeof(yukiplt_c_function_selector));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, require_current) ==
+                 offsetof(yukiplt_c_function_request_ex, base) +
+                     sizeof(yukiplt_c_function_request));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, struct_size) == 0);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, stage) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, cause) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, error) == 12);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, raise_errno) == 20);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, handle_consumed) == 36);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_operation_diagnostic, residual_page_count) == 40);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_operation_diagnostic) == 40 + sizeof(size_t));
 #if YUKIPLT_ELF_BITS == 64
 YK_STATIC_ASSERT(sizeof(yukiplt_c_recovery_diagnostic) == 40);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_recovery_diagnostic, residual_page_count) == 32);

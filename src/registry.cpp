@@ -3,10 +3,103 @@
 
 #include "registry.hpp"
 
+#include <cerrno>
+#include <stdexcept>
+
+#if defined(__linux__) || defined(__ANDROID__)
+#include <fcntl.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#elif defined(_WIN32)
+
+// clang-format off
+#include <windows.h>
+#include <bcrypt.h>
+// clang-format on
+#pragma comment(lib, "bcrypt")
+#endif
+
 #include "common.hpp"
 #include "memory.hpp"
 
 namespace yukiplt::detail {
+
+namespace {
+#if defined(__linux__) || defined(__ANDROID__)
+// The kernel CSPRNG through its device node.  Used only when getrandom(2) does
+// not exist (Linux < 3.17, as on old API 23 emulator kernels): it is the same
+// system random source, not a weaker fallback.  Returns 0 or an errno value.
+int read_urandom(unsigned char* bytes, size_t size) noexcept {
+  int fd;
+  do {
+    fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+  } while (fd < 0 && errno == EINTR);
+  if (fd < 0) return errno;
+  size_t filled = 0;
+  int error = 0;
+  while (filled < size) {
+    const ssize_t n = read(fd, bytes + filled, size - filled);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      error = errno;
+      break;
+    }
+    if (n == 0) {
+      error = EIO;
+      break;
+    }
+    filled += static_cast<size_t>(n);
+  }
+  close(fd);
+  return error;
+}
+#endif
+
+// Use kernel randomness; fall back to /dev/urandom only for ENOSYS.
+// The syscall supports bionic before API 28. No predictable salt fallback.
+int draw_salt(uint64_t& out) noexcept {
+#if defined(__linux__) || defined(__ANDROID__)
+  unsigned char* bytes = reinterpret_cast<unsigned char*>(&out);
+#if defined(SYS_getrandom)
+  size_t filled = 0;
+  while (filled < sizeof(out)) {
+    const long n = syscall(SYS_getrandom, bytes + filled, sizeof(out) - filled, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      if (errno == ENOSYS && filled == 0) break;
+      return errno;
+    }
+    filled += static_cast<size_t>(n);
+  }
+  if (filled == sizeof(out)) return 0;
+#endif
+  return read_urandom(bytes, sizeof(out));
+#elif defined(_WIN32)
+  return BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&out), sizeof(out),
+                         BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0
+             ? 0
+             : EIO;
+#else
+  (void)out;
+  return ENOSYS;
+#endif
+}
+}  // namespace
+
+Registry::Registry() noexcept {
+  uint64_t salt = 0;
+  const int error = draw_salt(salt);
+  if (error != 0) {
+    salt_errno_ = error;
+    return;
+  }
+  salt_errno_ = 0;
+  // Keep bit 31 of the salt clear and every record index below 2^31 (claim()
+  // enforces it): then index ^ low32(salt) never has bit 31 set where
+  // low32(~salt) does, so no issued id can equal kInvalidId.
+  salt_ = salt & ~(uint64_t{1} << 31);
+  salt_ready_ = true;
+}
 
 Registry& Registry::instance() {
   // Never destroyed: a HookHandle (or a thread) may call in after static
@@ -17,8 +110,9 @@ Registry& Registry::instance() {
 
 Registry::Record* Registry::resolve(uint64_t id) noexcept {
   if (id == kInvalidId) return nullptr;
-  uint32_t index = static_cast<uint32_t>(id & 0xffffffffu);
-  uint32_t gen = static_cast<uint32_t>(id >> 32);
+  const uint64_t raw = id ^ salt_;
+  uint32_t index = static_cast<uint32_t>(raw & 0xffffffffu);
+  uint32_t gen = static_cast<uint32_t>(raw >> 32);
   if (index >= records_.size()) return nullptr;
   Record& r = records_[index];
   if (!r.in_use || r.generation != gen) return nullptr;
@@ -113,7 +207,7 @@ void Registry::index_reserve(size_t extra) {
 }
 
 uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, size_t count) {
-  if (slots == nullptr || count == 0) return kInvalidId;
+  if (slots == nullptr || count == 0 || !salt_ready_) return kInvalidId;
 
   // No slot may already be owned by a live group (one slot, one owner).  The
   // liveness test and the insert happen under one lock, closing the
@@ -126,6 +220,8 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
   index_reserve(count);
 
   if (free_list_.empty()) {
+    // Indices stay below 2^31 so a salted id can never equal kInvalidId.
+    if (records_.size() >= (size_t{1} << 31)) throw std::length_error("Registry capacity");
     // Keep the free list able to hold every record without a later allocation,
     // so freeing a record (finish_restore/release) never throws. Reserve before
     // adding the record, so either allocation can fail without losing it.
@@ -207,7 +303,7 @@ void Registry::finish_restore(uint64_t id, bool released, GroupState not_release
   Record* r = resolve(id);
   if (r == nullptr) return;
   if (released) {
-    const auto index = static_cast<uint32_t>(id & 0xffffffffu);
+    const auto index = index_of(id);
     if (!r->image.invalidated) index_erase_record(*r, index);
     r->in_use = false;
     ++r->generation;
@@ -230,7 +326,7 @@ void Registry::finish_restore(uint64_t id, bool released, GroupState not_release
 Error Registry::release(uint64_t id) {
   Record* r = resolve(id);
   if (r == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
-  const auto index = static_cast<uint32_t>(id & 0xffffffffu);
+  const auto index = index_of(id);
   if (!r->image.invalidated) index_erase_record(*r, index);
   r->in_use = false;
   ++r->generation;

@@ -144,7 +144,8 @@ void MapsCoverage::feed_line(const char* line, size_t len) noexcept {
 
 Error MapsCoverage::finish() const noexcept {
   if (failure_ != ErrorCode::kSuccess) return Error::Make(failure_);
-  if (next_ != count_) return Error::Make(ErrorCode::kOutOfBounds);
+  if (next_ != count_)
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kMapsCoverage);
   return Error::Ok();
 }
 
@@ -224,7 +225,7 @@ Expected<VmaInfo, Error> probe_vma(uintptr_t addr, size_t size) {
   });
 
   if (err != 0) return Error::Sys(ErrorCode::kVmaUnavailable, err);
-  if (!found) return Error::Make(ErrorCode::kOutOfBounds);
+  if (!found) return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kMapsCoverage);
   return result;
 }
 
@@ -288,10 +289,16 @@ namespace {
 #if defined(__linux__) || defined(__ANDROID__)
 
 int sys_protect(void* /*ctx*/, uintptr_t page, size_t len, int prot) {
+  // The VMA policy only ever admits non-executable mappings, so a request to
+  // make a page both writable and executable can only be a logic error.  Refuse
+  // it here as well rather than ever creating a W+X page.
+  if ((prot & kProtWrite) && (prot & kProtExec)) return EINVAL;
   int p = PROT_NONE;
   if (prot & kProtRead) p |= PROT_READ;
-  if (prot & kProtWrite) p |= PROT_WRITE;
-  if (prot & kProtExec) p |= PROT_EXEC;
+  if (prot & kProtWrite)
+    p |= PROT_WRITE;
+  else if (prot & kProtExec)
+    p |= PROT_EXEC;
   return mprotect(reinterpret_cast<void*>(page), len, p) == 0 ? 0 : errno;
 }
 
@@ -389,7 +396,8 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   // r--p is raised to rw-p for the write and restored; rw-p is written as is.
   for (size_t i = 0; i < unique; ++i) {
     const VmaInfo& v = vmas[i];
-    if (v.shared || v.executable || !v.readable) return Error::Make(ErrorCode::kPermissionDenied);
+    if (v.shared || v.executable || !v.readable)
+      return with_cause(Error::Make(ErrorCode::kPermissionDenied), ErrorCause::kVmaPolicy);
   }
 
   pages_.clear();

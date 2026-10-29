@@ -609,7 +609,8 @@ constexpr uint64_t kKnownGroupFlags =
 Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, void* context,
                             ScanBudget* budget) {
   if (image.android_rela == 0 || image.android_rela_size == 0) return Error::Ok();
-  if (image.android_rela_size > kMaxPackedBytes) return Error::Make(ErrorCode::kOutOfBounds);
+  if (image.android_rela_size > kMaxPackedBytes)
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
   if (!readable(image, image.android_rela, image.android_rela_size))
     return Error::Make(ErrorCode::kOutOfBounds);
 
@@ -625,7 +626,8 @@ Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, voi
   if (!cursor.ok() || total_signed < 0 || group_base_offset < 0)
     return Error::Make(ErrorCode::kCorruptedElf);
   const uint64_t total = static_cast<uint64_t>(total_signed);
-  if (total > kMaxPackedRelocations) return Error::Make(ErrorCode::kOutOfBounds);
+  if (total > kMaxPackedRelocations)
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
   if (budget) {
     if (Error e = budget->take_records(static_cast<size_t>(total))) return e;
   }
@@ -1116,9 +1118,11 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
         const auto exact = exact_function_selector(record.entry);
         if ((exact.types & types) == 0) continue;
         const auto& symbol = record.entry.base.import.symbol;
-        if (snapshot.path.size() > text_remaining) return Error::Make(ErrorCode::kOutOfBounds);
+        if (snapshot.path.size() > text_remaining)
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
         text_remaining -= snapshot.path.size();
-        if (symbol.size() > text_remaining) return Error::Make(ErrorCode::kOutOfBounds);
+        if (symbol.size() > text_remaining)
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
         text_remaining -= symbol.size();
         if (!include.value().matches(snapshot.path, symbol)) continue;
         bool excluded = false;
@@ -1138,15 +1142,22 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
           try {
             keep = predicate(candidate, context);
           } catch (const std::bad_alloc&) {
-            return Error::Make(ErrorCode::kOutOfMemory);
+            return detail::with_cause(Error::Make(ErrorCode::kOutOfMemory),
+                                      ErrorCause::kHostCallback);
           } catch (...) {
-            return Error::Make(ErrorCode::kUnsupportedFormat);
+            // Documented containment (candidates.h): any other host exception is
+            // kUnsupportedFormat; the cause attributes it to the callback.
+            return detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
+                                      ErrorCause::kHostCallback);
           }
           if (!keep)
-            return keep.error().ok() ? Error::Make(ErrorCode::kInvalidArgument) : keep.error();
+            return keep.error().ok() ? detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                                          ErrorCause::kHostCallback)
+                                     : keep.error();
           if (!keep.value()) continue;
         }
-        if (result.size() == limits.candidates) return Error::Make(ErrorCode::kOutOfBounds);
+        if (result.size() == limits.candidates)
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
         result.push_back(std::move(candidate));
       }
     }
@@ -1157,14 +1168,11 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
       addresses.push_back(candidate.selected.base.import.slot_address);
     std::sort(addresses.begin(), addresses.end());
     if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
-      return Error::Make(ErrorCode::kInvalidArgument);
+      return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                ErrorCause::kDuplicateTarget);
     return result;
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
-  } catch (const std::length_error&) {
-    return Error::Make(ErrorCode::kIntegerOverflow);
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 }  // namespace yukiplt

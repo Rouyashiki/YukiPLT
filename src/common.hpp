@@ -9,6 +9,7 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -219,53 +220,50 @@ class SmallVec {
   size_t size_ = 0;
 };
 
-/// Non-owning, bounds-checked view over a contiguous byte range.
-///
-/// All read operations return Expected — out-of-bounds access never causes UB.
-/// The viewed memory must remain valid for the lifetime of the Span.
-class Span {
+/// Record `cause` as the current thread's most recent failure cause.
+void note_cause(ErrorCause cause) noexcept;
+
+/// The current thread's most recent noted cause (kNone if none).
+ErrorCause noted_cause() noexcept;
+
+/// Convenience: note `cause` and return `error` unchanged.
+inline Error with_cause(Error error, ErrorCause cause) noexcept {
+  note_cause(cause);
+  return error;
+}
+
+/// Clears the note for one operation and restores the previous value after.
+class CauseScope {
  public:
-  Span() noexcept : data_(nullptr), size_(0) {}
-  Span(const uint8_t* data, size_t size) noexcept : data_(data), size_(size) {}
-
-  [[nodiscard]] const uint8_t* data() const noexcept { return data_; }
-  [[nodiscard]] size_t size() const noexcept { return size_; }
-  [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
-
-  /// Returns a sub-span, or an error if the range exceeds bounds.
-  [[nodiscard]] Expected<Span, Error> subspan(size_t offset, size_t count) const noexcept {
-    if (offset > size_) return Error::Make(ErrorCode::kOutOfBounds);
-    if (count > size_ - offset) return Error::Make(ErrorCode::kOutOfBounds);
-    return Span(data_ + offset, count);
-  }
-
-  /// Read a single value of type U at the given byte offset.
-  /// U must be trivially copyable.  Uses memcpy to avoid alignment UB.
-  template <typename U>
-  [[nodiscard]] Expected<U, Error> read_at(size_t byte_offset) const noexcept {
-    static_assert(std::is_trivially_copyable_v<U>, "U must be trivially copyable");
-    if (byte_offset > size_ || sizeof(U) > size_ - byte_offset)
-      return Error::Make(ErrorCode::kOutOfBounds);
-    U val;
-    std::memcpy(&val, data_ + byte_offset, sizeof(U));
-    return val;
-  }
-
-  /// Check whether [byte_offset, byte_offset + byte_count) fits within the span.
-  [[nodiscard]] bool contains(size_t byte_offset, size_t byte_count) const noexcept {
-    return byte_offset <= size_ && byte_count <= size_ - byte_offset;
-  }
-
-  /// Read a raw byte, or error if out of bounds.
-  [[nodiscard]] Expected<uint8_t, Error> at(size_t index) const noexcept {
-    if (index >= size_) return Error::Make(ErrorCode::kOutOfBounds);
-    return data_[index];
-  }
+  CauseScope() noexcept;
+  ~CauseScope();
+  CauseScope(const CauseScope&) = delete;
+  CauseScope& operator=(const CauseScope&) = delete;
 
  private:
-  const uint8_t* data_;
-  size_t size_;
+  ErrorCause saved_;
 };
+
+/// The cause to report for a final `error`: the noted cause when it is one of
+/// the causes `error.code` can have, otherwise the code's default cause.
+ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept;
+
+// Map contained exceptions: bad_alloc to OutOfMemory, length_error to
+// IntegerOverflow, others to UnsupportedFormat with InternalException.
+// Host callbacks use OutOfMemory or UnsupportedFormat with HostCallback.
+
+/// Map the exception currently being handled.  Call only inside a catch block.
+inline Error current_exception_error() noexcept {
+  try {
+    throw;
+  } catch (const std::bad_alloc&) {
+    return Error::Make(ErrorCode::kOutOfMemory);
+  } catch (const std::length_error&) {
+    return Error::Make(ErrorCode::kIntegerOverflow);
+  } catch (...) {
+    return with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kInternalException);
+  }
+}
 
 // Per-operation work limits, shared across selected sources and candidate images.
 // Bytes count cumulative logical records/index payloads/text copied, including
@@ -276,18 +274,21 @@ struct ScanBudget {
   size_t bytes = size_t{64} << 20;
 
   Error take_records(size_t count) noexcept {
-    if (count > relocations) return Error::Make(ErrorCode::kOutOfBounds);
+    if (count > relocations)
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
     relocations -= count;
     return Error::Ok();
   }
   Error take_bytes(size_t count) noexcept {
-    if (count > bytes) return Error::Make(ErrorCode::kOutOfBounds);
+    if (count > bytes)
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
     bytes -= count;
     return Error::Ok();
   }
   template <typename T>
   Error take_objects(size_t count) noexcept {
-    if (count > bytes / sizeof(T)) return Error::Make(ErrorCode::kOutOfBounds);
+    if (count > bytes / sizeof(T))
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
     return take_bytes(count * sizeof(T));
   }
 };

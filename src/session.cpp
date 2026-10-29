@@ -310,6 +310,20 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
           return Error::Make(ErrorCode::kInvalidArgument);
         }
     }
+    plan.paths_.reserve(plan.targets_.size());
+    for (size_t i = 0; i < plan.targets_.size(); ++i) {
+      size_t previous = 0;
+      while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
+        ++previous;
+      if (previous < i) {
+        plan.paths_.push_back(plan.paths_[previous]);
+        continue;
+      }
+      if (failed_target) *failed_target = i;
+      auto path = detail::system_image_path(plan.targets_[i].image);
+      if (!path) return path.error();
+      plan.paths_.push_back(std::move(path.value()));
+    }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;
   } catch (const std::bad_alloc&) {
@@ -333,6 +347,8 @@ Result<HookSession> prepare_session(const HookPlan& plan) {
         SessionImageResult result;
         result.image = target.image;
         session.images_.push_back(std::move(result));
+        const size_t index = session.targets_.size();
+        session.paths_.push_back(index < plan.paths_.size() ? plan.paths_[index] : std::string());
       }
       session.images_[group].target_indices.push_back(session.targets_.size());
       session.targets_.push_back({target, nullptr, {}, {}});
@@ -347,7 +363,8 @@ Result<HookSession> prepare_session(const HookPlan& plan) {
 
 SessionSummary HookSession::install() {
   SessionSummary summary;
-  for (auto& group : images_) {
+  for (size_t g = 0; g < images_.size(); ++g) {
+    auto& group = images_[g];
     if (group.state == SessionState::kIndeterminate ||
         group.state == SessionState::kRestoreFailed) {
       ++summary.failed;
@@ -361,7 +378,10 @@ SessionSummary HookSession::install() {
         auto& target = targets_[index].target;
         requests[n++] = {exact_selector(target.selected), target.replacement, target.out_original};
       }
-      auto result = hook_imports(group.image, requests, n, reports);
+      // A system image must still carry the path it had when planned.
+      const char* path =
+          group.image.instance_token == 0 && g < paths_.size() ? paths_[g].c_str() : nullptr;
+      auto result = detail::hook_imports_at(group.image, path, requests, n, reports);
       group.install_error = result.error;
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled
@@ -522,6 +542,20 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
           return Error::Make(ErrorCode::kInvalidArgument);
         }
     }
+    plan.paths_.reserve(plan.targets_.size());
+    for (size_t i = 0; i < plan.targets_.size(); ++i) {
+      size_t previous = 0;
+      while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
+        ++previous;
+      if (previous < i) {
+        plan.paths_.push_back(plan.paths_[previous]);
+        continue;
+      }
+      if (failed_target) *failed_target = i;
+      auto path = detail::system_image_path(plan.targets_[i].image);
+      if (!path) return path.error();
+      plan.paths_.push_back(std::move(path.value()));
+    }
     if (failed_target) *failed_target = ~size_t{0};
     return plan;
   } catch (const std::bad_alloc&) {
@@ -544,6 +578,8 @@ Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& pla
         FunctionSessionImageResult result;
         result.image = target.image;
         session.images_.push_back(std::move(result));
+        const size_t index = session.targets_.size();
+        session.paths_.push_back(index < plan.paths_.size() ? plan.paths_[index] : std::string());
       }
       session.images_[group].target_indices.push_back(session.targets_.size());
       session.targets_.push_back({target, nullptr, {}, {}});
@@ -558,7 +594,8 @@ Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& pla
 
 SessionSummary FunctionHookSession::install() {
   SessionSummary summary;
-  for (auto& group : images_) {
+  for (size_t g = 0; g < images_.size(); ++g) {
+    auto& group = images_[g];
     if (group.state == SessionState::kIndeterminate ||
         group.state == SessionState::kRestoreFailed) {
       ++summary.failed;
@@ -573,7 +610,11 @@ SessionSummary FunctionHookSession::install() {
         requests[n++] = {exact_function_selector(target.selected), target.replacement,
                          target.out_original, target.require_current, target.expected_current};
       }
-      auto result = hook_function_imports_ex(group.image, requests, n, reports, &group.operation);
+      // A system image must still carry the path it had when planned.
+      const char* path =
+          group.image.instance_token == 0 && g < paths_.size() ? paths_[g].c_str() : nullptr;
+      auto result = detail::hook_function_imports_ex_at(group.image, path, requests, n, reports,
+                                                        &group.operation);
       group.install_error = result.error;
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled

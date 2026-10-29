@@ -73,6 +73,11 @@ class Registry {
 
   static Registry& instance();
 
+  /// False if the per-copy salt could not be drawn from the system random
+  /// source; claim() then always fails.  salt_errno() is the source's errno.
+  bool salt_ready() const noexcept { return salt_ready_; }
+  int salt_errno() const noexcept { return salt_errno_; }
+
   // Claim all slots or return kInvalidId without ownership. Requires salt_ready().
   // Copy system_path before publishing ownership; null means the exact empty
   // path, not a wildcard. Custom images do not use it.
@@ -132,7 +137,7 @@ class Registry {
  private:
   template <typename T>
   friend class NoDestructor;
-  Registry() = default;
+  Registry() noexcept;
 
   struct Record {
     uint32_t generation = 0;
@@ -145,8 +150,12 @@ class Registry {
   };
 
   static bool is_live(GroupState /*s*/) noexcept { return true; }  // all stored states are live
-  static uint64_t make_id(uint32_t gen, uint32_t index) noexcept {
-    return (static_cast<uint64_t>(gen) << 32) | index;
+  uint64_t make_id(uint32_t gen, uint32_t index) const noexcept {
+    return ((static_cast<uint64_t>(gen) << 32) | index) ^ salt_;
+  }
+  /// The record index encoded in an id issued by this copy.
+  uint32_t index_of(uint64_t id) const noexcept {
+    return static_cast<uint32_t>((id ^ salt_) & 0xffffffffu);
   }
   Record* resolve(uint64_t id) noexcept;
   const Record* resolve(uint64_t id) const noexcept;
@@ -169,6 +178,9 @@ class Registry {
   SmallVec<uint32_t, 8> free_list_;
   SmallVec<IndexEntry, 16> index_;  ///< Size is 0 or a power of two.
   size_t index_used_ = 0;
+  uint64_t salt_ = 0;
+  bool salt_ready_ = false;
+  int salt_errno_ = 0;
 };
 
 }  // namespace yukiplt::detail

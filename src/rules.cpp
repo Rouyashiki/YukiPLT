@@ -122,10 +122,9 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
                                    void** out_originals, size_t capacity) {
   if (next_rule_id_ == 0) return Error::Make(ErrorCode::kIntegerOverflow);
   if (replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
-  if (selector.base.symbol == nullptr || *selector.base.symbol == '\0')
-    return Error::Make(ErrorCode::kInvalidArgument);
   // Validate the filter and selector up front (same rules as find_images() and
-  // hook_function_imports()), so a malformed rule never silently fails later.
+  // hook_function_imports(), including a null symbol -> kNullPointer and an
+  // empty one -> kInvalidArgument), so a malformed rule never fails later.
   if (Error e = detail::validate_image_selector(filter)) return e;
   if (Error e = detail::validate_function_selector(selector)) return e;
   if (capacity > 0 && (out_originals == nullptr ||
@@ -170,11 +169,10 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter, const ImportSele
 
 namespace {
 
-// Translate a core HookResult/unhook outcome into a RuleState.
+// A pre-install invalidation is a clean retry using the same original slot.
+// Only a previously installed binding confirmed gone becomes Invalidated.
 RuleState install_state(const HookResult& result) noexcept {
   if (result.ok()) return RuleState::kInstalled;
-  if (!result.handle.valid() && result.error.code == ErrorCode::kImageInvalidated)
-    return RuleState::kInvalidated;
   return result.handle.valid() ? RuleState::kIndeterminate : RuleState::kInstallFailed;
 }
 
@@ -234,18 +232,18 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     event->error = bindings_[existing].error;
     if (handles_[existing].valid()) read_recovery(handles_[existing], event->recovery);
   }
-  // A binding is retried in place only after a clean install failure (it holds
-  // nothing and keeps its slot).  One that ended cleanly — released, or its
-  // image invalidated — is applied again as a NEW binding with a fresh slot:
-  // its old slot may still be read by code that escaped during the previous
-  // installation, so it is never reused (decision 8).  Installed, indeterminate,
-  // restore-failed and abandoned bindings are left alone: the first two still
-  // own the slot, and an abandoned one was given up on purpose.
+  // Retry clean failures in place. Reapply ended bindings with fresh originals;
+  // published slots may still be read and are never reused. Keep unresolved and
+  // abandoned bindings, and revalidate installed system bindings during refresh.
   bool retry_in_place = false;
   if (existing != ~size_t{0}) {
     const RuleState st = bindings_[existing].state;
     if (st == RuleState::kPending || st == RuleState::kInstallFailed) {
       retry_in_place = true;
+    } else if (st == RuleState::kInstalled && expected_path != nullptr &&
+               image.instance_token == 0) {
+      verify_binding(existing, expected_path, summary, event);
+      return;
     } else if (st != RuleState::kReleased && st != RuleState::kInvalidated) {
       return;
     }
@@ -335,6 +333,28 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   else
     ++summary.failed;
   if (handles_[idx].valid()) ++summary.retained;
+}
+
+// Recheck retained system bindings under the linker lock without writing.
+// A mismatch preserves handle and ownership; third-party values are never adopted.
+void RuleSet::verify_binding(size_t index, const char* expected_path, RuleSummary& summary,
+                             RuleOperationEvent* event) {
+  SlotReport report{};
+  const Error error = detail::verify_installed_at(handles_[index], expected_path, &report);
+  if (!error) return;
+  ++summary.attempted;
+  ++summary.failed;
+  bindings_[index].error = error;
+  if (event) {
+    event->attempted = true;
+    event->stage = RuleOperationStage::kVerify;
+    event->error = error;
+    event->state = bindings_[index].state;
+    event->binding_index = index;
+    event->recovery = {};
+    event->recovery.error = error;
+    if (handles_[index].valid()) read_recovery(handles_[index], event->recovery);
+  }
 }
 
 RuleSummary RuleSet::refresh() {

@@ -10,7 +10,9 @@ Checks: >-
   -performance-no-int-to-ptr,
   -portability-avoid-pragma-once
 WarningsAsErrors: ''
-HeaderFilterRegex: '(^|/)(include|src|tests)/'
+# check-tidy analyzes the library sources (src/); headers under include/ and
+# src/ are reported through them.  Tests are formatted but not tidied.
+HeaderFilterRegex: '(^|/)(include|src)/'
 
 # Native ELF/slot APIs intentionally validate integer addresses before converting
 # them to pointers. The int-to-ptr optimization advice does not apply here.

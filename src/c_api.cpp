@@ -5,6 +5,7 @@
 #include <new>
 #include <stdexcept>
 
+#include "common.hpp"
 #include "registry.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
@@ -12,8 +13,101 @@
 namespace {
 using namespace yukiplt;
 constexpr size_t kLimit = 64;
+// Every public C++ enum value that crosses the C boundary is pinned to its C
+// literal, so renumbering either side fails to compile.
+static_assert(static_cast<uint32_t>(ErrorCode::kSuccess) == YUKIPLT_C_SUCCESS);
+static_assert(static_cast<uint32_t>(ErrorCode::kInvalidArgument) == YUKIPLT_C_INVALID_ARGUMENT);
+static_assert(static_cast<uint32_t>(ErrorCode::kNullPointer) == YUKIPLT_C_NULL_POINTER);
+static_assert(static_cast<uint32_t>(ErrorCode::kInvalidImage) == YUKIPLT_C_INVALID_IMAGE);
+static_assert(static_cast<uint32_t>(ErrorCode::kCorruptedElf) == YUKIPLT_C_CORRUPTED_ELF);
+static_assert(static_cast<uint32_t>(ErrorCode::kUnsupportedFormat) == YUKIPLT_C_UNSUPPORTED_FORMAT);
+static_assert(static_cast<uint32_t>(ErrorCode::kUnsupportedRelocation) ==
+              YUKIPLT_C_UNSUPPORTED_RELOCATION);
+static_assert(static_cast<uint32_t>(ErrorCode::kSymbolNotFound) == YUKIPLT_C_SYMBOL_NOT_FOUND);
+static_assert(static_cast<uint32_t>(ErrorCode::kNoHashTable) == YUKIPLT_C_NO_HASH_TABLE);
+static_assert(static_cast<uint32_t>(ErrorCode::kAmbiguousSymbol) == YUKIPLT_C_AMBIGUOUS_SYMBOL);
+static_assert(static_cast<uint32_t>(ErrorCode::kSlotOwnershipConflict) ==
+              YUKIPLT_C_SLOT_OWNERSHIP_CONFLICT);
+static_assert(static_cast<uint32_t>(ErrorCode::kAlreadyHooked) == YUKIPLT_C_ALREADY_HOOKED);
+static_assert(static_cast<uint32_t>(ErrorCode::kNotInstalled) == YUKIPLT_C_NOT_INSTALLED);
+static_assert(static_cast<uint32_t>(ErrorCode::kSlotModifiedExternally) ==
+              YUKIPLT_C_SLOT_MODIFIED_EXTERNALLY);
+static_assert(static_cast<uint32_t>(ErrorCode::kIndeterminate) == YUKIPLT_C_INDETERMINATE);
+static_assert(static_cast<uint32_t>(ErrorCode::kPermissionDenied) == YUKIPLT_C_PERMISSION_DENIED);
+static_assert(static_cast<uint32_t>(ErrorCode::kImageInvalidated) == YUKIPLT_C_IMAGE_INVALIDATED);
+static_assert(static_cast<uint32_t>(ErrorCode::kOutOfMemory) == YUKIPLT_C_OUT_OF_MEMORY);
+static_assert(static_cast<uint32_t>(ErrorCode::kIntegerOverflow) == YUKIPLT_C_INTEGER_OVERFLOW);
+static_assert(static_cast<uint32_t>(ErrorCode::kOutOfBounds) == YUKIPLT_C_OUT_OF_BOUNDS);
+static_assert(static_cast<uint32_t>(ErrorCode::kImageNotFound) == YUKIPLT_C_IMAGE_NOT_FOUND);
+static_assert(static_cast<uint32_t>(ErrorCode::kAmbiguousImage) == YUKIPLT_C_AMBIGUOUS_IMAGE);
 static_assert(static_cast<uint32_t>(ErrorCode::kVmaUnavailable) == YUKIPLT_C_VMA_UNAVAILABLE);
+static_assert(static_cast<uint32_t>(SlotStatus::kUntouched) == YUKIPLT_C_UNTOUCHED);
+static_assert(static_cast<uint32_t>(SlotStatus::kInstalled) == YUKIPLT_C_INSTALLED);
+static_assert(static_cast<uint32_t>(SlotStatus::kRestored) == YUKIPLT_C_RESTORED);
+static_assert(static_cast<uint32_t>(SlotStatus::kConflict) == YUKIPLT_C_CONFLICT);
+static_assert(static_cast<uint32_t>(SlotStatus::kRolledBack) == YUKIPLT_C_ROLLED_BACK);
 static_assert(static_cast<uint32_t>(SlotStatus::kRollbackFailed) == YUKIPLT_C_ROLLBACK_FAILED);
+static_assert(static_cast<uint32_t>(OperationStage::kNone) == YUKIPLT_C_STAGE_NONE);
+static_assert(static_cast<uint32_t>(OperationStage::kPrepare) == YUKIPLT_C_STAGE_PREPARE);
+static_assert(static_cast<uint32_t>(OperationStage::kExpectedCurrent) ==
+              YUKIPLT_C_STAGE_EXPECTED_CURRENT);
+static_assert(static_cast<uint32_t>(OperationStage::kRaise) == YUKIPLT_C_STAGE_RAISE);
+static_assert(static_cast<uint32_t>(OperationStage::kCommit) == YUKIPLT_C_STAGE_COMMIT);
+static_assert(static_cast<uint32_t>(OperationStage::kRollback) == YUKIPLT_C_STAGE_ROLLBACK);
+static_assert(static_cast<uint32_t>(OperationStage::kRestorePages) ==
+              YUKIPLT_C_STAGE_RESTORE_PAGES);
+static_assert(static_cast<uint32_t>(OperationStage::kComplete) == YUKIPLT_C_STAGE_COMPLETE);
+static_assert(static_cast<uint32_t>(VersionMatch::kAny) == YUKIPLT_C_VERSION_ANY);
+static_assert(static_cast<uint32_t>(VersionMatch::kUnversioned) == YUKIPLT_C_VERSION_UNVERSIONED);
+static_assert(static_cast<uint32_t>(VersionMatch::kExact) == YUKIPLT_C_VERSION_EXACT);
+static_assert(static_cast<uint32_t>(HiddenMatch::kAny) == YUKIPLT_C_HIDDEN_ANY);
+static_assert(static_cast<uint32_t>(HiddenMatch::kNonHidden) == YUKIPLT_C_NON_HIDDEN);
+static_assert(static_cast<uint32_t>(HiddenMatch::kHidden) == YUKIPLT_C_HIDDEN);
+static_assert(static_cast<uint32_t>(kSourceJmprel) == YUKIPLT_C_SOURCE_JMPREL);
+static_assert(static_cast<uint32_t>(kSourceRela) == YUKIPLT_C_SOURCE_RELA);
+static_assert(static_cast<uint32_t>(kSourceAndroidRela) == YUKIPLT_C_SOURCE_ANDROID_RELA);
+static_assert(static_cast<uint32_t>(kSourceRel) == YUKIPLT_C_SOURCE_REL);
+static_assert(static_cast<uint32_t>(kSourceAndroidRel) == YUKIPLT_C_SOURCE_ANDROID_REL);
+static_assert(static_cast<uint32_t>(kTypeJumpSlot) == YUKIPLT_C_TYPE_JUMP_SLOT);
+static_assert(static_cast<uint32_t>(kTypeGlobDat) == YUKIPLT_C_TYPE_GLOB_DAT);
+static_assert(static_cast<uint32_t>(RelocationSource::kJmprel) == YUKIPLT_C_RELOC_SOURCE_JMPREL);
+static_assert(static_cast<uint32_t>(RelocationSource::kRela) == YUKIPLT_C_RELOC_SOURCE_RELA);
+static_assert(static_cast<uint32_t>(RelocationSource::kAndroidRela) ==
+              YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA);
+static_assert(static_cast<uint32_t>(RelocationSource::kRel) == YUKIPLT_C_RELOC_SOURCE_REL);
+static_assert(static_cast<uint32_t>(RelocationSource::kAndroidRel) ==
+              YUKIPLT_C_RELOC_SOURCE_ANDROID_REL);
+static_assert(static_cast<uint32_t>(ErrorCause::kNone) == YUKIPLT_C_CAUSE_NONE);
+static_assert(static_cast<uint32_t>(ErrorCause::kInvalidRequest) ==
+              YUKIPLT_C_CAUSE_INVALID_REQUEST);
+static_assert(static_cast<uint32_t>(ErrorCause::kHandleInvalid) == YUKIPLT_C_CAUSE_HANDLE_INVALID);
+static_assert(static_cast<uint32_t>(ErrorCause::kOwnImage) == YUKIPLT_C_CAUSE_OWN_IMAGE);
+static_assert(static_cast<uint32_t>(ErrorCause::kDuplicateTarget) ==
+              YUKIPLT_C_CAUSE_DUPLICATE_TARGET);
+static_assert(static_cast<uint32_t>(ErrorCause::kOutputAlias) == YUKIPLT_C_CAUSE_OUTPUT_ALIAS);
+static_assert(static_cast<uint32_t>(ErrorCause::kReplacementIsCurrent) ==
+              YUKIPLT_C_CAUSE_REPLACEMENT_IS_CURRENT);
+static_assert(static_cast<uint32_t>(ErrorCause::kOriginalCapacity) ==
+              YUKIPLT_C_CAUSE_ORIGINAL_CAPACITY);
+static_assert(static_cast<uint32_t>(ErrorCause::kMetadataBounds) ==
+              YUKIPLT_C_CAUSE_METADATA_BOUNDS);
+static_assert(static_cast<uint32_t>(ErrorCause::kScanBudget) == YUKIPLT_C_CAUSE_SCAN_BUDGET);
+static_assert(static_cast<uint32_t>(ErrorCause::kMapsUnavailable) ==
+              YUKIPLT_C_CAUSE_MAPS_UNAVAILABLE);
+static_assert(static_cast<uint32_t>(ErrorCause::kMapsCoverage) == YUKIPLT_C_CAUSE_MAPS_COVERAGE);
+static_assert(static_cast<uint32_t>(ErrorCause::kVmaPolicy) == YUKIPLT_C_CAUSE_VMA_POLICY);
+static_assert(static_cast<uint32_t>(ErrorCause::kProtectFailed) == YUKIPLT_C_CAUSE_PROTECT_FAILED);
+static_assert(static_cast<uint32_t>(ErrorCause::kExpectedCurrent) ==
+              YUKIPLT_C_CAUSE_EXPECTED_CURRENT);
+static_assert(static_cast<uint32_t>(ErrorCause::kCasConflict) == YUKIPLT_C_CAUSE_CAS_CONFLICT);
+static_assert(static_cast<uint32_t>(ErrorCause::kInternalException) ==
+              YUKIPLT_C_CAUSE_INTERNAL_EXCEPTION);
+static_assert(static_cast<uint32_t>(ErrorCause::kHostCallback) == YUKIPLT_C_CAUSE_HOST_CALLBACK);
+static_assert(static_cast<uint32_t>(ErrorCause::kRandomSource) == YUKIPLT_C_CAUSE_RANDOM_SOURCE);
+static_assert(static_cast<uint32_t>(ErrorCause::kPlatform) == YUKIPLT_C_CAUSE_PLATFORM);
+static_assert(static_cast<uint32_t>(ErrorCause::kIdentityMismatch) ==
+              YUKIPLT_C_CAUSE_IDENTITY_MISMATCH);
+static_assert(static_cast<uint32_t>(ErrorCause::kSlotDrift) == YUKIPLT_C_CAUSE_SLOT_DRIFT);
 yukiplt_c_error converted(Error error) noexcept {
   return {static_cast<uint32_t>(error.code), error.sys_errno};
 }
@@ -25,6 +119,26 @@ yukiplt_c_recovery_diagnostic converted(const RecoveryDiagnostic& value) noexcep
           value.rollback_failed ? 1u : 0u,
           value.image_invalidated ? 1u : 0u,
           value.residual_page_count};
+}
+// A C diagnostic for `final`, the code actually returned across the boundary
+// (validation in the C layer may fail before the core fills `value`).
+yukiplt_c_operation_diagnostic converted(const OperationDiagnostic& value,
+                                         yukiplt_c_error final) noexcept {
+  yukiplt_c_operation_diagnostic out{};
+  out.struct_size = sizeof(out);
+  const Error error = Error::Sys(static_cast<ErrorCode>(final.code), final.sys_errno);
+  const bool from_core = value.error.code == error.code && value.error.sys_errno == error.sys_errno;
+  out.stage = static_cast<uint32_t>(from_core ? value.stage : OperationStage::kPrepare);
+  out.cause =
+      static_cast<uint32_t>(from_core ? value.cause : detail::resolve_cause(error, value.cause));
+  out.error = final;
+  out.raise_errno = from_core ? value.raise_errno : 0;
+  out.restore_errno = from_core ? value.restore_errno : 0;
+  out.rollback_failed = from_core && value.rollback_failed ? 1u : 0u;
+  out.image_invalidated = final.code == YUKIPLT_C_IMAGE_INVALIDATED ? 1u : 0u;
+  out.handle_consumed = from_core && value.handle_consumed ? 1u : 0u;
+  out.residual_page_count = from_core ? value.residual_page_count : 0;
+  return out;
 }
 ImageView view(const yukiplt_c_image& image) noexcept {
   return {image.load_bias, static_cast<const NativeElfPhdr*>(image.program_headers),
@@ -86,12 +200,8 @@ template <typename Function>
 yukiplt_c_error guarded(Function function) noexcept {
   try {
     return converted(function());
-  } catch (const std::bad_alloc&) {
-    return converted(Error::Make(ErrorCode::kOutOfMemory));
-  } catch (const std::length_error&) {
-    return converted(Error::Make(ErrorCode::kIntegerOverflow));
   } catch (...) {
-    return converted(Error::Make(ErrorCode::kUnsupportedFormat));
+    return converted(detail::current_exception_error());
   }
 }
 }  // namespace
@@ -215,6 +325,7 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES ||
          feature_id == YUKIPLT_C_FEATURE_EXPECTED_CURRENT ||
          feature_id == YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY ||
+         feature_id == YUKIPLT_C_FEATURE_ERROR_CAUSES ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
@@ -283,6 +394,74 @@ yukiplt_c_error yukiplt_c_hook_functions_ex(const yukiplt_c_image* image,
   return error;
 }
 
+yukiplt_c_error yukiplt_c_hook_functions_diagnosed(
+    const yukiplt_c_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
+    yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
+    yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
+    return converted(Error::Make(ErrorCode::kInvalidArgument));
+  OperationDiagnostic operation;
+  operation.cause = ErrorCause::kInvalidRequest;
+  const auto error = guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    FunctionHookRequestEx translated[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      if (requests[i].struct_size != sizeof(yukiplt_c_function_request_ex) ||
+          requests[i].require_current > 1 ||
+          !function_selector(requests[i].base.target, translated[i].target))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      translated[i].replacement = requests[i].base.replacement;
+      translated[i].out_original = requests[i].base.out_original;
+      translated[i].require_current = requests[i].require_current != 0;
+      translated[i].expected_current = requests[i].expected_current;
+    }
+    auto result =
+        hook_function_imports_diagnosed(view(*image), translated, count, reports, &operation);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+  if (diagnostic) *diagnostic = converted(operation, error);
+  return error;
+}
+yukiplt_c_error yukiplt_c_unhook_diagnosed(yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
+                                           size_t capacity,
+                                           yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
+    return converted(Error::Make(ErrorCode::kInvalidArgument));
+  OperationDiagnostic operation;
+  operation.cause = ErrorCause::kInvalidRequest;
+  const auto error = guarded([&] {
+    if (!handle) return Error::Make(ErrorCode::kNullPointer);
+    if (!handle->token) {
+      operation.cause = ErrorCause::kHandleInvalid;
+      return Error::Make(ErrorCode::kInvalidArgument);
+    }
+    BorrowedHandle borrowed(handle->token);
+    SlotReport reports[kLimit];
+    size_t count = 0;
+    // Count-only query does not touch GOT or allocate transaction pages.
+    Error queried = query(borrowed.value, nullptr, 0, &count);
+    if (queried) {
+      if (queried.code == ErrorCode::kInvalidArgument) operation.cause = ErrorCause::kHandleInvalid;
+      return queried;
+    }
+    const size_t n = std::min({count, capacity, kLimit});
+    Error result = unhook_diagnosed(borrowed.value, reports, n, &operation);
+    handle->token = token(borrowed.value);
+    copy_reports(output, reports, n);
+    return result;
+  });
+  if (diagnostic) *diagnostic = converted(operation, error);
+  return error;
+}
+const char* yukiplt_c_error_cause_name(uint32_t cause) noexcept {
+  return error_cause_name(static_cast<ErrorCause>(cause));
+}
 yukiplt_c_error yukiplt_c_image_containing(const void* address, yukiplt_c_image* output) noexcept {
   return guarded([&] {
     if (!output) return Error::Make(ErrorCode::kNullPointer);

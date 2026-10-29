@@ -406,7 +406,7 @@ enum class ErrorCode : uint32_t {
   kOutOfBounds,
 
   // --- Image lookup ---
-  kImageNotFound,   ///< No loaded image matches the requested name.
+  kImageNotFound,   ///< No loaded image matches a lookup or enumeration.
   kAmbiguousImage,  ///< More than one loaded image matches the requested name.
 
   // --- Memory map ---
@@ -714,17 +714,55 @@ class [[nodiscard]] Expected<void, E> {
 /// - One slot, one owner.  A second hook of a slot this library already owns
 ///   returns kAlreadyHooked.  There is no hook stacking, no reference counting.
 ///
+/// - Ownership is per copy of YukiPLT.  Each copy loaded in a process (for
+///   example two DSOs that each link or bundle it) has its own registry and
+///   operation lock and is a third party to every other copy.  Another copy can
+///   install over this copy's replacement, taking it as the "original", and
+///   CAS cannot coordinate two copies' page-protection changes on a shared
+///   page.  Callers must not let two copies hook the same slot and must
+///   serialize their operations on shared pages.  Handles are only valid with
+///   the copy that issued them; each copy salts its handle ids from the system
+///   random source, so a foreign handle is rejected with high probability
+///   (kInvalidArgument), which is misuse detection, not a security boundary.
+///   If the random source is unavailable, installation fails with
+///   kUnsupportedFormat and its errno, and no predictable salt is used.
+///
 /// - Imports must already be eagerly bound before installation. For custom
 ///   loaders, finish relocation before exposing the image. A lazy resolver
 ///   could overwrite the hook or be mistaken for an original function. NOW
 ///   flags are not used as proof: Android's loader binds PLT relocations eagerly.
 ///
+/// ## Threading contract (applies to the C++ and C interfaces alike)
+///
+/// - Every free function may be called concurrently from any thread.  Image
+///   operations serialize on one operation lock per copy of the library;
+///   system images additionally run under the dynamic linker's lock (lock
+///   order linker -> operation, never the reverse).
+/// - One HookHandle (or C handle token) must not be used by two threads at
+///   once; hand it between threads with external synchronization.
+/// - HookSession, FunctionHookSession and RuleSet objects are not thread-safe:
+///   the caller serializes every operation on one object and every read of its
+///   results.  Distinct objects may be used concurrently.
+/// - No user callback runs while either lock is held.
+/// - Installed replacements may run on any thread at any time and must
+///   acquire-load their original pointers.
+///
 /// - Installing into the image containing this copy of YukiPLT is rejected
 ///   with kInvalidArgument before ownership or original-pointer publication.
+///   When YukiPLT is linked statically, the image it is linked into (for
+///   example the main executable) is that image: every installation there
+///   fails, while inspection still works.  To hook such an image, load
+///   YukiPLT as a separate shared library.
 ///   Do not arrange synchronous API reentry through functions the library may
 ///   call while holding its linker/operation locks (including interposition,
 ///   allocator hooks and destructors). A replacement reached outside those
-///   operations may call the API subject to the ordinary threading contract.
+///   operations may call the API subject to the threading contract above.
+///
+/// - Only private, readable, non-executable mappings are written.  A shared,
+///   executable or unreadable slot page fails with kPermissionDenied (cause
+///   kVmaPolicy).  In particular, a fully-RELRO 4K library loaded in a 16K
+///   device's page-size compatibility mode has its GOT mapped r-x by the linker
+///   and cannot be hooked.
 ///
 /// ## Batches and atomicity
 ///
@@ -828,7 +866,7 @@ struct ImportSnapshot {
 // Unsupported records are counted. This path is bounded by JMPREL size, without
 // the function-scan budget. System copying stays under the linker lock; callers
 // keep custom metadata stable. Allocation/size failures return errors, never exceptions.
-Result<ImportSnapshot> inspect_imports(const ImageView& image);
+YUKIPLT_API Result<ImportSnapshot> inspect_imports(const ImageView& image);
 
 enum class VersionSource : uint8_t { kNone, kNeeded, kDefined };
 
@@ -854,14 +892,15 @@ struct VersionedImportSnapshot {
 
 /// Like inspect_imports(), also validates/copies VERSYM, VERNEED and VERDEF.
 /// Missing version metadata is represented explicitly, not guessed from names.
-Result<VersionedImportSnapshot> inspect_versioned_imports(const ImageView& image);
+YUKIPLT_API Result<VersionedImportSnapshot> inspect_versioned_imports(const ImageView& image);
 
 enum class VersionMatch : uint8_t { kAny, kUnversioned, kExact };
 enum class HiddenMatch : uint8_t { kAny, kNonHidden, kHidden };
 
 /// All supplied filters must match ONE slot. No fallback to another version.
-/// Strings are borrowed only during the API call. An empty version/dependency
-/// filter is invalid; nullptr means no dependency filter. kUnversioned matches
+/// Strings are borrowed only during the API call. A null symbol is
+/// kNullPointer; an empty symbol, version or dependency filter is
+/// kInvalidArgument; nullptr means no dependency filter. kUnversioned matches
 /// absent VERSYM or indices 0/1. kAny never resolves ambiguity automatically.
 struct ImportSelector {
   const char* symbol = nullptr;
@@ -873,7 +912,8 @@ struct ImportSelector {
 };
 
 /// Read-only unique selection. Result addresses remain diagnostic snapshots.
-Result<VersionedImport> find_import(const ImageView& image, const ImportSelector& selector);
+YUKIPLT_API Result<VersionedImport> find_import(const ImageView& image,
+                                                const ImportSelector& selector);
 
 struct SelectedHookRequest {
   ImportSelector target;
@@ -900,6 +940,9 @@ struct SlotReport {
 };
 
 /// One slot to install in a batch.
+/// The legacy name request.  A null symbol is kNullPointer; an empty symbol
+/// never matches and is kSymbolNotFound (the selector-based entry points reject
+/// an empty name with kInvalidArgument instead).
 struct HookRequest {
   const char* symbol;   ///< Symbol name to hook (must resolve to one slot).
   void* replacement;    ///< Replacement function pointer.
@@ -915,13 +958,13 @@ struct HookRequest {
 class HookHandle {
  public:
   HookHandle() noexcept : id_(kInvalid) {}
-  ~HookHandle();
+  YUKIPLT_API ~HookHandle();
 
   HookHandle(const HookHandle&) = delete;
   HookHandle& operator=(const HookHandle&) = delete;
 
   HookHandle(HookHandle&& o) noexcept : id_(o.id_) { o.id_ = kInvalid; }
-  HookHandle& operator=(HookHandle&& o) noexcept;
+  YUKIPLT_API HookHandle& operator=(HookHandle&& o) noexcept;
 
   /// Returns true if this handle refers to a live hook entry.
   [[nodiscard]] bool valid() const noexcept { return id_ != kInvalid; }
@@ -955,31 +998,32 @@ struct [[nodiscard]] HookResult {
 // Linux/Android loader lookup: null/empty selects the main executable via
 // AT_PHDR; a slash selects exact dlpi_name; a bare name also matches basename.
 // Return a token-0 view or ImageNotFound/AmbiguousImage; never choose arbitrarily.
-Result<ImageView> image_from_soname(const char* soname);
+YUKIPLT_API Result<ImageView> image_from_soname(const char* soname);
 
 // Install one uniquely selected JUMP_SLOT with a non-null replacement.
 // out_original is optional, pointer-aligned, and published before replacement
 // becomes reachable. Success owns the slot; Indeterminate retains recovery
 // state. Other failures leave no installed hook or ownership. Check the result
 // and optional SlotReport; published originals are never cleared.
-HookResult hook(const ImageView& image, const char* symbol_name, void* replacement,
-                void** out_original, SlotReport* report = nullptr);
+YUKIPLT_API HookResult hook(const ImageView& image, const char* symbol_name, void* replacement,
+                            void** out_original, SlotReport* report = nullptr);
 
 // Install 1..64 requests in one image. Targets and non-null aligned original
 // outputs must be distinct; all targets must be unowned. Preflight rejects the
 // whole batch. CAS conflicts roll back; failed rollback/protection restoration
 // returns Indeterminate with a recovery handle. reports has count entries.
-HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
-                      SlotReport* reports = nullptr);
+YUKIPLT_API HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
+                                  SlotReport* reports = nullptr);
 
 /// Exact selection with the same transaction/ownership/recovery and
 /// original-pointer output contract as hook()/hook_batch(). Re-inspects
 /// metadata under the lifetime lock; never accepts a raw snapshot address. A
 /// batch is limited to 64 distinct slots in one image.
-HookResult hook_import(const ImageView& image, const ImportSelector& selector, void* replacement,
-                       void** out_original, SlotReport* report = nullptr);
-HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
-                        SlotReport* reports = nullptr);
+YUKIPLT_API HookResult hook_import(const ImageView& image, const ImportSelector& selector,
+                                   void* replacement, void** out_original,
+                                   SlotReport* report = nullptr);
+YUKIPLT_API HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
+                                    size_t count, SlotReport* reports = nullptr);
 // Explicit function sources/types extend the JUMP_SLOT APIs with GLOB_DAT.
 // Every match must be an undefined STT_FUNC with zero effective addend; only
 // GLOB_DAT also requires a nonzero current value. Any ineligible match rejects
@@ -1058,21 +1102,24 @@ struct FunctionHookRequest {
 // checks, including skipped types. Share a 2^22-record and 64 MiB logical
 // materialization budget, including indexes, copied text and temporaries;
 // excess returns OutOfBounds before allocation. This is not an RSS limit.
-Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, uint32_t sources);
+YUKIPLT_API Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image,
+                                                                    uint32_t sources);
 
 /// Read-only unique selection over the scanned sources/types.
-Result<FunctionImport> find_function_import(const ImageView& image,
-                                            const FunctionImportSelector& selector);
+YUKIPLT_API Result<FunctionImport> find_function_import(const ImageView& image,
+                                                        const FunctionImportSelector& selector);
 
 /// Install one / several function hooks on one image, same transaction,
 /// ownership, recovery and original-pointer contract as hook_import()/
 /// hook_imports().  A batch mixing JUMP_SLOT and GLOB_DAT slots on one image
 /// runs as a single transaction and is limited to 64 distinct slots.
-HookResult hook_function_import(const ImageView& image, const FunctionImportSelector& selector,
-                                void* replacement, void** out_original,
-                                SlotReport* report = nullptr);
-HookResult hook_function_imports(const ImageView& image, const FunctionHookRequest* reqs,
-                                 size_t count, SlotReport* reports = nullptr);
+YUKIPLT_API HookResult hook_function_import(const ImageView& image,
+                                            const FunctionImportSelector& selector,
+                                            void* replacement, void** out_original,
+                                            SlotReport* report = nullptr);
+YUKIPLT_API HookResult hook_function_imports(const ImageView& image,
+                                             const FunctionHookRequest* reqs, size_t count,
+                                             SlotReport* reports = nullptr);
 
 // Restore owned replacement values by CAS; already-original values are done.
 // Never-written slots are Untouched with live values. Preserve third-party values
@@ -1084,23 +1131,47 @@ HookResult hook_function_imports(const ImageView& image, const FunctionHookReque
 // System identity includes the installation path; mismatch consumes the old handle
 // without accessing the new image. Custom invalidation requires forget_image.
 // reports is an optional array of cap SlotReports. Success does not prove quiescence.
-Error unhook(HookHandle& handle, SlotReport* reports = nullptr, size_t cap = 0);
+YUKIPLT_API Error unhook(HookHandle& handle, SlotReport* reports = nullptr, size_t cap = 0);
+
+struct OperationDiagnostic;
+struct FunctionHookRequestEx;
+
+/// Diagnosed variants (see diagnostics.h).  Each behaves exactly like the
+/// undiagnosed entry point — same validation, transaction, return codes and
+/// handle semantics — and additionally writes an OperationDiagnostic for this
+/// call when `diagnostic` is non-null, on success and on every failure.  The
+/// diagnostic is caller-owned and must not alias any other argument.
+YUKIPLT_API HookResult hook_batch_diagnosed(const ImageView& image, const HookRequest* reqs,
+                                            size_t count, SlotReport* reports,
+                                            OperationDiagnostic* diagnostic);
+YUKIPLT_API HookResult hook_imports_diagnosed(const ImageView& image,
+                                              const SelectedHookRequest* reqs, size_t count,
+                                              SlotReport* reports, OperationDiagnostic* diagnostic);
+YUKIPLT_API HookResult hook_function_imports_diagnosed(const ImageView& image,
+                                                       const FunctionHookRequestEx* reqs,
+                                                       size_t count, SlotReport* reports,
+                                                       OperationDiagnostic* diagnostic);
+/// Also sets diagnostic->handle_consumed when this call consumed `handle`
+/// (success, or kImageInvalidated); a failure with handle_consumed false keeps
+/// the handle for a retry, abandon() or query_recovery().
+YUKIPLT_API Error unhook_diagnosed(HookHandle& handle, SlotReport* reports, size_t cap,
+                                   OperationDiagnostic* diagnostic);
 
 // Release bookkeeping and consume the handle without changing memory.
 // The caller assumes responsibility for remaining replacements and page residue.
-Error abandon(HookHandle& handle);
+YUKIPLT_API Error abandon(HookHandle& handle);
 
 // Copy at most cap reports and return the total slot count. address/value_before
 // are recorded; readable live slots report Installed and the observed value.
 // Unreadable or invalidated slots report Untouched/zero, never a fabricated value.
 // System reads require the recorded identity/path under the linker lock. Null out
 // or zero cap requests only the count. No writes or handle consumption.
-Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count);
+YUKIPLT_API Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count);
 
 // Forget a custom image by bias, PHDR identity and nonzero load token without
 // modifying memory. Its handles are consumed as ImageInvalidated on unhook.
 // System images are rejected. Call before unmapping the custom instance.
-Error forget_image(const ImageView& custom_image);
+YUKIPLT_API Error forget_image(const ImageView& custom_image);
 
 class HookHandle;
 
@@ -1133,13 +1204,117 @@ struct ResidualPage {
   int sys_errno = 0;  ///< Last failed restoration; 0 may mean a protection conflict.
 };
 
+/// Why an operation failed, beyond its ErrorCode.  Several codes cover more
+/// than one cause (see error.h); the cause tells them apart.  kNone means the
+/// operation succeeded or its code is already specific.  Values are stable and
+/// new values may be appended; treat an unknown value like kNone.
+enum class ErrorCause : uint32_t {
+  kNone = 0,
+  kInvalidRequest = 1,        ///< Malformed argument, selector, count or output buffer.
+  kHandleInvalid = 2,         ///< Handle empty, consumed, stale or issued by another copy.
+  kOwnImage = 3,              ///< Target is the image containing this copy of YukiPLT.
+  kDuplicateTarget = 4,       ///< Two requests of one batch select the same slot.
+  kOutputAlias = 5,           ///< An original output is a target slot or an owned slot.
+  kReplacementIsCurrent = 6,  ///< The slot already holds the replacement value.
+  kOriginalCapacity = 7,      ///< RuleSet original storage is exhausted.
+  kMetadataBounds = 8,        ///< ELF metadata lies outside readable LOAD segments.
+  kScanBudget = 9,            ///< A per-operation decode/byte/candidate limit was reached.
+  kMapsUnavailable = 10,      ///< /proc/self/maps could not be read or parsed.
+  kMapsCoverage = 11,         ///< A slot page is not covered by the maps read.
+  kVmaPolicy = 12,            ///< The mapping is shared, executable or unreadable.
+  kProtectFailed = 13,        ///< mprotect failed; the errno is in the Error.
+  kExpectedCurrent = 14,      ///< The expected-current precondition did not hold.
+  kCasConflict = 15,          ///< Another writer changed a slot during the CAS.
+  kInternalException = 16,    ///< An unexpected internal exception was contained.
+  kHostCallback = 17,         ///< A host callback threw or returned an invalid result.
+  kRandomSource = 18,         ///< The handle salt could not be drawn; errno attached.
+  kPlatform = 19,             ///< Unsupported platform or invalid runtime page size.
+  /// A system image no longer carries the identity (bias, program headers and
+  /// path) it was planned or bound with.
+  kIdentityMismatch = 20,
+  /// A slot this library installed no longer holds its replacement.
+  kSlotDrift = 21,
+};
+
+/// Version of OperationDiagnostic.  Newer versions only append fields.
+inline constexpr uint32_t kOperationDiagnosticVersion = 1;
+
+/// Immediate result of one operation, written by the *_diagnosed entry points
+/// whether or not they succeed.  It is a report of this call, not recorded
+/// state: query_recovery() remains the source for a handle's recovery history.
+struct OperationDiagnostic {
+  uint32_t version = kOperationDiagnosticVersion;
+  OperationStage stage = OperationStage::kNone;
+  ErrorCause cause = ErrorCause::kNone;
+  Error error;
+  int raise_errno = 0;
+  int restore_errno = 0;
+  bool rollback_failed = false;
+  bool image_invalidated = false;
+  /// unhook only: the call consumed the handle (success or invalidated image).
+  bool handle_consumed = false;
+  size_t residual_page_count = 0;
+};
+
+/// Stable, allocation-free name; unknown values return "Unknown".
+[[nodiscard]] inline const char* error_cause_name(ErrorCause cause) noexcept {
+  switch (cause) {
+    case ErrorCause::kNone:
+      return "None";
+    case ErrorCause::kInvalidRequest:
+      return "InvalidRequest";
+    case ErrorCause::kHandleInvalid:
+      return "HandleInvalid";
+    case ErrorCause::kOwnImage:
+      return "OwnImage";
+    case ErrorCause::kDuplicateTarget:
+      return "DuplicateTarget";
+    case ErrorCause::kOutputAlias:
+      return "OutputAlias";
+    case ErrorCause::kReplacementIsCurrent:
+      return "ReplacementIsCurrent";
+    case ErrorCause::kOriginalCapacity:
+      return "OriginalCapacity";
+    case ErrorCause::kMetadataBounds:
+      return "MetadataBounds";
+    case ErrorCause::kScanBudget:
+      return "ScanBudget";
+    case ErrorCause::kMapsUnavailable:
+      return "MapsUnavailable";
+    case ErrorCause::kMapsCoverage:
+      return "MapsCoverage";
+    case ErrorCause::kVmaPolicy:
+      return "VmaPolicy";
+    case ErrorCause::kProtectFailed:
+      return "ProtectFailed";
+    case ErrorCause::kExpectedCurrent:
+      return "ExpectedCurrent";
+    case ErrorCause::kCasConflict:
+      return "CasConflict";
+    case ErrorCause::kInternalException:
+      return "InternalException";
+    case ErrorCause::kHostCallback:
+      return "HostCallback";
+    case ErrorCause::kRandomSource:
+      return "RandomSource";
+    case ErrorCause::kPlatform:
+      return "Platform";
+    case ErrorCause::kIdentityMismatch:
+      return "IdentityMismatch";
+    case ErrorCause::kSlotDrift:
+      return "SlotDrift";
+  }
+  return "Unknown";
+}
+
 /// Copies the last operation and residual pages under the Registry lock only.
 /// Never reads an image, GOT or maps. diagnostic is required; pages may be null
 /// for count-only (capacity must then be zero). At most capacity pages are
 /// copied; diagnostic.residual_page_count always gives the total. Outputs are
 /// unchanged on failure. A consumed handle has no queryable history.
-[[nodiscard]] Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic,
-                                   ResidualPage* pages = nullptr, size_t capacity = 0);
+[[nodiscard]] YUKIPLT_API Error query_recovery(const HookHandle& handle,
+                                               RecoveryDiagnostic* diagnostic,
+                                               ResidualPage* pages = nullptr, size_t capacity = 0);
 
 enum class ImageMatch : uint8_t { kMainExecutable, kExactPath, kBasename, kLoadBias };
 struct ImageSelector {
@@ -1155,14 +1330,14 @@ struct NamedImage {
 /// Explicit matching of publicly enumerable system images, never implicit
 /// match-all. Empty matches return kImageNotFound. Paths are owned; ImageViews
 /// are not pinned. No promise of visibility into every linker namespace.
-Result<std::vector<NamedImage>> find_images(const ImageSelector& selector);
+YUKIPLT_API Result<std::vector<NamedImage>> find_images(const ImageSelector& selector);
 
 /// Find one publicly enumerable image whose actual PT_LOAD memory interval
 /// contains address. Holes are excluded, all images are enumerated to reject
 /// ambiguity. The result owns its path but does not hold the image alive.
 /// On Android ARM64 only the query's TBI top byte is ignored. This does not
 /// validate a memory tag, strip PAC signatures, or establish pointer validity.
-Result<NamedImage> find_image_containing(const void* address);
+YUKIPLT_API Result<NamedImage> find_image_containing(const void* address);
 
 struct HookTarget {
   ImageView image;
@@ -1184,17 +1359,24 @@ class HookPlan {
 
  private:
   friend Result<HookPlan> build_hook_plan(const HookTarget*, size_t, size_t*);
+  friend Result<HookSession> prepare_session(const HookPlan&);
   std::vector<PlannedTarget> targets_;
+  std::vector<std::string> paths_;  ///< Per target: system image path when planned.
 };
 
 /// Resolve every target without writing GOT, outputs, permissions or Registry.
+/// For a system image the plan also records the image's path as loaded at
+/// planning time; installation requires the image at the same bias and program
+/// headers to still carry that path, otherwise the group fails with
+/// kImageInvalidated (another image now occupies that address).  This cannot
+/// detect a same-address, same-path reload: unhook or abandon before dlclose.
 /// Failure reports the first target index (~0 for an error not tied to one).
 /// Strings are copied. Same-slot targets and shared non-null outputs fail.
 /// At most 64 targets per identical ImageView; no cross-image atomicity.
 /// Caller keeps images, headers, replacements and output storage alive through
 /// installation/recovery; planning does not pin images or freeze GOT values.
-Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count,
-                                 size_t* failed_target = nullptr);
+YUKIPLT_API Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count,
+                                             size_t* failed_target = nullptr);
 
 enum class SessionState : uint8_t {
   kPrepared,
@@ -1250,22 +1432,23 @@ class HookSession {
   /// errors; no rollback across images. Retry only Prepared/InstallFailed.
   /// A remaining Indeterminate/RestoreFailed group counts as failed and is
   /// never overwritten: explicitly unhook/abandon it first.
-  SessionSummary install();
+  YUKIPLT_API SessionSummary install();
   /// Reverse image order, attempt every valid handle despite earlier errors.
   /// Failed handles remain retryable; invalidated images consume their handle.
-  SessionSummary unhook();
+  YUKIPLT_API SessionSummary unhook();
   /// Drop all remaining ownership without touching slots or page protections.
-  SessionSummary abandon();
+  YUKIPLT_API SessionSummary abandon();
 
  private:
   friend Result<HookSession> prepare_session(const HookPlan&);
   std::vector<SessionTargetResult> targets_;
   std::vector<SessionImageResult> images_;
+  std::vector<std::string> paths_;  ///< Per image group: planned system path.
 };
 
 /// Copy a validated plan and preallocate every report/group before any write.
 /// Failure never leaves a partial session or any installed hook.
-Result<HookSession> prepare_session(const HookPlan& plan);
+YUKIPLT_API Result<HookSession> prepare_session(const HookPlan& plan);
 
 /// Optional value precondition, checked after VMA validation and before page
 /// raises/original publication. A later external writer is still checked by CAS.
@@ -1279,13 +1462,13 @@ struct FunctionHookRequestEx {
 };
 /// diagnostic is the immediate operation result, including failures without a
 /// surviving handle. It must not alias requests/reports/original outputs.
-HookResult hook_function_imports_ex(const ImageView&, const FunctionHookRequestEx*, size_t count,
-                                    SlotReport* reports = nullptr,
-                                    RecoveryDiagnostic* diagnostic = nullptr);
+YUKIPLT_API HookResult hook_function_imports_ex(const ImageView&, const FunctionHookRequestEx*,
+                                                size_t count, SlotReport* reports = nullptr,
+                                                RecoveryDiagnostic* diagnostic = nullptr);
 
 /// Borrowed selector strings remain valid only while the owning import is
 /// unchanged/alive. Pins exact source, type, version, hidden bit and table index.
-FunctionImportSelector exact_function_selector(const FunctionImport&) noexcept;
+YUKIPLT_API FunctionImportSelector exact_function_selector(const FunctionImport&) noexcept;
 
 struct FunctionHookTarget {
   ImageView image;
@@ -1299,6 +1482,7 @@ struct FunctionPlannedTarget {
   bool require_current = false;
   uintptr_t expected_current = 0;
 };
+class FunctionHookSession;
 class FunctionHookPlan {
  public:
   const std::vector<FunctionPlannedTarget>& targets() const noexcept { return targets_; }
@@ -1306,12 +1490,17 @@ class FunctionHookPlan {
  private:
   friend Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget*, size_t,
                                                            size_t*);
+  friend Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
   std::vector<FunctionPlannedTarget> targets_;
+  std::vector<std::string> paths_;  ///< Per target: system image path when planned.
 };
 /// Read-only owning metadata; never reads GOT or holds an image alive. One
-/// image group is limited to 64 targets, with no automatic splitting.
-Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget*, size_t count,
-                                                  size_t* failed_target = nullptr);
+/// image group is limited to 64 targets, with no automatic splitting.  Like
+/// build_hook_plan(), a system image's path is recorded at planning time and
+/// must still match at installation (kImageInvalidated otherwise).
+YUKIPLT_API Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget*,
+                                                              size_t count,
+                                                              size_t* failed_target = nullptr);
 struct FunctionSessionTargetResult {
   FunctionPlannedTarget target;
   void* original = nullptr;
@@ -1340,16 +1529,17 @@ class FunctionHookSession {
   FunctionHookSession& operator=(FunctionHookSession&&) noexcept = default;
   const std::vector<FunctionSessionTargetResult>& targets() const noexcept { return targets_; }
   const std::vector<FunctionSessionImageResult>& images() const noexcept { return images_; }
-  SessionSummary install();
-  SessionSummary unhook();
-  SessionSummary abandon();
+  YUKIPLT_API SessionSummary install();
+  YUKIPLT_API SessionSummary unhook();
+  YUKIPLT_API SessionSummary abandon();
 
  private:
   friend Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
   std::vector<FunctionSessionTargetResult> targets_;
   std::vector<FunctionSessionImageResult> images_;
+  std::vector<std::string> paths_;  ///< Per image group: planned system path.
 };
-Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
+YUKIPLT_API Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
 
 // Explicit rule refresh; no background tracking. Each (rule, image instance)
 // owns one single-slot group. Serialize all operations and result reads per
@@ -1397,7 +1587,13 @@ enum class RuleOperationStage : uint32_t {
   kCapacity,
   kInstall,
   kRestore,
-  kAbandon
+  kAbandon,
+  /// refresh() re-verified an installed system-image binding under the linker
+  /// lock.  kImageInvalidated: the bound identity (bias, program headers and
+  /// path) is no longer loaded.  kSlotModifiedExternally: a slot no longer holds
+  /// the replacement.  kVmaUnavailable: a slot could not be read.  The binding
+  /// keeps its handle and ownership in every case; nothing is reinstalled.
+  kVerify
 };
 struct RuleOperationEvent {
   uint64_t rule_id = 0;
@@ -1440,7 +1636,7 @@ struct RuleSetStatistics {
 class RuleSet {
  public:
   RuleSet() = default;
-  ~RuleSet();
+  YUKIPLT_API ~RuleSet();
   RuleSet(const RuleSet&) = delete;
   RuleSet& operator=(const RuleSet&) = delete;
   RuleSet(RuleSet&&) noexcept = default;
@@ -1451,12 +1647,13 @@ class RuleSet {
   // Capacity zero disables original output. Exhaustion fails before writes and is
   // terminal for that binding; remove and re-register with larger storage to recover.
   // A null/empty symbol returns NullPointer/InvalidArgument.
-  Result<uint64_t> add_rule(const ImageSelector& filter, const FunctionImportSelector& selector,
-                            void* replacement, void** out_originals, size_t capacity);
+  YUKIPLT_API Result<uint64_t> add_rule(const ImageSelector& filter,
+                                        const FunctionImportSelector& selector, void* replacement,
+                                        void** out_originals, size_t capacity);
 
   /// Convenience overload for a plain JUMP_SLOT name/version selector.
-  Result<uint64_t> add_rule(const ImageSelector& filter, const ImportSelector& selector,
-                            void* replacement, void** out_originals, size_t capacity);
+  YUKIPLT_API Result<uint64_t> add_rule(const ImageSelector& filter, const ImportSelector& selector,
+                                        void* replacement, void** out_originals, size_t capacity);
 
   // Prepare all enumeration caches/reports before any install; preparation failure
   // returns failed=1, attempted=retained=0. Use the report overload for its error.
@@ -1469,44 +1666,45 @@ class RuleSet {
   // Only core-confirmed invalidation ends ownership; callers prevent reload ABA.
   // retained counts unique targets enumerated this call, including skipped live
   // bindings. statistics().active_handles counts the entire outstanding population.
-  RuleSummary refresh();
+  YUKIPLT_API RuleSummary refresh();
 
   /// Undo this RuleSet's hooks on one image instance before the caller unloads
   /// it.  Failure keeps the handle and ownership and is reported.  This does not
   /// disable the rules: a later refresh()/notify_loaded() that still finds the
   /// instance applies them again (see refresh()); remove_rule() stops a rule.
-  RuleSummary release_image(const ImageView& image);
+  YUKIPLT_API RuleSummary release_image(const ImageView& image);
 
   // Custom-loader notifications run synchronously after relocation/final
   // protections and before unmapping, respectively. Keep the instance stable,
   // serialize RuleSet access, and hold no loader lock or dl_iterate_phdr callback.
   // path supplies diagnostics and matching. Token-0 system images are rejected.
-  RuleSummary notify_loaded(const ImageView& image, const char* path);
-  RuleSummary notify_unloading(const ImageView& image);
+  YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path);
+  YUKIPLT_API RuleSummary notify_unloading(const ImageView& image);
 
   /// Remove a rule: undo all its bindings (reverse order), keep failures, and
   /// stop it participating in future refreshes.
-  RuleSummary remove_rule(uint64_t rule_id);
+  YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id);
 
   /// Undo all of this RuleSet's hooks (reverse order), keeping failures.  The
   /// rules stay registered; a later refresh() applies them again.
-  RuleSummary unhook();
+  YUKIPLT_API RuleSummary unhook();
 
   /// Relinquish all registrations without touching memory.  Abandoned bindings
   /// are never re-applied by refresh()/notify_loaded().
-  RuleSummary abandon();
+  YUKIPLT_API RuleSummary abandon();
 
   /// Detailed overloads reserve all report storage before any hook/unhook.
   /// A preparation failure returns failed=1, attempted=0 and preserves hooks.
-  RuleSummary refresh(RuleOperationReport& report);
-  RuleSummary notify_loaded(const ImageView& image, const char* path, RuleOperationReport& report);
-  RuleSummary notify_unloading(const ImageView& image, RuleOperationReport& report);
-  RuleSummary release_image(const ImageView& image, RuleOperationReport& report);
-  RuleSummary remove_rule(uint64_t rule_id, RuleOperationReport& report);
-  RuleSummary unhook(RuleOperationReport& report);
-  RuleSummary abandon(RuleOperationReport& report);
-  [[nodiscard]] RuleSetStatistics statistics() const noexcept;
-  [[nodiscard]] Result<RuleStatistics> statistics(uint64_t rule_id) const noexcept;
+  YUKIPLT_API RuleSummary refresh(RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path,
+                                        RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_unloading(const ImageView& image, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary release_image(const ImageView& image, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary unhook(RuleOperationReport& report);
+  YUKIPLT_API RuleSummary abandon(RuleOperationReport& report);
+  [[nodiscard]] YUKIPLT_API RuleSetStatistics statistics() const noexcept;
+  [[nodiscard]] YUKIPLT_API Result<RuleStatistics> statistics(uint64_t rule_id) const noexcept;
 
   /// Per-(rule, image instance) results.  Valid until the next mutation.
   [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
@@ -1537,6 +1735,9 @@ class RuleSet {
   void apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
                            const char* expected_path, RuleSummary& summary,
                            RuleOperationEvent* event = nullptr);
+  // Re-verify an installed system-image binding found again by refresh().
+  void verify_binding(size_t index, const char* expected_path, RuleSummary& summary,
+                      RuleOperationEvent* event);
   Error prepare_undo_report(RuleOperationReport& report, uint64_t rule_id, const ImageView* image,
                             RuleOperationStage stage) const;
   void finish_undo_report(RuleOperationReport& report) const;
@@ -1622,7 +1823,7 @@ struct CandidateSelection {
 /// the image before any host callback. This does not eliminate same-path ABA.
 /// Failure returns no partial candidates; host callback side effects, if any,
 /// cannot be undone. Caller keeps supplied images stable for snapshot acquisition.
-Result<std::vector<FunctionCandidate>> expand_function_candidates(
+YUKIPLT_API Result<std::vector<FunctionCandidate>> expand_function_candidates(
     const NamedImage* images, size_t count, const CandidateSelection& selection);
 
 /// Stable original-address storage. Keep it and all replacement code/context

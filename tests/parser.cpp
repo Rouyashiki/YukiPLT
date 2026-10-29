@@ -450,10 +450,16 @@ TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
       .add_jump_slot(1);
   set_backing(b.build());
   wr(image.got_slot_addr(0), 0);
-  auto result =
-      hook_function_import(view(), sel("weak", kSourceJmprel, kTypeJumpSlot), kReplA, &outputs[0]);
+  SlotReport report{};
+  auto result = hook_function_import(view(), sel("weak", kSourceJmprel, kTypeJumpSlot), kReplA,
+                                     &outputs[0], &report);
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(outputs[0], nullptr);
+
+  EXPECT_EQ(rd(image.got_slot_addr(0)), reinterpret_cast<uintptr_t>(kReplA));
+  EXPECT_EQ(report.address, image.got_slot_addr(0));
+  EXPECT_EQ(report.value_before, 0u);
+  EXPECT_EQ(report.status, SlotStatus::kInstalled);
   EXPECT_FALSE(unhook(result.handle));
   EXPECT_EQ(rd(image.got_slot_addr(0)), 0u);
 }

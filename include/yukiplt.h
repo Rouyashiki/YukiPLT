@@ -57,6 +57,14 @@
 #error "YukiPLT supports only little-endian targets"
 #endif
 
+// Public symbol visibility; static consumers define YUKIPLT_STATIC.
+
+#if defined(__GNUC__) || defined(__clang__)
+#define YUKIPLT_API __attribute__((visibility("default")))
+#else
+#define YUKIPLT_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #define YUKIPLT_C_NOEXCEPT noexcept
@@ -177,7 +185,8 @@ enum {
   YUKIPLT_C_FEATURE_ERROR_NAMES = 3,
   YUKIPLT_C_FEATURE_EXPECTED_CURRENT = 4,
   YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY = 5,
-  YUKIPLT_C_FEATURE_REL_IMPORTS = 6
+  YUKIPLT_C_FEATURE_REL_IMPORTS = 6,
+  YUKIPLT_C_FEATURE_ERROR_CAUSES = 7
 };
 
 enum {
@@ -209,10 +218,10 @@ typedef struct yukiplt_c_residual_page {
 // Registry-only recorded state, not current permissions. diagnostic is required;
 // pages may be NULL with zero capacity for count-only. Copies at most capacity
 // pages, and reports the full count. Outputs remain unchanged on error.
-yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle*,
-                                         yukiplt_c_recovery_diagnostic* diagnostic,
-                                         yukiplt_c_residual_page* pages,
-                                         size_t capacity) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle*,
+                                                     yukiplt_c_recovery_diagnostic* diagnostic,
+                                                     yukiplt_c_residual_page* pages,
+                                                     size_t capacity) YUKIPLT_C_NOEXCEPT;
 
 // struct_size must be set to sizeof(yukiplt_c_function_selector) (use the macro);
 // a mismatch is rejected with INVALID_ARGUMENT.  It is a layout check, not an
@@ -242,11 +251,14 @@ typedef struct yukiplt_c_function_request {
 // ABI v1 targets native ARM64/ARM32/x86_64/x86 Android API23+. No STL, allocation ownership or C++
 // exceptions cross this boundary. Error values match the C++ core. No operation
 // silently succeeds after partial commit: INDETERMINATE retains a valid token.
-uint32_t yukiplt_c_abi_version(void) YUKIPLT_C_NOEXCEPT;
+// Threading: the C entry points follow the threading contract in yukiplt.h.
+// They may be called concurrently; one handle token must not be used by two
+// threads at once; no callback runs under internal locks.
+YUKIPLT_API uint32_t yukiplt_c_abi_version(void) YUKIPLT_C_NOEXCEPT;
 // Stable literal; never allocates. Unknown numeric values return "Unknown".
-const char* yukiplt_c_error_name(uint32_t code) YUKIPLT_C_NOEXCEPT;
-yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
-                                            yukiplt_c_image* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API const char* yukiplt_c_error_name(uint32_t code) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
+                                                        yukiplt_c_image* out) YUKIPLT_C_NOEXCEPT;
 
 // Strings are borrowed during the call. Selector filters are ANDed and must
 // select one JUMP_SLOT. No GLOB_DAT/APS2. Caller holds images/replacements/output
@@ -261,24 +273,26 @@ yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
 // installed. Replacement must acquire-load them. They may be another hook's
 // replacement. A clean failure leaves no net GOT change, restored protections
 // and no ownership; that excludes original outputs.
-yukiplt_c_error yukiplt_c_hook(const yukiplt_c_image*, const yukiplt_c_selector*, void* replacement,
-                               void** out_original, yukiplt_c_handle* out_handle,
-                               yukiplt_c_slot_report* report) YUKIPLT_C_NOEXCEPT;
-yukiplt_c_error yukiplt_c_hook_batch(const yukiplt_c_image*, const yukiplt_c_request*, size_t count,
-                                     yukiplt_c_handle* out_handle,
-                                     yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook(const yukiplt_c_image*, const yukiplt_c_selector*,
+                                           void* replacement, void** out_original,
+                                           yukiplt_c_handle* out_handle,
+                                           yukiplt_c_slot_report* report) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch(const yukiplt_c_image*, const yukiplt_c_request*,
+                                                 size_t count, yukiplt_c_handle* out_handle,
+                                                 yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
 // One image, 1..64 requests, reports either NULL or at least count elements.
 // Transaction recovery is guaranteed, not an atomic cross-slot switch.
 
 // Success and IMAGE_INVALIDATED consume the handle. IMAGE_INVALIDATED means a
 // system image no longer loaded or a custom image passed to forget_image.
 // Transient/conflict/OOM/OUT_OF_BOUNDS/VMA_UNAVAILABLE/INDETERMINATE failures
-// preserve it for retry. Success does not establish replacement quiescence;
-// caller must coordinate code/context reclamation.
-yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle*, yukiplt_c_slot_report* reports,
-                                 size_t capacity) YUKIPLT_C_NOEXCEPT;
+// preserve it for retry; for unhook, OUT_OF_BOUNDS can only mean a slot page
+// missing from the maps read (unhook parses no ELF metadata). Success does not establish
+// replacement quiescence; caller must coordinate code/context reclamation.
+YUKIPLT_API yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle*, yukiplt_c_slot_report* reports,
+                                             size_t capacity) YUKIPLT_C_NOEXCEPT;
 // Only relinquishes ownership; never changes slots or permissions.
-yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle*) YUKIPLT_C_NOEXCEPT;
 // Slot status is operation-specific: hook reports commit/rollback outcomes;
 // unhook reports RESTORED only for slots previously written by this owner and
 // UNTOUCHED for never-written slots, with actual before/observed values. Query
@@ -288,18 +302,18 @@ yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle*) YUKIPLT_C_NOEXCEPT;
 // count, remain unchanged.
 // count receives total slots; at most capacity reports are filled. Reports may
 // be NULL (count-only). A copied token here is a borrowed view, not a new owner.
-yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle*, yukiplt_c_slot_report* reports,
-                                size_t capacity, size_t* count) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle*, yukiplt_c_slot_report* reports,
+                                            size_t capacity, size_t* count) YUKIPLT_C_NOEXCEPT;
 // Custom images only; matches load bias, Program Header address/count and
 // token. Coordinate with the owner before unmapping; handles then unhook as
 // IMAGE_INVALIDATED. System reload at the same address remains ABA.
-yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image*) YUKIPLT_C_NOEXCEPT;
 
 // Returns nonzero if the running library implements the given feature id (one of
 // YUKIPLT_C_FEATURE_*).  The ABI version stays 1; this lets a caller built
 // against a newer header detect whether the opt-in function-import entry points
 // below are present before calling them.
-int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
 
 // Opt-in function-import hooks (JUMP_SLOT + function GLOB_DAT across the named
 // sources).  Same image/selector/transaction/ownership/original-output contract
@@ -310,13 +324,13 @@ int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
 // nonzero current slot value; any other matched relocation fails the whole call
 // with UNSUPPORTED_RELOCATION and modifies nothing.  Unhook/abandon/query with
 // the shared yukiplt_c_unhook/abandon/query functions.
-yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image*, const yukiplt_c_function_selector*,
-                                        void* replacement, void** out_original,
-                                        yukiplt_c_handle* out_handle,
-                                        yukiplt_c_slot_report* report) YUKIPLT_C_NOEXCEPT;
-yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image*, const yukiplt_c_function_request*,
-                                         size_t count, yukiplt_c_handle* out_handle,
-                                         yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_hook_function(const yukiplt_c_image*, const yukiplt_c_function_selector*,
+                        void* replacement, void** out_original, yukiplt_c_handle* out_handle,
+                        yukiplt_c_slot_report* report) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions(
+    const yukiplt_c_image*, const yukiplt_c_function_request*, size_t count,
+    yukiplt_c_handle* out_handle, yukiplt_c_slot_report* reports) YUKIPLT_C_NOEXCEPT;
 
 typedef struct yukiplt_c_function_request_ex {
   uint32_t struct_size;  // Must equal sizeof(this exact layout).
@@ -328,15 +342,74 @@ typedef struct yukiplt_c_function_request_ex {
 // complete VMA validation and before permissions/publication; CAS still applies.
 // diagnostic is optional and immediate, including clean precondition failure.
 // Output buffers must not alias requests or each other.
-yukiplt_c_error yukiplt_c_hook_functions_ex(
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_ex(
     const yukiplt_c_image*, const yukiplt_c_function_request_ex*, size_t count,
     yukiplt_c_handle* out_handle, yukiplt_c_slot_report* reports,
     yukiplt_c_recovery_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
 // Actual LOAD intervals only; complete enumeration rejects ambiguity. Android
 // ARM64 ignores only the query's TBI top byte, without validating tags/PAC or
 // pointer validity. The returned image is not held alive.
-yukiplt_c_error yukiplt_c_image_containing(const void* address,
-                                           yukiplt_c_image* out_image) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_image_containing(const void* address, yukiplt_c_image* out_image) YUKIPLT_C_NOEXCEPT;
+
+// --- Error causes (YUKIPLT_C_FEATURE_ERROR_CAUSES) ---
+//
+// Some error codes cover several causes (for example OUT_OF_BOUNDS is metadata
+// outside a LOAD, an exhausted scan budget, or a page missing from the maps
+// read).  The *_diagnosed entry points behave exactly like their counterparts
+// and also fill a yukiplt_c_operation_diagnostic for this call, on success and
+// on every failure.  Values match yukiplt::ErrorCause; new ones may be
+// appended, and an unknown value must be treated like NONE.
+enum {
+  YUKIPLT_C_CAUSE_NONE = 0,
+  YUKIPLT_C_CAUSE_INVALID_REQUEST = 1,
+  YUKIPLT_C_CAUSE_HANDLE_INVALID = 2,
+  YUKIPLT_C_CAUSE_OWN_IMAGE = 3,
+  YUKIPLT_C_CAUSE_DUPLICATE_TARGET = 4,
+  YUKIPLT_C_CAUSE_OUTPUT_ALIAS = 5,
+  YUKIPLT_C_CAUSE_REPLACEMENT_IS_CURRENT = 6,
+  YUKIPLT_C_CAUSE_ORIGINAL_CAPACITY = 7,
+  YUKIPLT_C_CAUSE_METADATA_BOUNDS = 8,
+  YUKIPLT_C_CAUSE_SCAN_BUDGET = 9,
+  YUKIPLT_C_CAUSE_MAPS_UNAVAILABLE = 10,
+  YUKIPLT_C_CAUSE_MAPS_COVERAGE = 11,
+  YUKIPLT_C_CAUSE_VMA_POLICY = 12,
+  YUKIPLT_C_CAUSE_PROTECT_FAILED = 13,
+  YUKIPLT_C_CAUSE_EXPECTED_CURRENT = 14,
+  YUKIPLT_C_CAUSE_CAS_CONFLICT = 15,
+  YUKIPLT_C_CAUSE_INTERNAL_EXCEPTION = 16,
+  YUKIPLT_C_CAUSE_HOST_CALLBACK = 17,
+  YUKIPLT_C_CAUSE_RANDOM_SOURCE = 18,
+  YUKIPLT_C_CAUSE_PLATFORM = 19,
+  YUKIPLT_C_CAUSE_IDENTITY_MISMATCH = 20,
+  YUKIPLT_C_CAUSE_SLOT_DRIFT = 21
+};
+// A new struct (version 1); existing structs are unchanged.  struct_size must
+// equal sizeof(yukiplt_c_operation_diagnostic) on input, else INVALID_ARGUMENT
+// and nothing else happens.
+typedef struct yukiplt_c_operation_diagnostic {
+  uint32_t struct_size;
+  uint32_t stage;  // YUKIPLT_C_STAGE_*
+  uint32_t cause;  // YUKIPLT_C_CAUSE_*
+  yukiplt_c_error error;
+  int32_t raise_errno;
+  int32_t restore_errno;
+  uint32_t rollback_failed;
+  uint32_t image_invalidated;
+  uint32_t handle_consumed;  // unhook only: this call consumed the handle.
+  size_t residual_page_count;
+} yukiplt_c_operation_diagnostic;
+// Same contract as yukiplt_c_hook_functions_ex, plus the diagnostic.
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed(
+    const yukiplt_c_image*, const yukiplt_c_function_request_ex*, size_t count,
+    yukiplt_c_handle* out_handle, yukiplt_c_slot_report* reports,
+    yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+// Same contract as yukiplt_c_unhook, plus the diagnostic.
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_unhook_diagnosed(yukiplt_c_handle*, yukiplt_c_slot_report* reports, size_t capacity,
+                           yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+// Stable literal; never allocates. Unknown values return "Unknown".
+YUKIPLT_API const char* yukiplt_c_error_cause_name(uint32_t cause) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

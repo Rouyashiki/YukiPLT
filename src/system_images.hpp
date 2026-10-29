@@ -27,6 +27,36 @@ HookResult hook_function_imports_at(const ImageView& image, const char* expected
                                     const FunctionHookRequest* reqs, size_t count,
                                     SlotReport* reports);
 
+/// hook_imports() / hook_function_imports_ex() for a planned system image whose
+/// discovery path is known; same expected_path rule as above.
+HookResult hook_imports_at(const ImageView& image, const char* expected_path,
+                           const SelectedHookRequest* reqs, size_t count, SlotReport* reports);
+HookResult hook_function_imports_ex_at(const ImageView& image, const char* expected_path,
+                                       const FunctionHookRequestEx* reqs, size_t count,
+                                       SlotReport* reports, RecoveryDiagnostic* diagnostic);
+
+/// The live path (dlpi_name, "" when absent) of the system image with exactly
+/// this bias/phdr/phnum, read under the linker lock.  kImageInvalidated when no
+/// such image is loaded.  Custom images (nonzero token) have no linker path and
+/// return an empty string.
+Result<std::string> system_image_path(const ImageView& image);
+
+/// Re-verify an installed group without writing anything.  Under the linker
+/// lock (system image) or the op lock (custom image), confirm that the group's
+/// image still carries the identity it was installed with — bias, program
+/// headers and, when `expected_path` is non-null, its path — and that every
+/// slot the group wrote still holds its replacement.  Returns:
+///   Ok                       identity and every written slot unchanged;
+///   kImageInvalidated        the identity is no longer loaded (cause
+///                            kIdentityMismatch); the handle is NOT consumed;
+///   kSlotModifiedExternally  a slot no longer holds the replacement (cause
+///                            kSlotDrift); `report` names the first such slot;
+///   kVmaUnavailable/kOutOfBounds  a slot could not be read;
+///   kInvalidArgument         a stale handle.
+/// Matching does not prove the same instance: a same-address reload with the
+/// same path and the same slot values is indistinguishable (ABA).
+Error verify_installed_at(const HookHandle& handle, const char* expected_path, SlotReport* report);
+
 }  // namespace yukiplt::detail
 
 #endif  // YUKIPLT_SYSTEM_IMAGES_HPP_

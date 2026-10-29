@@ -93,8 +93,9 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_pa
     const char* want_path;
     Fn* fn;
     bool matched;
+    bool path_mismatch;
     std::exception_ptr error;
-  } ctx{&want, want_path, &fn, false, nullptr};
+  } ctx{&want, want_path, &fn, false, false, nullptr};
 
   dl_iterate_phdr(
       [](struct dl_phdr_info* info, size_t /*size*/, void* p) -> int {
@@ -106,6 +107,7 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_pa
         }
         if (c->want_path != nullptr &&
             std::strcmp(info->dlpi_name == nullptr ? "" : info->dlpi_name, c->want_path) != 0) {
+          c->path_mismatch = true;
           return 1;  // Same address, different image: the wanted one is gone.
         }
         ImageView live;
@@ -124,6 +126,9 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_pa
       },
       &ctx);
   if (ctx.error) std::rethrow_exception(ctx.error);
+  // Not found under the wanted identity (gone, or another path at the same
+  // bias/program headers): the caller reports kImageInvalidated.
+  if (!ctx.matched) detail::note_cause(ErrorCause::kIdentityMismatch);
   return ctx.matched;
 #else
   (void)want;
@@ -158,9 +163,12 @@ Error validate_outputs(const Request* reqs, size_t count) noexcept {
     void** out = reqs[i].out_original;
     if (out == nullptr) continue;
     if (reinterpret_cast<uintptr_t>(out) % alignof(void*) != 0)
-      return Error::Make(ErrorCode::kInvalidArgument);
+      return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                ErrorCause::kInvalidRequest);
     for (size_t j = 0; j < i; ++j) {
-      if (reqs[j].out_original == out) return Error::Make(ErrorCode::kInvalidArgument);
+      if (reqs[j].out_original == out)
+        return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                  ErrorCause::kOutputAlias);
     }
   }
   return Error::Ok();
@@ -177,6 +185,9 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
   for (size_t i = 0; i < count; ++i) {
     if (reqs[i].symbol == nullptr || reqs[i].replacement == nullptr)
       return Error::Make(ErrorCode::kNullPointer);
+    // The legacy name path keeps its historical code for an empty name
+    // (kSymbolNotFound) but never lets "" match an unnamed record.
+    if (reqs[i].symbol[0] == '\0') return Error::Make(ErrorCode::kSymbolNotFound);
 
     const ImportInfo* selected = nullptr;
     for (const auto& entry : snapshot.value().imports) {
@@ -187,7 +198,9 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
     if (!selected) return Error::Make(ErrorCode::kSymbolNotFound);
     uintptr_t addr = selected->slot_address;
     for (const PlannedSlot& p : out) {
-      if (p.address == addr) return Error::Make(ErrorCode::kInvalidArgument);  // duplicate target
+      if (p.address == addr)
+        return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                  ErrorCause::kDuplicateTarget);
     }
     PlannedSlot ps;
     ps.address = addr;
@@ -210,7 +223,9 @@ Error plan_selected_requests(const InspectedImage& img, const SelectedHookReques
     if (!selected) return selected.error();
     const auto address = snapshot.value().imports[selected.value()].import.slot_address;
     for (const auto& previous : out) {
-      if (previous.address == address) return Error::Make(ErrorCode::kInvalidArgument);
+      if (previous.address == address)
+        return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                  ErrorCause::kDuplicateTarget);
     }
     out.push_back(
         {address, 0, reinterpret_cast<uintptr_t>(reqs[i].replacement), reqs[i].out_original, i});
@@ -267,14 +282,23 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   for (const auto& slot : planned) {
     const uintptr_t output = reinterpret_cast<uintptr_t>(slot.out_original);
     if (output == 0) continue;
-    if (reg.owns_slot(output)) return {Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
+    const Error alias =
+        detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kOutputAlias);
+    if (reg.owns_slot(output)) return {alias, HookHandle{}};
     for (const auto& target : planned)
-      if (output == target.address) return {Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
+      if (output == target.address) return {alias, HookHandle{}};
   }
 
   const size_t ps = detail::page_size();
   if (ps == 0)
-    return {Error::Make(ErrorCode::kUnsupportedFormat), detail_api::make(detail_api::invalid())};
+    return {detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kPlatform),
+            detail_api::make(detail_api::invalid())};
+  // Without the per-copy handle salt the Registry issues no ids; report the
+  // random source's errno rather than falling back to a predictable salt.
+  if (!reg.salt_ready())
+    return {detail::with_cause(Error::Sys(ErrorCode::kUnsupportedFormat, reg.salt_errno()),
+                               ErrorCause::kRandomSource),
+            detail_api::make(detail_api::invalid())};
 
   // Reserve ownership of every slot before any write (one slot, one owner).
   SlotRecord recs[kMaxBatch];
@@ -320,7 +344,9 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
         reports[planned[i].report_index].value_observed = cur;
         reports[planned[i].report_index].status = SlotStatus::kConflict;
       }
-      return {Error::Make(ErrorCode::kSlotOwnershipConflict), HookHandle{}};
+      return {detail::with_cause(Error::Make(ErrorCode::kSlotOwnershipConflict),
+                                 ErrorCause::kExpectedCurrent),
+              HookHandle{}};
     }
     // Reject unresolved GLOB_DAT before any write. Zero JUMP_SLOT remains valid.
     if (planned[i].reject_zero_original && cur == 0) {
@@ -328,7 +354,9 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
               detail_api::make(detail_api::invalid())};
     }
     if (cur == planned[i].replacement) {  // replacement == current value: ambiguous ownership
-      return {Error::Make(ErrorCode::kInvalidArgument), detail_api::make(detail_api::invalid())};
+      return {detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                 ErrorCause::kReplacementIsCurrent),
+              detail_api::make(detail_api::invalid())};
     }
     ops[i].slot = planned[i].address;
     ops[i].expected = cur;
@@ -389,8 +417,12 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   if (pn > 0 || r.rollback_failed) {
     reg.mark_indeterminate(id, recs, planned.size(), pr, pn);
     claim.retained = true;
-    const Error error = Error::Sys(ErrorCode::kIndeterminate,
-                                   r.restore_errno != 0 ? r.restore_errno : r.raise_errno);
+    const Error error =
+        detail::with_cause(Error::Sys(ErrorCode::kIndeterminate,
+                                      r.restore_errno != 0 ? r.restore_errno : r.raise_errno),
+                           // A page left raised is a failed protection restore; otherwise the
+                           // residue is a rollback CAS that lost to another writer.
+                           pn != 0 ? ErrorCause::kProtectFailed : ErrorCause::kCasConflict);
     reg.record_diagnostic(id, {pn != 0 ? OperationStage::kRestorePages : OperationStage::kRollback,
                                error, r.raise_errno, r.restore_errno, r.rollback_failed});
     if (diagnostic) {
@@ -403,9 +435,12 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   // Every raised page was restored and no rollback failed, so nothing is left
   // modified: free the group and report the first cause.
   if (r.raise_errno != 0)
-    return {Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
+    return {detail::with_cause(Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
+                               ErrorCause::kProtectFailed),
             detail_api::make(detail_api::invalid())};
-  return {Error::Make(ErrorCode::kSlotOwnershipConflict), detail_api::make(detail_api::invalid())};
+  return {
+      detail::with_cause(Error::Make(ErrorCode::kSlotOwnershipConflict), ErrorCause::kCasConflict),
+      detail_api::make(detail_api::invalid())};
 }
 
 /// Plan a function-import batch: one scan of the image's selected sources shared
@@ -429,7 +464,9 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
     const auto& record = scan.value().records[selected.value()].entry;
     const uintptr_t address = record.base.import.slot_address;
     for (const auto& previous : out) {
-      if (previous.address == address) return Error::Make(ErrorCode::kInvalidArgument);
+      if (previous.address == address)
+        return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                  ErrorCause::kDuplicateTarget);
     }
     PlannedSlot ps;
     ps.address = address;
@@ -437,8 +474,9 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
     ps.replacement = reinterpret_cast<uintptr_t>(reqs[i].replacement);
     ps.out_original = reqs[i].out_original;
     ps.report_index = i;
-    // Only a GLOB_DAT slot must refuse a zero current value; a JUMP_SLOT slot is
-    // installed regardless (its lazy stub value is non-zero and legitimate).
+    // Only a GLOB_DAT slot must refuse a zero current value.  A JUMP_SLOT is
+    // installed whatever it holds, including 0: the caller asserted eager
+    // binding, and its original is reported as found (0 included).
     ps.reject_zero_original = record.relocation_type == detail::kRelGlobDat;
     if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
       ps.require_current = reqs[i].require_current;
@@ -451,28 +489,38 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
 
 /// Legacy name batch.
 HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
-                   size_t count, SlotReport* reports, size_t report_cap) {
-  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
-    return plan_requests(img, reqs, count, planned);
-  });
+                   size_t count, SlotReport* reports, size_t report_cap,
+                   RecoveryDiagnostic* diagnostic = nullptr) {
+  return install_planned(
+      view, reports, report_cap,
+      [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+        return plan_requests(img, reqs, count, planned);
+      },
+      diagnostic);
 }
 
 /// Versioned selector batch.
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const SelectedHookRequest* selected, size_t count, SlotReport* reports,
-                   size_t report_cap) {
-  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
-    return plan_selected_requests(img, selected, count, planned);
-  });
+                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr) {
+  return install_planned(
+      view, reports, report_cap,
+      [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+        return plan_selected_requests(img, selected, count, planned);
+      },
+      diagnostic);
 }
 
 /// Function selector batch (JUMP_SLOT + function GLOB_DAT).
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const FunctionHookRequest* reqs, size_t count, SlotReport* reports,
-                   size_t report_cap) {
-  return install_planned(view, reports, report_cap, [&](detail::SmallVec<PlannedSlot, 4>& planned) {
-    return plan_function_requests(img, reqs, count, planned);
-  });
+                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr) {
+  return install_planned(
+      view, reports, report_cap,
+      [&](detail::SmallVec<PlannedSlot, 4>& planned) {
+        return plan_function_requests(img, reqs, count, planned);
+      },
+      diagnostic);
 }
 
 }  // namespace
@@ -489,17 +537,30 @@ HookHandle& HookHandle::operator=(HookHandle&& o) noexcept {
   return *this;
 }
 
+// Destructors and move assignment must never block or throw: try the op lock
+// once and fall back to a generic warning when it is held (for example by a
+// thread inside an operation), or when locking reports an error.
 void HookHandle::warn_if_installed() const noexcept {
   if (id_ == kInvalid) return;
-  std::lock_guard<std::mutex> lock(detail::op_mutex());
-  auto& reg = Registry::instance();
-  // Warn whenever a dropped handle still owns a live replacement — Installed, or
-  // Indeterminate with a slot whose contents are ours — not just Installed.
-  if (reg.owns_live_replacement(id_)) {
-    std::fprintf(stderr,
-                 "[YukiPLT] WARNING: HookHandle dropped while hook is still "
-                 "installed (slot 0x%zx)\n",
-                 static_cast<size_t>(reg.first_slot_of(id_)));
+  try {
+    std::unique_lock<std::mutex> lock(detail::op_mutex(), std::try_to_lock);
+    if (!lock.owns_lock()) {
+      std::fprintf(stderr,
+                   "[YukiPLT] WARNING: HookHandle dropped while its state could not be "
+                   "inspected; it may still own an installed hook\n");
+      return;
+    }
+    auto& reg = Registry::instance();
+    // Warn whenever a dropped handle still owns a live replacement — Installed,
+    // or Indeterminate with a slot whose contents are ours — not just Installed.
+    if (reg.owns_live_replacement(id_)) {
+      std::fprintf(stderr,
+                   "[YukiPLT] WARNING: HookHandle dropped while hook is still "
+                   "installed (slot 0x%zx)\n",
+                   static_cast<size_t>(reg.first_slot_of(id_)));
+    }
+  } catch (...) {
+    std::fprintf(stderr, "[YukiPLT] WARNING: HookHandle dropped; state check failed\n");
   }
 }
 // image_from_soname
@@ -571,8 +632,9 @@ HookResult hook(const ImageView& image, const char* symbol_name, void* replaceme
   return hook_batch(image, &req, 1, report);
 }
 
-HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
-                      SlotReport* reports) {
+namespace {
+HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size_t count,
+                           SlotReport* reports, RecoveryDiagnostic* diagnostic) {
   auto fail = [](ErrorCode c) {
     return HookResult{Error::Make(c), detail_api::make(detail_api::invalid())};
   };
@@ -586,14 +648,14 @@ HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t co
     try {
       auto insp = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!insp) return {insp.error(), detail_api::make(detail_api::invalid())};
-      if (is_own_image(insp.value())) return fail(ErrorCode::kInvalidArgument);
-      return install(image, insp.value(), reqs, count, reports, count);
-    } catch (const std::bad_alloc&) {
-      return fail(ErrorCode::kOutOfMemory);
-    } catch (const std::length_error&) {
-      return fail(ErrorCode::kIntegerOverflow);
+      if (is_own_image(insp.value())) {
+        detail::note_cause(ErrorCause::kOwnImage);
+        return fail(ErrorCode::kInvalidArgument);
+      }
+      return install(image, insp.value(), reqs, count, reports, count, diagnostic);
     } catch (...) {
-      return fail(ErrorCode::kUnsupportedFormat);
+      // Never unwind through the loader's C callback frame.
+      return HookResult{detail::current_exception_error(), detail_api::make(detail_api::invalid())};
     }
   };
   try {
@@ -608,11 +670,15 @@ HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t co
     // Custom image: the caller guarantees it stays mapped (contract).
     std::lock_guard<std::mutex> lock(detail::op_mutex());
     return apply(image);
-  } catch (const std::bad_alloc&) {
-    return fail(ErrorCode::kOutOfMemory);
   } catch (...) {
-    return fail(ErrorCode::kUnsupportedFormat);
+    return HookResult{detail::current_exception_error(), detail_api::make(detail_api::invalid())};
   }
+}
+}  // namespace
+
+HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
+                      SlotReport* reports) {
+  return hook_batch_impl(image, reqs, count, reports, nullptr);
 }
 // Precisely selected imports
 
@@ -622,8 +688,10 @@ HookResult hook_import(const ImageView& image, const ImportSelector& selector, v
   return hook_imports(image, &request, 1, report);
 }
 
-HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
-                        SlotReport* reports) {
+namespace {
+HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
+                             const SelectedHookRequest* reqs, size_t count, SlotReport* reports,
+                             RecoveryDiagnostic* diagnostic) {
   auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
   if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
   if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
@@ -639,30 +707,33 @@ HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
-      if (is_own_image(inspected.value())) return fail(Error::Make(ErrorCode::kInvalidArgument));
-      return install(live, inspected.value(), reqs, count, reports, count);
-    } catch (const std::bad_alloc&) {
-      return fail(Error::Make(ErrorCode::kOutOfMemory));
-    } catch (const std::length_error&) {
-      return fail(Error::Make(ErrorCode::kIntegerOverflow));
+      if (is_own_image(inspected.value()))
+        return fail(
+            detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kOwnImage));
+      return install(live, inspected.value(), reqs, count, reports, count, diagnostic);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
-      return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+      return fail(detail::current_exception_error());
     }
   };
   try {
     if (image.instance_token == 0) {
       auto result = fail(Error::Make(ErrorCode::kImageInvalidated));
-      run_on_system_image(identity_of(image), [&](const ImageView& live) { result = apply(live); });
+      run_on_system_image(
+          identity_of(image), [&](const ImageView& live) { result = apply(live); }, expected_path);
       return result;
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
     return apply(image);
-  } catch (const std::bad_alloc&) {
-    return fail(Error::Make(ErrorCode::kOutOfMemory));
   } catch (...) {
-    return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+    return fail(detail::current_exception_error());
   }
+}
+}  // namespace
+
+HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
+                        SlotReport* reports) {
+  return hook_imports_impl(image, nullptr, reqs, count, reports, nullptr);
 }
 // Function GLOB_DAT / APS2 imports (opt-in)
 //
@@ -702,7 +773,9 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
-      if (is_own_image(inspected.value())) return fail(Error::Make(ErrorCode::kInvalidArgument));
+      if (is_own_image(inspected.value()))
+        return fail(
+            detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kOwnImage));
       if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
         return install_planned(
             live, reports, count,
@@ -711,15 +784,11 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
             },
             diagnostic);
       } else {
-        return install(live, inspected.value(), reqs, count, reports, count);
+        return install(live, inspected.value(), reqs, count, reports, count, diagnostic);
       }
-    } catch (const std::bad_alloc&) {
-      return fail(Error::Make(ErrorCode::kOutOfMemory));
-    } catch (const std::length_error&) {
-      return fail(Error::Make(ErrorCode::kIntegerOverflow));
     } catch (...) {
       // Never unwind through the loader's C callback frame.
-      return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+      return fail(detail::current_exception_error());
     }
   };
   try {
@@ -733,10 +802,8 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
     return apply(image);
-  } catch (const std::bad_alloc&) {
-    return fail(Error::Make(ErrorCode::kOutOfMemory));
   } catch (...) {
-    return fail(Error::Make(ErrorCode::kUnsupportedFormat));
+    return fail(detail::current_exception_error());
   }
 }
 
@@ -757,9 +824,22 @@ namespace yukiplt {
 HookResult hook_function_imports_ex(const ImageView& image, const FunctionHookRequestEx* reqs,
                                     size_t count, SlotReport* reports,
                                     RecoveryDiagnostic* diagnostic) {
+  return detail::hook_function_imports_ex_at(image, nullptr, reqs, count, reports, diagnostic);
+}
+
+HookResult detail::hook_imports_at(const ImageView& image, const char* expected_path,
+                                   const SelectedHookRequest* reqs, size_t count,
+                                   SlotReport* reports) {
+  return hook_imports_impl(image, expected_path, reqs, count, reports, nullptr);
+}
+
+HookResult detail::hook_function_imports_ex_at(const ImageView& image, const char* expected_path,
+                                               const FunctionHookRequestEx* reqs, size_t count,
+                                               SlotReport* reports,
+                                               RecoveryDiagnostic* diagnostic) {
   RecoveryDiagnostic value;
   value.stage = OperationStage::kPrepare;
-  auto result = hook_functions_impl(image, nullptr, reqs, count, reports, &value);
+  auto result = hook_functions_impl(image, expected_path, reqs, count, reports, &value);
   value.error = result.error;
   value.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
   if (diagnostic) *diagnostic = value;
@@ -773,9 +853,14 @@ namespace {
 /// inside the linker callback.  `image_live` is true when the image is known to
 /// be mapped right now: for a system image, because we are inside
 /// dl_iterate_phdr; for a custom image, by the caller's contract.
-Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* reports,
-                 size_t cap) {
+Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* reports, size_t cap,
+                 RecoveryDiagnostic* diagnostic = nullptr) {
   Registry& reg = Registry::instance();
+  // Mirror each recorded stage into the caller's immediate diagnostic too.
+  auto record = [&](const RecoveryDiagnostic& value) {
+    reg.record_diagnostic(id, value);
+    if (diagnostic) *diagnostic = value;
+  };
   const auto previous_state =
       reg.is_installed(id) ? GroupState::kInstalled : GroupState::kIndeterminate;
 
@@ -791,6 +876,8 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
       const Error released = reg.release(id);
       if (released) return released;
       detail_api::set(handle, detail_api::invalid());
+    } else if (begin.code == ErrorCode::kInvalidArgument) {
+      detail::note_cause(ErrorCause::kHandleInvalid);
     }
     return begin;
   }
@@ -807,9 +894,10 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   const size_t ps = detail::page_size();
   if (ps == 0) {
     reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
-    reg.record_diagnostic(id,
-                          {OperationStage::kPrepare, Error::Make(ErrorCode::kUnsupportedFormat)});
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    const Error error =
+        detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kPlatform);
+    record({OperationStage::kPrepare, error});
+    return error;
   }
 
   // Build the page set: slot pages plus any residual raised pages.
@@ -823,23 +911,18 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   try {
     prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
                        page_count > 0 ? extra_pages : nullptr, page_count);
-  } catch (const std::bad_alloc&) {
-    // prepare has not changed any slot or page. Restore the exact prior state
-    // before the public boundary translates the allocation exception.
-    reg.finish_restore(id, false, previous_state, nullptr, 0, nullptr, 0);
-    reg.record_diagnostic(id, {OperationStage::kPrepare, Error::Make(ErrorCode::kOutOfMemory)});
-    throw;
   } catch (...) {
+    // prepare has not changed any slot or page. Restore the exact prior state
+    // and record the same code the public boundary will report.
     reg.finish_restore(id, false, previous_state, nullptr, 0, nullptr, 0);
-    reg.record_diagnostic(id,
-                          {OperationStage::kPrepare, Error::Make(ErrorCode::kUnsupportedFormat)});
+    record({OperationStage::kPrepare, detail::current_exception_error()});
     throw;
   }
   if (prep) {
     // A failed/incomplete maps read does not prove unload. Preserve recovery
     // state; custom-image invalidation requires forget_image().
     reg.finish_restore(id, false, previous_state, recs, slot_count, pages, page_count);
-    reg.record_diagnostic(id, {OperationStage::kPrepare, prep});
+    record({OperationStage::kPrepare, prep});
     return prep;
   }
 
@@ -968,6 +1051,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   if (all_restored && pages_clean && !rollback_failed) {
     reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
     detail_api::set(handle, detail_api::invalid());
+    if (diagnostic) *diagnostic = {OperationStage::kComplete, Error::Ok()};
     return Error::Ok();
   }
 
@@ -976,11 +1060,11 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   // raise errno, since a stuck page is the more serious residual state.
   if (rollback_failed || !pages_clean) {
     reg.finish_restore(id, false, GroupState::kIndeterminate, recs, slot_count, new_pages, pn);
-    const Error error =
-        Error::Sys(ErrorCode::kIndeterminate, restore_errno != 0 ? restore_errno : r.raise_errno);
-    reg.record_diagnostic(
-        id, {!pages_clean ? OperationStage::kRestorePages : OperationStage::kRollback, error,
-             r.raise_errno, restore_errno, rollback_failed});
+    const Error error = detail::with_cause(
+        Error::Sys(ErrorCode::kIndeterminate, restore_errno != 0 ? restore_errno : r.raise_errno),
+        !pages_clean ? ErrorCause::kProtectFailed : ErrorCause::kCasConflict);
+    record({!pages_clean ? OperationStage::kRestorePages : OperationStage::kRollback, error,
+            r.raise_errno, restore_errno, rollback_failed});
     return error;
   }
 
@@ -988,17 +1072,16 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     // A page could not be raised, but every page we did raise was restored, so
     // nothing is left writable.  No slot was written; keep the handle to retry.
     reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, new_pages, 0);
-    reg.record_diagnostic(
-        id, {OperationStage::kRaise, Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
-             r.raise_errno});
-    return Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno);
+    const Error error = detail::with_cause(Error::Sys(ErrorCode::kPermissionDenied, r.raise_errno),
+                                           ErrorCause::kProtectFailed);
+    record({OperationStage::kRaise, error, r.raise_errno});
+    return error;
   }
 
   // Slots left as a third party's value: keep ownership for a later retry.
   (void)any_foreign;
   reg.finish_restore(id, false, GroupState::kInstalled, recs, slot_count, new_pages, pn);
-  reg.record_diagnostic(id,
-                        {OperationStage::kCommit, Error::Make(ErrorCode::kSlotModifiedExternally)});
+  record({OperationStage::kCommit, Error::Make(ErrorCode::kSlotModifiedExternally)});
   return Error::Make(ErrorCode::kSlotModifiedExternally);
 }
 
@@ -1017,8 +1100,11 @@ Error peek_image(uint64_t id, ImageIdentity& out) {
 
 }  // namespace
 
-Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
-  if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
+namespace {
+Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
+                  RecoveryDiagnostic* diagnostic) {
+  if (!handle.valid())
+    return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kHandleInvalid);
   uint64_t id = detail_api::id(handle);
   try {
     // Learn the image token first (brief op-lock) so we can pick the lock order.
@@ -1026,31 +1112,99 @@ Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
     {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
       Error peek = peek_image(id, image);
-      if (peek) return peek;
+      if (peek)
+        return peek.code == ErrorCode::kInvalidArgument
+                   ? detail::with_cause(peek, ErrorCause::kHandleInvalid)
+                   : peek;
     }
 
     if (image.instance_token == 0 && !image.invalidated) {
       // System image: restore inside the linker callback (linker -> op order).
       Error result = Error::Make(ErrorCode::kImageInvalidated);
       bool matched = run_on_system_image(image, [&](const ImageView&) {
-        result = do_restore(id, handle, /*image_live=*/true, reports, cap);
+        result = do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic);
       });
       if (!matched) {
         // The image is gone: consume the handle without touching memory.
         std::lock_guard<std::mutex> lock(detail::op_mutex());
-        return do_restore(id, handle, /*image_live=*/false, reports, cap);
+        return do_restore(id, handle, /*image_live=*/false, reports, cap, diagnostic);
       }
       return result;
     }
 
     // Custom image (or already-forgotten): the caller guarantees mapping.
     std::lock_guard<std::mutex> lock(detail::op_mutex());
-    return do_restore(id, handle, /*image_live=*/true, reports, cap);
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
+    return do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic);
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
+}
+
+/// Complete an immediate OperationDiagnostic from the operation's recorded
+/// stage data, its final error and the cause noted on this thread.
+void finish_diagnostic(OperationDiagnostic* out, const RecoveryDiagnostic& recorded,
+                       const Error& error) noexcept {
+  if (out == nullptr) return;
+  OperationDiagnostic value;
+  value.stage = recorded.stage;
+  value.error = error;
+  value.cause = detail::resolve_cause(error, detail::noted_cause());
+  value.raise_errno = recorded.raise_errno;
+  value.restore_errno = recorded.restore_errno;
+  value.rollback_failed = recorded.rollback_failed;
+  value.image_invalidated = error.code == ErrorCode::kImageInvalidated;
+  value.residual_page_count = recorded.residual_page_count;
+  if (value.stage == OperationStage::kNone && !error.ok()) value.stage = OperationStage::kPrepare;
+  if (error.ok()) value.stage = OperationStage::kComplete;
+  *out = value;
+}
+
+template <typename Call>
+HookResult diagnosed_install(OperationDiagnostic* diagnostic, Call&& call) {
+  detail::CauseScope scope;
+  RecoveryDiagnostic recorded;
+  HookResult result = call(&recorded);
+  finish_diagnostic(diagnostic, recorded, result.error);
+  return result;
+}
+}  // namespace
+
+Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
+  return unhook_impl(handle, reports, cap, nullptr);
+}
+
+Error unhook_diagnosed(HookHandle& handle, SlotReport* reports, size_t cap,
+                       OperationDiagnostic* diagnostic) {
+  detail::CauseScope scope;
+  const bool held = handle.valid();
+  RecoveryDiagnostic recorded;
+  const Error error = unhook_impl(handle, reports, cap, &recorded);
+  finish_diagnostic(diagnostic, recorded, error);
+  if (diagnostic) diagnostic->handle_consumed = held && !handle.valid();
+  return error;
+}
+
+HookResult hook_batch_diagnosed(const ImageView& image, const HookRequest* reqs, size_t count,
+                                SlotReport* reports, OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    return hook_batch_impl(image, reqs, count, reports, recorded);
+  });
+}
+
+HookResult hook_imports_diagnosed(const ImageView& image, const SelectedHookRequest* reqs,
+                                  size_t count, SlotReport* reports,
+                                  OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    return hook_imports_impl(image, nullptr, reqs, count, reports, recorded);
+  });
+}
+
+HookResult hook_function_imports_diagnosed(const ImageView& image,
+                                           const FunctionHookRequestEx* reqs, size_t count,
+                                           SlotReport* reports, OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    return hook_functions_impl(image, nullptr, reqs, count, reports, recorded);
+  });
 }
 // Import snapshots / abandon / query / forget_image
 
@@ -1060,17 +1214,15 @@ Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metada
                                   const char* expected_path = nullptr) {
   if (image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
   if (image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
-  // Catch allocation failures inside the callable as well: it runs inside a
-  // C loader callback for system images. Publish only a complete owning result.
+  // Contain every exception inside the callable as well: it runs inside a C
+  // loader callback for system images. Publish only a complete owning result.
   auto collect = [&](const ImageView& live) -> Result<Snapshot> {
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return inspected.error();
       return collect_metadata(inspected.value());
-    } catch (const std::bad_alloc&) {
-      return Error::Make(ErrorCode::kOutOfMemory);
-    } catch (const std::length_error&) {
-      return Error::Make(ErrorCode::kIntegerOverflow);
+    } catch (...) {
+      return detail::current_exception_error();
     }
   };
   try {
@@ -1083,10 +1235,8 @@ Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metada
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
     return collect(image);
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 }  // namespace
@@ -1152,6 +1302,101 @@ Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageV
       expected_path);
 }
 
+Result<std::string> detail::system_image_path(const ImageView& image) {
+  if (image.instance_token != 0) return std::string();
+  try {
+    Result<std::string> path = Error::Make(ErrorCode::kImageInvalidated);
+#if defined(__linux__) || defined(__ANDROID__)
+    struct Ctx {
+      const ImageView* want;
+      Result<std::string>* out;
+    } ctx{&image, &path};
+    dl_iterate_phdr(
+        [](struct dl_phdr_info* info, size_t, void* p) -> int {
+          auto* c = static_cast<Ctx*>(p);
+          if (static_cast<uintptr_t>(info->dlpi_addr) != c->want->load_bias ||
+              info->dlpi_phdr != c->want->phdr_table || info->dlpi_phnum != c->want->phdr_count)
+            return 0;
+          try {
+            *c->out = std::string(info->dlpi_name == nullptr ? "" : info->dlpi_name);
+          } catch (...) {
+            *c->out = detail::current_exception_error();
+          }
+          return 1;
+        },
+        &ctx);
+#endif
+    return path;
+  } catch (...) {
+    return detail::current_exception_error();
+  }
+}
+
+Error detail::verify_installed_at(const HookHandle& handle, const char* expected_path,
+                                  SlotReport* report) {
+  if (!handle.valid())
+    return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kHandleInvalid);
+  const uint64_t id = detail_api::id(handle);
+  try {
+    ImageIdentity image;
+    {
+      std::lock_guard<std::mutex> lock(detail::op_mutex());
+      Error peek = peek_image(id, image);
+      if (peek) return detail::with_cause(peek, ErrorCause::kHandleInvalid);
+    }
+    // Under the locks: re-read the group and compare every written slot.
+    auto check = [&]() -> Error {
+      ImageIdentity current;
+      SlotRecord recs[kMaxBatch];
+      size_t n = 0;
+      Error snap = Registry::instance().snapshot(id, current, recs, kMaxBatch, &n);
+      if (snap) return detail::with_cause(snap, ErrorCause::kHandleInvalid);
+      if (n > kMaxBatch) n = kMaxBatch;
+      const size_t ps = detail::page_size();
+      if (ps == 0)
+        return detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
+                                  ErrorCause::kPlatform);
+      uintptr_t addrs[kMaxBatch];
+      for (size_t i = 0; i < n; ++i) addrs[i] = recs[i].address;
+      Txn txn(detail::active_ops(), ps);
+      // A read-only maps check: prepare() changes no protection.
+      Error prep = txn.prepare(addrs, n);
+      if (prep) return prep;
+      for (size_t i = 0; i < n; ++i) {
+        if (!recs[i].ever_written) continue;
+        uintptr_t live = 0;
+        txn.load(recs[i].address, live);
+        if (live == recs[i].replacement) continue;
+        if (report) {
+          report->address = recs[i].address;
+          report->value_before = recs[i].replacement;
+          report->value_observed = live;
+          report->status = SlotStatus::kConflict;
+        }
+        return detail::with_cause(Error::Make(ErrorCode::kSlotModifiedExternally),
+                                  ErrorCause::kSlotDrift);
+      }
+      return Error::Ok();
+    };
+    if (image.instance_token == 0 && !image.invalidated) {
+      Error result = Error::Ok();
+      const bool matched =
+          run_on_system_image(image, [&](const ImageView&) { result = check(); }, expected_path);
+      if (!matched)
+        return detail::with_cause(Error::Make(ErrorCode::kImageInvalidated),
+                                  ErrorCause::kIdentityMismatch);
+      return result;
+    }
+    if (image.invalidated)
+      return detail::with_cause(Error::Make(ErrorCode::kImageInvalidated),
+                                ErrorCause::kIdentityMismatch);
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return check();
+  } catch (...) {
+    return detail::current_exception_error();
+  }
+}
+
 Error abandon(HookHandle& handle) {
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -1160,7 +1405,7 @@ Error abandon(HookHandle& handle) {
     if (!e) detail_api::set(handle, detail_api::invalid());
     return e;
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 
@@ -1250,10 +1495,8 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
     }
     if (count != nullptr) *count = n;
     return Error::Ok();
-  } catch (const std::bad_alloc&) {
-    return Error::Make(ErrorCode::kOutOfMemory);
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 
@@ -1264,7 +1507,7 @@ Error forget_image(const ImageView& custom_image) {
     Registry::instance().forget_custom_image(identity_of(custom_image));
     return Error::Ok();
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 
@@ -1278,8 +1521,77 @@ Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, R
     return Registry::instance().recovery_snapshot(detail_api::id(handle), *diagnostic, pages,
                                                   capacity);
   } catch (...) {
-    return Error::Make(ErrorCode::kUnsupportedFormat);
+    return detail::current_exception_error();
   }
 }
 
 }  // namespace yukiplt
+
+namespace yukiplt::detail {
+
+namespace {
+// Trivially destructible, so no thread-exit destructor is registered.
+thread_local ErrorCause t_cause = ErrorCause::kNone;
+
+bool consistent(ErrorCode code, ErrorCause cause) noexcept {
+  switch (code) {
+    case ErrorCode::kOutOfBounds:
+      return cause == ErrorCause::kMetadataBounds || cause == ErrorCause::kScanBudget ||
+             cause == ErrorCause::kMapsCoverage;
+    case ErrorCode::kInvalidArgument:
+      return cause == ErrorCause::kInvalidRequest || cause == ErrorCause::kHandleInvalid ||
+             cause == ErrorCause::kOwnImage || cause == ErrorCause::kDuplicateTarget ||
+             cause == ErrorCause::kOutputAlias || cause == ErrorCause::kReplacementIsCurrent ||
+             cause == ErrorCause::kOriginalCapacity || cause == ErrorCause::kHostCallback;
+    case ErrorCode::kNullPointer:
+      return cause == ErrorCause::kInvalidRequest;
+    case ErrorCode::kPermissionDenied:
+      return cause == ErrorCause::kVmaPolicy || cause == ErrorCause::kProtectFailed;
+    case ErrorCode::kSlotOwnershipConflict:
+      return cause == ErrorCause::kExpectedCurrent || cause == ErrorCause::kCasConflict;
+    case ErrorCode::kUnsupportedFormat:
+      return cause == ErrorCause::kInternalException || cause == ErrorCause::kHostCallback ||
+             cause == ErrorCause::kRandomSource || cause == ErrorCause::kPlatform;
+    case ErrorCode::kVmaUnavailable:
+      return cause == ErrorCause::kMapsUnavailable;
+    case ErrorCode::kIndeterminate:
+      return cause == ErrorCause::kProtectFailed || cause == ErrorCause::kCasConflict;
+    case ErrorCode::kImageInvalidated:
+      return cause == ErrorCause::kIdentityMismatch;
+    case ErrorCode::kSlotModifiedExternally:
+      return cause == ErrorCause::kSlotDrift;
+    default:
+      return false;
+  }
+}
+}  // namespace
+
+void note_cause(ErrorCause cause) noexcept { t_cause = cause; }
+
+ErrorCause noted_cause() noexcept { return t_cause; }
+
+CauseScope::CauseScope() noexcept : saved_(t_cause) { t_cause = ErrorCause::kNone; }
+
+CauseScope::~CauseScope() { t_cause = saved_; }
+
+ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept {
+  if (error.ok()) return ErrorCause::kNone;
+  if (noted != ErrorCause::kNone && consistent(error.code, noted)) return noted;
+  switch (error.code) {
+    case ErrorCode::kOutOfBounds:
+      return ErrorCause::kMetadataBounds;
+    case ErrorCode::kInvalidArgument:
+    case ErrorCode::kNullPointer:
+      return ErrorCause::kInvalidRequest;
+    case ErrorCode::kPermissionDenied:
+      return error.sys_errno != 0 ? ErrorCause::kProtectFailed : ErrorCause::kVmaPolicy;
+    case ErrorCode::kVmaUnavailable:
+      return ErrorCause::kMapsUnavailable;
+    case ErrorCode::kSlotOwnershipConflict:
+      return ErrorCause::kCasConflict;
+    default:
+      return ErrorCause::kNone;
+  }
+}
+
+}  // namespace yukiplt::detail

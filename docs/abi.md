@@ -29,8 +29,9 @@ only your wrapper API. The macro alone does not hide archive implementation
 symbols or keep the host alive.
 
 The documented `ANDROID_STL=c++_shared` build depends on the matching NDK's
-`libc++_shared.so`, even for C-only callers. Changing the STL setting creates a
-different integration contract; do not mix those C++ artifacts or callers.
+`libc++_shared.so`, even for C-only callers. The `c++_static` shared variant is for C ABI boundaries. For static embedding,
+select the runtime at the final host link. Do not mix incompatible C++ runtime
+instances, artifacts or callers.
 
 Use `<yukiplt.h>` for C and `<yukiplt.hpp>` for C++. The former
 `yukiplt/` include paths have been removed; update source includes when

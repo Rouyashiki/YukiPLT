@@ -62,7 +62,7 @@
 #if defined(YUKIPLT_STATIC) && defined(__ELF__)
 // Define consistently when compiling an embedded copy and its callers. Also
 // hide all implementation symbols and archive dependencies in the host DSO;
-// this marker only controls the public API (see ABI_COMPATIBILITY.md).
+// this marker only controls the public API (see docs/abi.md).
 #define YUKIPLT_API __attribute__((visibility("hidden")))
 #elif defined(__GNUC__) || defined(__clang__)
 #define YUKIPLT_API __attribute__((visibility("default")))

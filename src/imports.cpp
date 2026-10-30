@@ -399,6 +399,21 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
   uintptr_t versym = t.values[0];
   if (t.present[0] && !image.dptr_adjusted && !safe_add(image.load_bias, versym, versym))
     return Error::Make(ErrorCode::kIntegerOverflow);
+  if (t.present[0]) {
+    // A referenced symbol proves this contiguous VERSYM prefix exists. Do not
+    // use a LOAD-derived dynsym upper bound as an exact version-table count.
+    uintptr_t last = 0;
+    for (const auto& entry : imports) last = std::max(last, uintptr_t{entry.symbol_index});
+    uintptr_t count, bytes, end;
+    if (!safe_add(last, 1, count) || !safe_mul(count, sizeof(NativeElfHalf), bytes) ||
+        !safe_add(versym, bytes, end))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+    if (!readable(image, versym, bytes)) return Error::Make(ErrorCode::kOutOfBounds);
+    const auto next = scan.ranges.lower_bound(versym);
+    if ((next != scan.ranges.end() && next->first < end) ||
+        (next != scan.ranges.begin() && std::prev(next)->second > versym))
+      return Error::Make(ErrorCode::kCorruptedElf);
+  }
   VersionedImportSnapshot result;
   result.skipped_relocations = skipped_relocations;
   if (Error e = budget.take_objects<VersionedImport>(imports.size())) return e;

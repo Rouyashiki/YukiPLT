@@ -484,6 +484,30 @@ TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
 
 }  // namespace function_imports_checks
 
+namespace versions_checks {
+using namespace yukiplt;
+using namespace yukiplt::test;
+
+TEST(Versions, VersymCannotAliasNamedVersionRecordsOrChangeSelection) {
+  for (bool definitions : {false, true}) {
+    VersionedElf fixture(definitions);
+    ASSERT_TRUE(inspect_versioned_imports(fixture.view()));
+    fixture.change_tag(DT_VERSYM, DT_VERSYM, fixture.need - sizeof(NativeElfHalf));
+    const auto before = fixture.image.buffer;
+    auto snapshot = inspect_versioned_imports(fixture.view());
+    ASSERT_FALSE(snapshot);
+    EXPECT_EQ(snapshot.error().code, ErrorCode::kCorruptedElf);
+    auto selected = find_import(fixture.view(), {"versioned", VersionMatch::kUnversioned});
+    ASSERT_FALSE(selected);
+    EXPECT_EQ(selected.error().code, ErrorCode::kCorruptedElf);
+    EXPECT_EQ(fixture.image.buffer, before);
+
+    EXPECT_TRUE(inspect_imports(fixture.view()));
+  }
+}
+
+}  // namespace versions_checks
+
 namespace scan_limits_checks {
 using namespace yukiplt;
 using namespace yukiplt::detail;

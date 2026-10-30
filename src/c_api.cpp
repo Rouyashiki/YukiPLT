@@ -1,8 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include "c_api.hpp"
+
 #include <algorithm>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <new>
+#include <random>
 #include <stdexcept>
 
 #include "common.hpp"
@@ -334,6 +340,8 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_ERROR_CAUSES ||
          feature_id == YUKIPLT_C_FEATURE_ORIGINAL_LOAD ||
          feature_id == YUKIPLT_C_FEATURE_NAMED_IMAGE ||
+         feature_id == YUKIPLT_C_FEATURE_OWNED_IMAGES ||
+         feature_id == YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
@@ -623,3 +631,59 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
   return error;
 }
 }  // extern C
+
+namespace yukiplt::detail::c_objects {
+namespace {
+struct Store {
+  std::mutex mutex;
+  // Node-based storage releases each allocation at erase; an empty libc++
+  // tree retains no bucket array across a static host unload.
+  std::map<uint64_t, std::shared_ptr<Object>> objects;
+  uint64_t next = 1;
+  uint64_t salt;
+  Store() {
+    std::random_device random;
+    salt = (uint64_t{random()} << 32) ^ random();
+  }
+};
+Store& store() {
+  static NoDestructor<Store> value;
+  return value.get();
+}
+}  // namespace
+Result<uint64_t> publish(std::shared_ptr<Object> object) {
+  auto& s = store();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  // IDs never repeat within a copy, including after failed allocation. Refuse
+  // exhaustion instead of wrapping into a previously released generation.
+  if (s.next == std::numeric_limits<uint64_t>::max()) return Error::Make(ErrorCode::kOutOfBounds);
+  uint64_t token = s.next++ ^ s.salt;
+  if (token == 0) {
+    if (s.next == std::numeric_limits<uint64_t>::max()) return Error::Make(ErrorCode::kOutOfBounds);
+    token = s.next++ ^ s.salt;
+  }
+  s.objects.emplace(token, std::move(object));
+  return token;
+}
+std::shared_ptr<Object> acquire(uint64_t token, Kind kind) {
+  if (!token) return {};
+  auto& s = store();
+  std::lock_guard<std::mutex> lock(s.mutex);
+  auto found = s.objects.find(token);
+  return found != s.objects.end() && found->second->kind == kind ? found->second : nullptr;
+}
+Error destroy(uint64_t& token, Kind kind) {
+  if (!token) return Error::Ok();
+  std::shared_ptr<Object> retired;
+  {
+    auto& s = store();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    auto found = s.objects.find(token);
+    if (found == s.objects.end() || found->second->kind != kind) return invalid();
+    retired = std::move(found->second);
+    s.objects.erase(found);
+    token = 0;
+  }
+  return Error::Ok();
+}
+}  // namespace yukiplt::detail::c_objects

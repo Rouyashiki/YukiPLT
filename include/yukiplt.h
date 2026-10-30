@@ -200,7 +200,9 @@ enum {
   YUKIPLT_C_FEATURE_REL_IMPORTS = 6,
   YUKIPLT_C_FEATURE_ERROR_CAUSES = 7,
   YUKIPLT_C_FEATURE_ORIGINAL_LOAD = 8,
-  YUKIPLT_C_FEATURE_NAMED_IMAGE = 9
+  YUKIPLT_C_FEATURE_NAMED_IMAGE = 9,
+  YUKIPLT_C_FEATURE_OWNED_IMAGES = 10,
+  YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS = 11
 };
 
 enum {
@@ -473,6 +475,119 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_ex_named(
 YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
     const yukiplt_c_named_image*, const yukiplt_c_function_request_ex*, size_t count,
     yukiplt_c_handle*, yukiplt_c_slot_report*, yukiplt_c_operation_diagnostic*) YUKIPLT_C_NOEXCEPT;
+
+// Owned objects belong to the issuing library copy. Tokens are unique owners,
+// not pointers and not yukiplt_c_handle values. Do not copy tokens into owners.
+// Creation requires a zero output token; failure preserves it. Destroy clears
+// a token on success; destroying zero succeeds. Stale/wrong-kind tokens fail.
+// Serialize operations, reads and destruction on each object. No object pins an
+// image. Keep the issuing library loaded until every object is destroyed.
+typedef struct yukiplt_c_image_list {
+  uint64_t token;
+} yukiplt_c_image_list;
+typedef struct yukiplt_c_import_snapshot {
+  uint64_t token;
+} yukiplt_c_import_snapshot;
+
+enum {
+  YUKIPLT_C_IMAGE_MAIN = 0,
+  YUKIPLT_C_IMAGE_PATH = 1,
+  YUKIPLT_C_IMAGE_BASENAME = 2,
+  YUKIPLT_C_IMAGE_BIAS = 3
+};
+typedef struct yukiplt_c_image_selector {
+  uint32_t struct_size;
+  uint32_t match;
+  const char* name;
+  uintptr_t load_bias;
+} yukiplt_c_image_selector;
+
+// References into the caller's copied text buffer. length excludes the trailing
+// NUL; required_text includes it. Empty strings still occupy one byte.
+typedef struct yukiplt_c_text_ref {
+  size_t offset;
+  size_t length;
+} yukiplt_c_text_ref;
+typedef struct yukiplt_c_image_record {
+  yukiplt_c_image image;
+  yukiplt_c_text_ref path;
+} yukiplt_c_image_record;
+
+enum {
+  YUKIPLT_C_SNAPSHOT_IMPORTS = 0,
+  YUKIPLT_C_SNAPSHOT_VERSIONED = 1,
+  YUKIPLT_C_SNAPSHOT_FUNCTIONS = 2
+};
+enum {
+  YUKIPLT_C_VERSION_SOURCE_NONE = 0,
+  YUKIPLT_C_VERSION_SOURCE_NEEDED = 1,
+  YUKIPLT_C_VERSION_SOURCE_DEFINED = 2
+};
+typedef struct yukiplt_c_import_record {
+  yukiplt_c_text_ref symbol;
+  yukiplt_c_text_ref version;
+  yukiplt_c_text_ref dependency;
+  uintptr_t slot_address;
+  size_t relocation_index;
+  uint32_t symbol_index;
+  uint32_t version_index;
+  uint32_t version_table_present;
+  uint32_t version_hidden;
+  uint32_t version_source;
+  uint32_t relocation_source;
+  uint32_t relocation_type;
+  uint32_t symbol_type;
+} yukiplt_c_import_record;
+
+// All input structures use exact struct_size checks, not appendable layouts.
+// Strings are borrowed for the call. find_images requires an explicit selector.
+// The returned immutable list owns paths but does not extend mapping lifetime.
+YUKIPLT_API yukiplt_c_error yukiplt_c_find_images(const yukiplt_c_image_selector*,
+                                                  yukiplt_c_image_list*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_find_image_containing(const void* address, yukiplt_c_image_list*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_image_list_destroy(yukiplt_c_image_list*) YUKIPLT_C_NOEXCEPT;
+
+// Queries never re-enumerate, inspect GOT or modify ownership. required_count
+// and required_text are mandatory, disjoint writable size_t objects. Both NULL
+// buffers with zero capacities request sizes only. Otherwise both capacities
+// must suffice; OUT_OF_BOUNDS writes only the required sizes, no partial data.
+// Other errors preserve all outputs. Buffers/counts must not overlap each other
+// or input storage, and must be aligned, accessible and live for the call.
+YUKIPLT_API yukiplt_c_error yukiplt_c_image_list_copy(const yukiplt_c_image_list*,
+                                                      yukiplt_c_image_record*,
+                                                      size_t record_capacity, char* text,
+                                                      size_t text_capacity, size_t* required_count,
+                                                      size_t* required_text) YUKIPLT_C_NOEXCEPT;
+
+// kind chooses the existing plain, versioned or function snapshot semantics.
+// sources must be zero for plain/versioned snapshots and a valid nonzero source
+// mask for function snapshots. Optional tables remain lazily validated. A named
+// image also checks the exact system path; same-path/address ABA remains the
+// caller's responsibility. Addresses are metadata, never installation tokens.
+YUKIPLT_API yukiplt_c_error yukiplt_c_inspect_imports(const yukiplt_c_image*, uint32_t kind,
+                                                      uint32_t sources, yukiplt_c_import_snapshot*)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_inspect_imports_named(const yukiplt_c_named_image*, uint32_t kind, uint32_t sources,
+                                yukiplt_c_import_snapshot*) YUKIPLT_C_NOEXCEPT;
+// Unique selection uses the existing full-scan ambiguity and eligibility rules.
+// These return a one-entry owned snapshot, with skipped_relocations == 0.
+YUKIPLT_API yukiplt_c_error yukiplt_c_select_import(const yukiplt_c_image*,
+                                                    const yukiplt_c_selector*,
+                                                    yukiplt_c_import_snapshot*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_select_function_import(const yukiplt_c_image*, const yukiplt_c_function_selector*,
+                                 yukiplt_c_import_snapshot*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_import_snapshot_destroy(yukiplt_c_import_snapshot*)
+    YUKIPLT_C_NOEXCEPT;
+// Same buffer contract as image_list_copy. kind and skipped are mandatory output
+// scalars, also disjoint. Plain snapshots report empty version/dependency and
+// symbol_type=0 (not inspected), rather than validating extra ELF metadata.
+YUKIPLT_API yukiplt_c_error yukiplt_c_import_snapshot_copy(
+    const yukiplt_c_import_snapshot*, yukiplt_c_import_record*, size_t record_capacity, char* text,
+    size_t text_capacity, size_t* required_count, size_t* required_text, uint32_t* kind,
+    size_t* skipped_relocations) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

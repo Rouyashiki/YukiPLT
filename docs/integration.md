@@ -69,3 +69,22 @@ features with `yukiplt_c_has_feature()`, and provide buffers required by the
 individual query. Handle tokens have unique ownership: do not copy them to
 create another owner or pass them to another library copy. No STL objects or
 exceptions cross the C boundary. See [ABI compatibility](abi.md).
+
+## Owned C metadata
+
+Include `yukiplt.h` and probe
+`YUKIPLT_C_FEATURE_OWNED_IMAGES` / `YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS`.
+Image lists and import snapshots own their strings without pinning mappings.
+Initialize output tokens to zero. Read required record/text sizes from the
+same object, allocate caller-owned buffers, and copy; short buffers return
+`OUT_OF_BOUNDS` with required sizes and no partially copied records or text.
+Text references are offsets into the copied buffer, with lengths excluding
+NUL. Destroy the issuing object explicitly; copied data remains caller-owned.
+
+Plain inspection validates only the existing JUMP_SLOT path. Request versioned
+or explicit-source function inspection when needed. Unique selection still
+rejects ambiguity; snapshot addresses are metadata, not installation authority.
+Keep the issuing library loaded for all queries and object destruction. Tokens
+are typed owners scoped to one library copy; a copied token is only a borrowed
+view. Serialize queries and destruction on the same object. No exception crosses
+the C boundary. The core and runtime remain C++ even for pure C source consumers.

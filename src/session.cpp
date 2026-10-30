@@ -114,7 +114,7 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
   };
   try {
     Context ctx{selector, {}, getauxval(AT_PHDR), {}};
-    dl_iterate_phdr(
+    detail::iterate_system_phdr(
         [](dl_phdr_info* info, size_t, void* opaque) -> int {
           auto& c = *static_cast<Context*>(opaque);
           const char* path = info->dlpi_name == nullptr ? "" : info->dlpi_name;
@@ -174,7 +174,7 @@ Result<NamedImage> find_image_containing(const void* address) {
     Error error;
   };
   Context ctx{query_address, 0, {}, {}};
-  dl_iterate_phdr(
+  detail::iterate_system_phdr(
       [](dl_phdr_info* info, size_t, void* opaque) -> int {
         auto& c = *static_cast<Context*>(opaque);
         try {

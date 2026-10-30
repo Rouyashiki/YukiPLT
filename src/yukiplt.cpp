@@ -100,7 +100,7 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_pa
     std::exception_ptr error;
   } ctx{&want, want_path, &fn, false, false, nullptr};
 
-  dl_iterate_phdr(
+  detail::iterate_system_phdr(
       [](struct dl_phdr_info* info, size_t /*size*/, void* p) -> int {
         auto* c = static_cast<Ctx*>(p);
         if (static_cast<uintptr_t>(info->dlpi_addr) != c->want->load_bias ||
@@ -601,7 +601,7 @@ Result<ImageView> image_from_soname(const char* soname) {
 
   if (data.target == nullptr && data.main_phdr == 0) return Error::Make(ErrorCode::kImageNotFound);
 
-  dl_iterate_phdr(
+  detail::iterate_system_phdr(
       [](struct dl_phdr_info* info, size_t /*size*/, void* ctx) -> int {
         auto* d = static_cast<CallbackData*>(ctx);
         const char* name = info->dlpi_name;
@@ -1540,7 +1540,7 @@ Result<std::string> detail::system_image_path(const ImageView& image) {
       const ImageView* want;
       Result<std::string>* out;
     } ctx{&image, &path};
-    dl_iterate_phdr(
+    detail::iterate_system_phdr(
         [](struct dl_phdr_info* info, size_t, void* p) -> int {
           auto* c = static_cast<Ctx*>(p);
           if (static_cast<uintptr_t>(info->dlpi_addr) != c->want->load_bias ||
@@ -1686,7 +1686,7 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
       Error error;
     } context{&verify_image, {}};
     if (statistics) ++statistics->enumerations;
-    dl_iterate_phdr(
+    detail::iterate_system_phdr(
         [](dl_phdr_info* info, size_t, void* opaque) -> int {
           auto& ctx = *static_cast<Context*>(opaque);
           try {

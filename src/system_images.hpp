@@ -6,7 +6,22 @@
 
 #include "yukiplt.hpp"
 
+#if defined(__linux__) || defined(__ANDROID__)
+#include <link.h>
+#if defined(YUKIPLT_SYSTEM_PHDR_ITERATOR)
+extern "C" int YUKIPLT_SYSTEM_PHDR_ITERATOR(int (*)(dl_phdr_info*, size_t, void*), void*);
+#else
+#define YUKIPLT_SYSTEM_PHDR_ITERATOR dl_iterate_phdr
+#endif
+#endif
+
 namespace yukiplt::detail {
+#if defined(__linux__) || defined(__ANDROID__)
+inline int iterate_system_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* data) {
+  return YUKIPLT_SYSTEM_PHDR_ITERATOR(callback, data);
+}
+#endif
+
 // Caller keeps Program Headers readable; pure LOAD interval check, no holes.
 Result<bool> image_contains_address(const ImageView&, uintptr_t address);
 

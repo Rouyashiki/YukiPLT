@@ -17,10 +17,10 @@
 #include <utility>
 #include <vector>
 
-#include "registry.hpp"
 #include "elf_builder.hpp"
-#include "overrides.hpp"
 #include "memory.hpp"
+#include "overrides.hpp"
+#include "registry.hpp"
 #include "system_images.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
@@ -497,3 +497,74 @@ TEST_F(RulesFixture, NotifyUnloadingFailureKeepsHandleAndDoesNotForget) {
 }
 
 }  // namespace rules_checks
+
+namespace contracts_checks {
+
+TEST_F(ContractFixture, DiagnosedRestoreKeepsCoverageCauseAndRecoveryHandle) {
+  HookRequest request{"alpha", kReplA, &outputs[0]};
+  OperationDiagnostic diagnostic;
+  auto installed = hook_batch_diagnosed(view(), &request, 1, nullptr, &diagnostic);
+  ASSERT_TRUE(installed.ok());
+  EXPECT_EQ(diagnostic.cause, ErrorCause::kNone);
+  hide_image = true;
+  EXPECT_EQ(unhook_diagnosed(installed.handle, nullptr, 0, &diagnostic).code,
+            ErrorCode::kOutOfBounds);
+  EXPECT_EQ(diagnostic.cause, ErrorCause::kMapsCoverage);
+  EXPECT_TRUE(installed.handle.valid());
+  hide_image = false;
+  EXPECT_TRUE(unhook_diagnosed(installed.handle, nullptr, 0, &diagnostic).ok());
+  EXPECT_EQ(diagnostic.cause, ErrorCause::kNone);
+  EXPECT_TRUE(diagnostic.handle_consumed);
+}
+
+TEST(Diagnostics, ConcurrentPreparationFailuresStayIndependent) {
+  std::atomic<bool> start{false};
+  auto check = [&](bool alias) {
+    void* original = nullptr;
+    HookRequest requests[] = {{"one", reinterpret_cast<void*>(1), &original},
+                              {"two", reinterpret_cast<void*>(2), &original}};
+    while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+    for (int i = 0; i < 200; ++i) {
+      OperationDiagnostic diagnostic;
+      auto result = hook_batch_diagnosed({}, requests, alias ? 2 : 0, nullptr, &diagnostic);
+      EXPECT_EQ(result.error.code, ErrorCode::kInvalidArgument);
+      EXPECT_EQ(diagnostic.cause, alias ? ErrorCause::kOutputAlias : ErrorCause::kInvalidRequest);
+      EXPECT_FALSE(result.handle.valid());
+    }
+  };
+  std::thread first(check, true), second(check, false);
+  start.store(true, std::memory_order_release);
+  first.join();
+  second.join();
+}
+
+TEST(Diagnostics, CandidateCallbackCannotLeakItsNestedFailureCause) {
+  test::ElfBuilder builder;
+  builder.add_symbol("alpha", 1).set_symbol_undefined(1).add_jump_slot(1);
+  auto image = builder.build();
+  NamedImage named{{image.load_bias(), image.phdr_table(), image.phdr_count, 0x765}, "custom"};
+  CandidateSelection selection;
+  selection.sources = kSourceJmprel;
+  selection.types = kTypeJumpSlot;
+  selection.predicate = [](const FunctionCandidate&, void*) -> Result<bool> {
+    void* original = nullptr;
+    HookRequest requests[] = {{"one", reinterpret_cast<void*>(1), &original},
+                              {"two", reinterpret_cast<void*>(2), &original}};
+    OperationDiagnostic nested;
+    auto result = hook_batch_diagnosed({}, requests, 2, nullptr, &nested);
+    EXPECT_EQ(result.error.code, ErrorCode::kInvalidArgument);
+    EXPECT_EQ(nested.cause, ErrorCause::kOutputAlias);
+    return Error::Make(ErrorCode::kInvalidArgument);
+  };
+  OperationDiagnostic diagnostic;
+  auto result = expand_function_candidates_diagnosed(&named, 1, selection, &diagnostic);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(diagnostic.cause, ErrorCause::kInvalidRequest);
+  selection.predicate = nullptr;
+  selection.limits.text_bytes = 0;
+  result = expand_function_candidates_diagnosed(&named, 1, selection, &diagnostic);
+  ASSERT_FALSE(result);
+  EXPECT_EQ(diagnostic.cause, ErrorCause::kScanBudget);
+}
+
+}  // namespace contracts_checks

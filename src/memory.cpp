@@ -90,9 +90,9 @@ bool parse_maps_line(const char* line, size_t len, VmaInfo& out) noexcept {
   return true;
 }
 
-MapsCoverage::MapsCoverage(const uintptr_t* pages, size_t count, size_t page_size,
-                           VmaInfo* out) noexcept
-    : pages_(pages), count_(count), page_size_(page_size), out_(out) {
+MapsCoverage::MapsCoverage(const uintptr_t* pages, size_t count, size_t page_size, VmaInfo* out,
+                           CauseContext* cause) noexcept
+    : pages_(pages), count_(count), page_size_(page_size), out_(out), cause_(cause) {
   if (pages == nullptr || out == nullptr || count == 0 || page_size == 0 ||
       (page_size & (page_size - 1)) != 0) {
     fail(ErrorCode::kInvalidArgument);
@@ -144,10 +144,10 @@ void MapsCoverage::feed_line(const char* line, size_t len) noexcept {
 
 Error MapsCoverage::finish() const noexcept {
   if (failure_ == ErrorCode::kOutOfBounds)
-    return with_cause(Error::Make(failure_), ErrorCause::kMapsCoverage);
+    return with_cause(Error::Make(failure_), ErrorCause::kMapsCoverage, cause_);
   if (failure_ != ErrorCode::kSuccess) return Error::Make(failure_);
   if (next_ != count_)
-    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kMapsCoverage);
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kMapsCoverage, cause_);
   return Error::Ok();
 }
 
@@ -351,7 +351,7 @@ int prot_of(const VmaInfo& vma) noexcept {
 }
 
 Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* extra_pages,
-                   size_t extra_count) {
+                   size_t extra_count, CauseContext* cause) {
   if (prepared_) return Error::Make(ErrorCode::kInvalidArgument);
   if (page_size_ == 0 || (page_size_ & (page_size_ - 1)) != 0)
     return Error::Make(ErrorCode::kInvalidArgument);
@@ -390,7 +390,7 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   SmallVec<VmaInfo, 8> vmas;
   vmas.reserve(unique);
   for (size_t i = 0; i < unique; ++i) vmas.push_back(VmaInfo{});
-  MapsCoverage coverage(bases.begin(), unique, page_size_, vmas.begin());
+  MapsCoverage coverage(bases.begin(), unique, page_size_, vmas.begin(), cause);
   Error maps = ops_.read_maps(ops_.ctx, coverage);
   if (maps) return maps;
 
@@ -399,7 +399,7 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   for (size_t i = 0; i < unique; ++i) {
     const VmaInfo& v = vmas[i];
     if (v.shared || v.executable || !v.readable)
-      return with_cause(Error::Make(ErrorCode::kPermissionDenied), ErrorCause::kVmaPolicy);
+      return with_cause(Error::Make(ErrorCode::kPermissionDenied), ErrorCause::kVmaPolicy, cause);
   }
 
   pages_.clear();

@@ -220,29 +220,18 @@ class SmallVec {
   size_t size_ = 0;
 };
 
-/// Record `cause` as the current thread's most recent failure cause.
-void note_cause(ErrorCause cause) noexcept;
+struct CauseContext {
+  ErrorCause value = ErrorCause::kNone;
+};
 
-/// The current thread's most recent noted cause (kNone if none).
-ErrorCause noted_cause() noexcept;
-
-/// Convenience: note `cause` and return `error` unchanged.
-inline Error with_cause(Error error, ErrorCause cause) noexcept {
-  note_cause(cause);
-  return error;
+inline void note_cause(ErrorCause value, CauseContext* cause = nullptr) noexcept {
+  if (cause != nullptr) cause->value = value;
 }
 
-/// Clears the note for one operation and restores the previous value after.
-class CauseScope {
- public:
-  CauseScope() noexcept;
-  ~CauseScope();
-  CauseScope(const CauseScope&) = delete;
-  CauseScope& operator=(const CauseScope&) = delete;
-
- private:
-  ErrorCause saved_;
-};
+inline Error with_cause(Error error, ErrorCause value, CauseContext* cause = nullptr) noexcept {
+  note_cause(value, cause);
+  return error;
+}
 
 /// The cause to report for a final `error`: the noted cause when it is one of
 /// the causes `error.code` can have, otherwise the code's default cause.
@@ -255,21 +244,25 @@ ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept;
 enum class ExceptionOrigin { kInternal, kHostCallback };
 
 /// Map the exception currently being handled.  Call only inside a catch block.
-inline Error current_exception_error(ExceptionOrigin origin = ExceptionOrigin::kInternal) noexcept {
+inline Error current_exception_error(ExceptionOrigin origin = ExceptionOrigin::kInternal,
+                                     CauseContext* cause = nullptr) noexcept {
   try {
     throw;
   } catch (const std::bad_alloc&) {
     const auto error = Error::Make(ErrorCode::kOutOfMemory);
-    return origin == ExceptionOrigin::kHostCallback ? with_cause(error, ErrorCause::kHostCallback)
-                                                    : error;
+    return origin == ExceptionOrigin::kHostCallback
+               ? with_cause(error, ErrorCause::kHostCallback, cause)
+               : error;
   } catch (const std::length_error&) {
     if (origin == ExceptionOrigin::kHostCallback)
-      return with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kHostCallback);
+      return with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kHostCallback,
+                        cause);
     return Error::Make(ErrorCode::kIntegerOverflow);
   } catch (...) {
     return with_cause(Error::Make(ErrorCode::kUnsupportedFormat),
                       origin == ExceptionOrigin::kHostCallback ? ErrorCause::kHostCallback
-                                                               : ErrorCause::kInternalException);
+                                                               : ErrorCause::kInternalException,
+                      cause);
   }
 }
 
@@ -280,23 +273,24 @@ inline Error current_exception_error(ExceptionOrigin origin = ExceptionOrigin::k
 struct ScanBudget {
   size_t relocations = size_t{1} << 22;
   size_t bytes = size_t{64} << 20;
+  CauseContext* cause = nullptr;
 
   Error take_records(size_t count) noexcept {
     if (count > relocations)
-      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget, cause);
     relocations -= count;
     return Error::Ok();
   }
   Error take_bytes(size_t count) noexcept {
     if (count > bytes)
-      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget, cause);
     bytes -= count;
     return Error::Ok();
   }
   template <typename T>
   Error take_objects(size_t count) noexcept {
     if (count > bytes / sizeof(T))
-      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+      return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget, cause);
     return take_bytes(count * sizeof(T));
   }
 };

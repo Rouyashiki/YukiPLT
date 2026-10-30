@@ -93,8 +93,8 @@ refuses further installs with `IntegerOverflow` while allowing recovery.
 Trim does not destroy snapshots, plans, sessions or rule sets; does not touch
 original storage or abandoned memory effects; and does not establish quiescence.
 Keep its code resident until all objects are destroyed and all API, callback and
-replacement calls (including cached pointers) are excluded. API23 toolchains can
-use emulated TLS even for trivial thread-local diagnostic values. Core storage
+replacement calls (including cached pointers) are excluded. Diagnostics use operation-owned context and do not require compiler TLS. The
+linked C++ exception runtime may still use private emulated TLS. Core storage
 reclamation cannot reclaim private compiler/runtime TLS blocks: for an unloadable
 static-runtime host, end its participating threads before host unload. A host
 that cannot satisfy its runtime lifetime requirements must remain resident.

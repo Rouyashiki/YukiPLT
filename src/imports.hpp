@@ -21,7 +21,8 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image);
 // function-import path.
 Result<size_t> dynamic_symbol_count(const InspectedImage& image);
 
-Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image);
+Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image,
+                                                           CauseContext* cause = nullptr);
 // Attach version metadata to a caller-provided import set (shared by the
 // JUMP_SLOT and function-import paths).
 Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,

@@ -48,7 +48,8 @@ class MapsCoverage {
  public:
   /// `pages` (ascending, unique, aligned to `page_size`) and `out` (one entry
   /// per page) must outlive this object.  out[i] receives the VMA of pages[i].
-  MapsCoverage(const uintptr_t* pages, size_t count, size_t page_size, VmaInfo* out) noexcept;
+  MapsCoverage(const uintptr_t* pages, size_t count, size_t page_size, VmaInfo* out,
+               CauseContext* cause = nullptr) noexcept;
 
   /// Consume one maps line (without its trailing newline).
   void feed_line(const char* line, size_t len) noexcept;
@@ -74,6 +75,7 @@ class MapsCoverage {
   size_t next_ = 0;
   uintptr_t prev_end_ = 0;
   ErrorCode failure_ = ErrorCode::kSuccess;
+  CauseContext* cause_;
 };
 
 /// Feed /proc/self/maps to `coverage` in one pass and return its outcome.
@@ -190,7 +192,7 @@ class Txn {
   ///
   /// May throw std::bad_alloc; call it before any write.
   Error prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* extra_pages = nullptr,
-                size_t extra_count = 0);
+                size_t extra_count = 0, CauseContext* cause = nullptr);
 
   /// Atomically load a prepared slot.  Returns false if `slot` was not
   /// prepared (its page has not been confirmed mapped and readable).

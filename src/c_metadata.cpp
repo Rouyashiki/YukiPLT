@@ -294,57 +294,60 @@ yukiplt_c_error yukiplt_c_expand_candidates(const yukiplt_c_candidate_image* inp
                                             yukiplt_c_candidates* out,
                                             yukiplt_c_operation_diagnostic* diagnostic) noexcept {
   if (diagnostic && diagnostic->struct_size != sizeof(*diagnostic)) return converted(invalid());
-  detail::CauseScope scope;
+  detail::CauseContext context;
   OperationDiagnostic detail_result;
-  auto result = boundary([&]() -> Error {
-    if (!options || !out || (!input && count)) return Error::Make(ErrorCode::kNullPointer);
-    if (out->token || options->struct_size != sizeof(*options) ||
-        !valid_pattern(options->include) || (!options->exclude && options->exclude_count))
-      return invalid();
-    detail::ScanBudget budget;
-    if (auto e = budget.take_objects<NamedImage>(count)) return e;
-    std::vector<NamedImage> images;
-    images.reserve(count);
-    for (size_t i = 0; i < count; ++i) {
-      if (input[i].struct_size != sizeof(input[i]) || !input[i].path) return invalid();
-      const auto length = std::strlen(input[i].path);
-      size_t bytes;
-      if (!detail::safe_add(length, size_t{1}, bytes))
-        return Error::Make(ErrorCode::kIntegerOverflow);
-      if (auto e = budget.take_bytes(bytes)) return e;
-      images.push_back({image(input[i].image), input[i].path});
-    }
-    if (auto e = budget.take_objects<CandidatePattern>(options->exclude_count)) return e;
-    std::vector<CandidatePattern> exclusions;
-    exclusions.reserve(options->exclude_count);
-    for (size_t i = 0; i < options->exclude_count; ++i) {
-      if (!valid_pattern(options->exclude[i])) return invalid();
-      exclusions.push_back(pattern(options->exclude[i]));
-    }
-    Predicate host{options->predicate, options->context, {}};
-    CandidateSelection selection{options->sources,
-                                 options->types,
-                                 pattern(options->include),
-                                 exclusions.data(),
-                                 exclusions.size(),
-                                 options->predicate ? &predicate : nullptr,
-                                 &host,
-                                 {options->text_bytes, options->candidates}};
-    auto expanded = detail::expand_candidates_budgeted(images.data(), images.size(), selection,
-                                                       budget, &detail_result);
-    if (!expanded) {
-      if (host.failure && host.failure.code == expanded.error().code &&
-          host.failure.sys_errno == expanded.error().sys_errno)
-        detail_result.cause = ErrorCause::kHostCallback;
-      return expanded.error();
-    }
-    auto owned = std::make_shared<Candidates>();
-    owned->value = std::move(expanded.value());
-    auto token = publish(owned);
-    if (!token) return token.error();
-    out->token = token.value();
-    return Error::Ok();
-  });
+  auto result = boundary(
+      [&]() -> Error {
+        if (!options || !out || (!input && count)) return Error::Make(ErrorCode::kNullPointer);
+        if (out->token || options->struct_size != sizeof(*options) ||
+            !valid_pattern(options->include) || (!options->exclude && options->exclude_count))
+          return invalid();
+        detail::ScanBudget budget;
+        budget.cause = &context;
+        if (auto e = budget.take_objects<NamedImage>(count)) return e;
+        std::vector<NamedImage> images;
+        images.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+          if (input[i].struct_size != sizeof(input[i]) || !input[i].path) return invalid();
+          const auto length = std::strlen(input[i].path);
+          size_t bytes;
+          if (!detail::safe_add(length, size_t{1}, bytes))
+            return Error::Make(ErrorCode::kIntegerOverflow);
+          if (auto e = budget.take_bytes(bytes)) return e;
+          images.push_back({image(input[i].image), input[i].path});
+        }
+        if (auto e = budget.take_objects<CandidatePattern>(options->exclude_count)) return e;
+        std::vector<CandidatePattern> exclusions;
+        exclusions.reserve(options->exclude_count);
+        for (size_t i = 0; i < options->exclude_count; ++i) {
+          if (!valid_pattern(options->exclude[i])) return invalid();
+          exclusions.push_back(pattern(options->exclude[i]));
+        }
+        Predicate host{options->predicate, options->context, {}};
+        CandidateSelection selection{options->sources,
+                                     options->types,
+                                     pattern(options->include),
+                                     exclusions.data(),
+                                     exclusions.size(),
+                                     options->predicate ? &predicate : nullptr,
+                                     &host,
+                                     {options->text_bytes, options->candidates}};
+        auto expanded = detail::expand_candidates_budgeted(images.data(), images.size(), selection,
+                                                           budget, &detail_result);
+        if (!expanded) {
+          if (host.failure && host.failure.code == expanded.error().code &&
+              host.failure.sys_errno == expanded.error().sys_errno)
+            detail_result.cause = ErrorCause::kHostCallback;
+          return expanded.error();
+        }
+        auto owned = std::make_shared<Candidates>();
+        owned->value = std::move(expanded.value());
+        auto token = publish(owned);
+        if (!token) return token.error();
+        out->token = token.value();
+        return Error::Ok();
+      },
+      &context);
   if (diagnostic) {
     const bool from_core = static_cast<uint32_t>(detail_result.error.code) == result.code &&
                            detail_result.error.sys_errno == result.sys_errno;
@@ -355,7 +358,7 @@ yukiplt_c_error yukiplt_c_expand_candidates(const yukiplt_c_candidate_image* inp
         from_core ? detail_result.cause
                   : detail::resolve_cause(
                         Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno),
-                        detail::noted_cause()));
+                        context.value));
     d.error = result;
     *diagnostic = d;
   }

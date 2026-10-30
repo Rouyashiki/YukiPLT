@@ -31,11 +31,11 @@ inline yukiplt_c_error converted(Error e) noexcept {
 }
 inline Error invalid() noexcept { return Error::Make(ErrorCode::kInvalidArgument); }
 template <typename F>
-yukiplt_c_error boundary(F&& call) noexcept {
+yukiplt_c_error boundary(F&& call, CauseContext* cause = nullptr) noexcept {
   try {
     return converted(call());
   } catch (...) {
-    return converted(current_exception_error());
+    return converted(current_exception_error(ExceptionOrigin::kInternal, cause));
   }
 }
 inline ImageView image(const yukiplt_c_image& v) noexcept {

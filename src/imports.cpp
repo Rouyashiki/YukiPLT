@@ -449,10 +449,14 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
   return result;
 }
 
-Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image) {
+Result<VersionedImportSnapshot> snapshot_versioned_imports(const InspectedImage& image,
+                                                           CauseContext* cause) {
   auto raw = snapshot_imports(image);
   if (!raw) return raw.error();
-  return resolve_versions(image, std::move(raw.value().imports), raw.value().skipped_relocations);
+  ScanBudget budget;
+  budget.cause = cause;
+  return resolve_versions(image, std::move(raw.value().imports), raw.value().skipped_relocations,
+                          &budget);
 }
 
 Error validate_selector(const ImportSelector& selector) noexcept {
@@ -625,7 +629,8 @@ Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, voi
                             ScanBudget* budget) {
   if (image.android_rela == 0 || image.android_rela_size == 0) return Error::Ok();
   if (image.android_rela_size > kMaxPackedBytes)
-    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget,
+                      budget == nullptr ? nullptr : budget->cause);
   if (!readable(image, image.android_rela, image.android_rela_size))
     return Error::Make(ErrorCode::kOutOfBounds);
 
@@ -642,7 +647,8 @@ Error decode_android_packed(const InspectedImage& image, RelocVisitor visit, voi
     return Error::Make(ErrorCode::kCorruptedElf);
   const uint64_t total = static_cast<uint64_t>(total_signed);
   if (total > kMaxPackedRelocations)
-    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+    return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget,
+                      budget == nullptr ? nullptr : budget->cause);
   if (budget) {
     if (Error e = budget->take_records(static_cast<size_t>(total))) return e;
   }
@@ -1134,10 +1140,12 @@ static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* imag
         if ((exact.types & types) == 0) continue;
         const auto& symbol = record.entry.base.import.symbol;
         if (snapshot.path.size() > text_remaining)
-          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget,
+                                    budget.cause);
         text_remaining -= snapshot.path.size();
         if (symbol.size() > text_remaining)
-          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget,
+                                    budget.cause);
         text_remaining -= symbol.size();
         if (!include.value().matches(snapshot.path, symbol)) continue;
         bool excluded = false;
@@ -1157,16 +1165,18 @@ static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* imag
           try {
             keep = predicate(candidate, context);
           } catch (...) {
-            return detail::current_exception_error(detail::ExceptionOrigin::kHostCallback);
+            return detail::current_exception_error(detail::ExceptionOrigin::kHostCallback,
+                                                   budget.cause);
           }
           if (!keep)
             return keep.error().ok() ? detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
-                                                          ErrorCause::kHostCallback)
+                                                          ErrorCause::kHostCallback, budget.cause)
                                      : keep.error();
           if (!keep.value()) continue;
         }
         if (result.size() == limits.candidates)
-          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget);
+          return detail::with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kScanBudget,
+                                    budget.cause);
         result.push_back(std::move(candidate));
       }
     }
@@ -1178,23 +1188,27 @@ static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* imag
     std::sort(addresses.begin(), addresses.end());
     if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
       return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
-                                ErrorCause::kDuplicateTarget);
+                                ErrorCause::kDuplicateTarget, budget.cause);
     return result;
   } catch (...) {
-    return detail::current_exception_error();
+    return detail::current_exception_error(detail::ExceptionOrigin::kInternal, budget.cause);
   }
 }
 
 Result<std::vector<FunctionCandidate>> detail::expand_candidates_budgeted(
     const NamedImage* images, size_t count, const CandidateSelection& selection, ScanBudget& budget,
     OperationDiagnostic* diagnostic) {
-  detail::CauseScope scope;
-  auto result = expand_impl(images, count, selection, budget);
+  detail::CauseContext context;
+  auto local_budget = budget;
+  local_budget.cause = &context;
+  auto result = expand_impl(images, count, selection, local_budget);
+  budget.bytes = local_budget.bytes;
+  budget.relocations = local_budget.relocations;
   if (diagnostic) {
     *diagnostic = {};
     diagnostic->error = result ? Error::Ok() : result.error();
     diagnostic->stage = result ? OperationStage::kComplete : OperationStage::kPrepare;
-    diagnostic->cause = detail::resolve_cause(diagnostic->error, detail::noted_cause());
+    diagnostic->cause = detail::resolve_cause(diagnostic->error, context.value);
   }
   return result;
 }

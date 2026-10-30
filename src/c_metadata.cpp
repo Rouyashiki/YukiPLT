@@ -12,6 +12,7 @@
 namespace {
 using namespace yukiplt;
 using namespace yukiplt::detail::c_objects;
+using namespace yukiplt::detail::c_copy;
 static_assert(YUKIPLT_C_FEATURE_OWNED_IMAGES == 10);
 static_assert(YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS == 11);
 static_assert(YUKIPLT_C_SNAPSHOT_IMPORTS == 0 && YUKIPLT_C_SNAPSHOT_VERSIONED == 1 &&
@@ -52,39 +53,6 @@ Error save(Result<T>&& result, yukiplt_c_import_snapshot* out) {
   snapshot->value = std::move(result.value());
   return publish_to(std::move(snapshot), out);
 }
-bool append_size(size_t& bytes, std::string_view text) noexcept {
-  size_t count;
-  return detail::safe_add(text.size(), size_t{1}, count) && detail::safe_add(bytes, count, bytes);
-}
-yukiplt_c_text_ref copy_text(std::string_view value, char* text, size_t& offset) noexcept {
-  yukiplt_c_text_ref result{offset, value.size()};
-  if (!value.empty()) std::memcpy(text + offset, value.data(), value.size());
-  text[offset + value.size()] = '\0';
-  offset += value.size() + 1;
-  return result;
-}
-Error buffers(size_t count, size_t bytes, const void* rows, size_t capacity, const char* text,
-              size_t text_capacity, size_t* required_count, size_t* required_text,
-              bool& sizes_only) noexcept {
-  if (!required_count || !required_text) return Error::Make(ErrorCode::kNullPointer);
-  if ((!rows && capacity) || (!text && text_capacity)) return invalid();
-  sizes_only = !rows && !text && capacity == 0 && text_capacity == 0;
-  *required_count = count;
-  *required_text = bytes;
-  if (!sizes_only &&
-      (capacity < count || text_capacity < bytes || (count && !rows) || (bytes && !text)))
-    return Error::Make(ErrorCode::kOutOfBounds);
-  return Error::Ok();
-}
-struct RecordView {
-  const ImportInfo& import;
-  const SymbolVersion* version = nullptr;
-  const FunctionImport* function = nullptr;
-};
-RecordView record(const ImportInfo& v) noexcept { return {v}; }
-RecordView record(const VersionedImport& v) noexcept { return {v.import, &v.version}; }
-RecordView record(const FunctionImport& v) noexcept { return {v.base.import, &v.base.version, &v}; }
-constexpr std::string_view empty_text() noexcept { return ""; }
 Error inspect_snapshot(const ImageView& view, const NamedImage* named, uint32_t kind,
                        uint32_t sources, yukiplt_c_import_snapshot* out) {
   if (!out) return Error::Make(ErrorCode::kNullPointer);
@@ -237,24 +205,7 @@ yukiplt_c_error yukiplt_c_import_snapshot_copy(const yukiplt_c_import_snapshot* 
             size_t offset = 0, index = 0;
             for (const auto& item : snapshot.imports) {
               auto v = record(item);
-              yukiplt_c_import_record r{};
-              r.symbol = copy_text(v.import.symbol, text, offset);
-              r.version = copy_text(v.version ? v.version->name : empty, text, offset);
-              r.dependency = copy_text(v.version ? v.version->dependency : empty, text, offset);
-              r.slot_address = v.import.slot_address;
-              r.relocation_index = v.import.relocation_index;
-              r.symbol_index = v.import.symbol_index;
-              r.version_index = v.version ? v.version->index : 1;
-              if (v.version) {
-                r.version_table_present = v.version->table_present;
-                r.version_hidden = v.version->hidden;
-                r.version_source = static_cast<uint32_t>(v.version->source);
-              }
-              r.relocation_source = v.function ? static_cast<uint32_t>(v.function->source)
-                                               : YUKIPLT_C_RELOC_SOURCE_JMPREL;
-              r.relocation_type =
-                  v.function ? v.function->relocation_type : YUKIPLT_RELOC_JUMP_SLOT;
-              r.symbol_type = v.function ? v.function->symbol_type : 0;
+              auto r = copy_import(v, text, offset);
               rows[index++] = r;
             }
           }

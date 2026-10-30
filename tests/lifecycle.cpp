@@ -167,6 +167,42 @@ TEST_F(ContractFixture, ResidueAlreadyRestoredByThirdPartyNeedsNoProtectCall) {
   EXPECT_FALSE(result.handle.valid());
 }
 
+TEST_F(ContractFixture, CSessionOwnsPlanMetadataAndRefusesToLoseLiveRecovery) {
+  yukiplt_c_image ci{image.load_bias(), image.phdr_table(), image.phdr_count, 0x901};
+  yukiplt_c_hook_target target{
+      sizeof(target), ci, {YUKIPLT_C_SELECTOR("alpha"), kReplA, &outputs[0]}};
+  yukiplt_c_plan plan{};
+  size_t failed = 0;
+  ASSERT_EQ(yukiplt_c_build_plan(&target, 1, &plan, &failed).code, 0u);
+  EXPECT_EQ(failed, SIZE_MAX);
+  yukiplt_c_session session{};
+  ASSERT_EQ(yukiplt_c_prepare_session(&plan, &session).code, 0u);
+  EXPECT_EQ(yukiplt_c_plan_destroy(&plan).code, 0u);
+  yukiplt_c_summary summary{};
+  ASSERT_EQ(yukiplt_c_session_install(&session, &summary).code, 0u);
+  EXPECT_EQ(summary.succeeded, 1u);
+  EXPECT_EQ(summary.retained, 1u);
+  const auto token = session.token;
+  EXPECT_EQ(yukiplt_c_session_destroy(&session).code, YUKIPLT_C_INVALID_ARGUMENT);
+  EXPECT_EQ(session.token, token);
+  size_t bytes = 0;
+  ASSERT_EQ(yukiplt_c_session_target(&session, 0, nullptr, nullptr, 0, &bytes).code, 0u);
+  std::vector<char> text(bytes);
+  yukiplt_c_target_record result{};
+  ASSERT_EQ(yukiplt_c_session_target(&session, 0, &result, text.data(), bytes, &bytes).code, 0u);
+  EXPECT_STREQ(text.data() + result.selected.symbol.offset, "alpha");
+  EXPECT_EQ(result.original, reinterpret_cast<void*>(uintptr_t{0x1000}));
+  set_slot(0, 0x7777);
+  EXPECT_EQ(yukiplt_c_session_unhook(&session, &summary).code, YUKIPLT_C_SLOT_MODIFIED_EXTERNALLY);
+  EXPECT_EQ(summary.retained, 1u);
+  EXPECT_EQ(yukiplt_c_session_destroy(&session).code, YUKIPLT_C_INVALID_ARGUMENT);
+  set_slot(0, reinterpret_cast<uintptr_t>(kReplA));
+  EXPECT_EQ(yukiplt_c_session_unhook(&session, &summary).code, 0u);
+  EXPECT_EQ(summary.retained, 0u);
+  EXPECT_EQ(slot(0), 0x1000u);
+  EXPECT_EQ(yukiplt_c_session_destroy(&session).code, 0u);
+}
+
 }  // namespace contracts_checks
 
 namespace concurrency_checks {

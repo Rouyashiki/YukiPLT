@@ -232,3 +232,39 @@ TEST(ImportAllocation, RefreshCachePreparationFailureNeverPartiallyInstallsEithe
     if (detailed) EXPECT_EQ(report.preparation_error.code, ErrorCode::kOutOfMemory);
   }
 }
+
+TEST(ImportAllocation, CPlanAndSessionPreparationPreserveOutputsAndOwnership) {
+  AllocationFixture fixture;
+  auto v = fixture.view();
+  yukiplt_c_hook_target target{sizeof(target),
+                               {v.load_bias, v.phdr_table, v.phdr_count, v.instance_token},
+                               {YUKIPLT_C_SELECTOR(fixture.names[0].c_str()),
+                                reinterpret_cast<void*>(uintptr_t{0xa000}), &fixture.originals[0]}};
+  const auto baseline = live_groups();
+  bool completed = false;
+  size_t failures = 0;
+  for (int allocation = 0; allocation < 256; ++allocation) {
+    yukiplt_c_plan plan{};
+    yukiplt_c_session session{};
+    fail_after = allocation;
+    auto error = yukiplt_c_build_plan(&target, 1, &plan, nullptr);
+    if (!error.code) error = yukiplt_c_prepare_session(&plan, &session);
+    fail_after = -1;
+    EXPECT_EQ(live_groups(), baseline);
+    EXPECT_EQ(fixture.writes, 0u);
+    EXPECT_EQ(fixture.originals[0], nullptr);
+    if (error.code) {
+      EXPECT_EQ(error.code, YUKIPLT_C_OUT_OF_MEMORY);
+      EXPECT_EQ(session.token, 0u);
+      ++failures;
+    } else {
+      completed = true;
+      EXPECT_NE(session.token, 0u);
+    }
+    EXPECT_EQ(yukiplt_c_plan_destroy(&plan).code, 0u);
+    EXPECT_EQ(yukiplt_c_session_destroy(&session).code, 0u);
+    if (completed) break;
+  }
+  EXPECT_TRUE(completed);
+  EXPECT_GT(failures, 4u);
+}

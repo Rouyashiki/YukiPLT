@@ -4,17 +4,20 @@
 #ifndef YUKIPLT_C_API_HPP_
 #define YUKIPLT_C_API_HPP_
 
+#include <cstring>
 #include <memory>
+#include <string_view>
 
 #include "common.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail::c_objects {
-enum class Kind { kImages, kImports };
+enum class Kind { kImages, kImports, kPlan, kSession };
 struct Object {
   explicit Object(Kind value) noexcept : kind(value) {}
   virtual ~Object() = default;
+  virtual bool can_destroy() const noexcept { return true; }
   const Kind kind;
 };
 // Per-copy table. The mutex protects only lookup/publication/removal. Leases
@@ -57,5 +60,68 @@ inline FunctionImportSelector selector(const yukiplt_c_function_selector& v) noe
   return {selector(v.base), v.sources, v.types, static_cast<RelocationSource>(v.index_source)};
 }
 }  // namespace yukiplt::detail::c_objects
+
+namespace yukiplt::detail::c_copy {
+using c_objects::invalid;
+inline bool append_size(size_t& bytes, std::string_view text) noexcept {
+  size_t count;
+  return detail::safe_add(text.size(), size_t{1}, count) && detail::safe_add(bytes, count, bytes);
+}
+inline yukiplt_c_text_ref copy_text(std::string_view value, char* text, size_t& offset) noexcept {
+  yukiplt_c_text_ref result{offset, value.size()};
+  if (!value.empty()) std::memcpy(text + offset, value.data(), value.size());
+  text[offset + value.size()] = '\0';
+  offset += value.size() + 1;
+  return result;
+}
+inline Error buffers(size_t count, size_t bytes, const void* rows, size_t capacity,
+                     const char* text, size_t text_capacity, size_t* required_count,
+                     size_t* required_text, bool& sizes_only) noexcept {
+  if (!required_count || !required_text) return Error::Make(ErrorCode::kNullPointer);
+  if ((!rows && capacity) || (!text && text_capacity)) return invalid();
+  sizes_only = !rows && !text && capacity == 0 && text_capacity == 0;
+  *required_count = count;
+  *required_text = bytes;
+  if (!sizes_only &&
+      (capacity < count || text_capacity < bytes || (count && !rows) || (bytes && !text)))
+    return Error::Make(ErrorCode::kOutOfBounds);
+  return Error::Ok();
+}
+struct RecordView {
+  const ImportInfo& import;
+  const SymbolVersion* version = nullptr;
+  const FunctionImport* function = nullptr;
+};
+inline RecordView record(const ImportInfo& v) noexcept { return {v}; }
+inline RecordView record(const VersionedImport& v) noexcept { return {v.import, &v.version}; }
+inline RecordView record(const FunctionImport& v) noexcept {
+  return {v.base.import, &v.base.version, &v};
+}
+constexpr std::string_view empty_text() noexcept { return ""; }
+
+inline yukiplt_c_import_record copy_import(RecordView v, char* text, size_t& offset) noexcept {
+  const auto empty = empty_text();
+  yukiplt_c_import_record r{};
+  r.symbol = copy_text(v.import.symbol, text, offset);
+  r.version = copy_text(v.version ? v.version->name : empty, text, offset);
+  r.dependency = copy_text(v.version ? v.version->dependency : empty, text, offset);
+  r.slot_address = v.import.slot_address;
+  r.relocation_index = v.import.relocation_index;
+  r.symbol_index = v.import.symbol_index;
+  r.version_index = v.version ? v.version->index : 1;
+  if (v.version) {
+    r.version_table_present = v.version->table_present;
+    r.version_hidden = v.version->hidden;
+    r.version_source = static_cast<uint32_t>(v.version->source);
+  }
+  r.relocation_source =
+      v.function ? static_cast<uint32_t>(v.function->source) : YUKIPLT_C_RELOC_SOURCE_JMPREL;
+  r.relocation_type = v.function ? v.function->relocation_type : YUKIPLT_RELOC_JUMP_SLOT;
+  r.symbol_type = v.function ? v.function->symbol_type : 0;
+
+  return r;
+}
+
+}  // namespace yukiplt::detail::c_copy
 
 #endif  // YUKIPLT_C_API_HPP_

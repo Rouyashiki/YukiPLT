@@ -88,3 +88,24 @@ Keep the issuing library loaded for all queries and object destruction. Tokens
 are typed owners scoped to one library copy; a copied token is only a borrowed
 view. Serialize queries and destruction on the same object. No exception crosses
 the C boundary. The core and runtime remain C++ even for pure C source consumers.
+
+## C plans and sessions
+
+Probe `YUKIPLT_C_FEATURE_PLANS` and `YUKIPLT_C_FEATURE_SESSIONS`. Build an owned
+plan with `yukiplt_c_build_plan` or `yukiplt_c_build_function_plan`, then call
+`yukiplt_c_prepare_session`. Preparation copies the plan and allocates result
+storage; the plan can then be destroyed. Query target text sizes and copy
+individual target records, or read each group's target indices and state.
+
+Install returns both an error and a summary. A partial failure retains the
+session and every installed/recovery group; inspect all results. Destroying a
+session with any live handle fails with `INVALID_ARGUMENT` and preserves it.
+Retry clean failed groups, or explicitly unhook; unhook tries all groups in
+reverse order. Invalidated hooks consume their handles but still report the
+invalidation error. Abandon preserves the preceding recovery snapshot and does
+not restore memory. Destroy is permitted after all handles are consumed, but
+replacement/context/original storage still require the caller's quiescence.
+
+Original outputs are borrowed stable storage. They are not owned by the C plan
+or session and must not be reset or reused after publication. The `original`
+field in a copied target record is diagnostic, not an atomic reader.

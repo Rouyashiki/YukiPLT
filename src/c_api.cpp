@@ -342,6 +342,7 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_NAMED_IMAGE ||
          feature_id == YUKIPLT_C_FEATURE_OWNED_IMAGES ||
          feature_id == YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS ||
+         feature_id == YUKIPLT_C_FEATURE_PLANS || feature_id == YUKIPLT_C_FEATURE_SESSIONS ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
@@ -674,6 +675,8 @@ std::shared_ptr<Object> acquire(uint64_t token, Kind kind) {
 }
 Error destroy(uint64_t& token, Kind kind) {
   if (!token) return Error::Ok();
+  auto lease = acquire(token, kind);
+  if (!lease || !lease->can_destroy()) return invalid();
   std::shared_ptr<Object> retired;
   {
     auto& s = store();

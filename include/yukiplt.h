@@ -202,7 +202,9 @@ enum {
   YUKIPLT_C_FEATURE_ORIGINAL_LOAD = 8,
   YUKIPLT_C_FEATURE_NAMED_IMAGE = 9,
   YUKIPLT_C_FEATURE_OWNED_IMAGES = 10,
-  YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS = 11
+  YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS = 11,
+  YUKIPLT_C_FEATURE_PLANS = 12,
+  YUKIPLT_C_FEATURE_SESSIONS = 13
 };
 
 enum {
@@ -588,6 +590,112 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_import_snapshot_copy(
     const yukiplt_c_import_snapshot*, yukiplt_c_import_record*, size_t record_capacity, char* text,
     size_t text_capacity, size_t* required_count, size_t* required_text, uint32_t* kind,
     size_t* skipped_relocations) YUKIPLT_C_NOEXCEPT;
+
+// Plans own selected metadata/path identities. Sessions copy their plans and
+// allocate results before installation. Neither pins images or original storage.
+typedef struct yukiplt_c_plan {
+  uint64_t token;
+} yukiplt_c_plan;
+typedef struct yukiplt_c_session {
+  uint64_t token;
+} yukiplt_c_session;
+typedef struct yukiplt_c_hook_target {
+  uint32_t struct_size;
+  yukiplt_c_image image;
+  yukiplt_c_request request;
+} yukiplt_c_hook_target;
+typedef struct yukiplt_c_function_target {
+  uint32_t struct_size;
+  yukiplt_c_image image;
+  yukiplt_c_function_request_ex request;
+} yukiplt_c_function_target;
+typedef struct yukiplt_c_summary {
+  size_t attempted;
+  size_t succeeded;
+  size_t failed;
+  size_t retained;
+} yukiplt_c_summary;
+enum {
+  YUKIPLT_C_SESSION_PREPARED = 0,
+  YUKIPLT_C_SESSION_INSTALLED = 1,
+  YUKIPLT_C_SESSION_INSTALL_FAILED = 2,
+  YUKIPLT_C_SESSION_INDETERMINATE = 3,
+  YUKIPLT_C_SESSION_RESTORE_FAILED = 4,
+  YUKIPLT_C_SESSION_RELEASED = 5,
+  YUKIPLT_C_SESSION_INVALIDATED = 6,
+  YUKIPLT_C_SESSION_ABANDONED = 7
+};
+typedef struct yukiplt_c_target_record {
+  yukiplt_c_image image;
+  yukiplt_c_import_record selected;
+  void* replacement;
+  void** out_original;
+  uint32_t require_current;
+  uintptr_t expected_current;
+  void* original;  // Diagnostic value only; replacement uses load_original.
+  yukiplt_c_slot_report install_report;
+  yukiplt_c_slot_report restore_report;
+} yukiplt_c_target_record;
+typedef struct yukiplt_c_session_group {
+  yukiplt_c_image image;
+  uint32_t state;
+  uint32_t has_live_handle;  // A boolean, never an owning Hook token.
+  yukiplt_c_error install_error;
+  yukiplt_c_error restore_error;
+} yukiplt_c_session_group;
+
+// Exact-size inputs, 1..64 targets per identical image, no automatic splitting.
+// Failure sets failed_target to the first bad input or SIZE_MAX for global errors.
+// All other outputs are preserved on failure. Strings are copied; original
+// outputs/replacement contexts remain borrowed through recovery and quiescence.
+YUKIPLT_API yukiplt_c_error yukiplt_c_build_plan(const yukiplt_c_hook_target*, size_t,
+                                                 yukiplt_c_plan*,
+                                                 size_t* failed_target) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_build_function_plan(const yukiplt_c_function_target*, size_t,
+                                                          yukiplt_c_plan*,
+                                                          size_t* failed_target) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_plan_destroy(yukiplt_c_plan*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_plan_size(const yukiplt_c_plan*, size_t*) YUKIPLT_C_NOEXCEPT;
+// Single-record copying: both record/text NULL and capacity zero request text
+// size only. Short buffers write only required_text. Plan-only result fields
+// (original and operation reports) are zero. All outputs must be disjoint.
+YUKIPLT_API yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan*, size_t index,
+                                                  yukiplt_c_target_record*, char* text,
+                                                  size_t capacity,
+                                                  size_t* required_text) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_prepare_session(const yukiplt_c_plan*,
+                                                      yukiplt_c_session*) YUKIPLT_C_NOEXCEPT;
+// Destroy refuses any live/recovery handle with INVALID_ARGUMENT and retains
+// the entire object. Explicit unhook or abandon must succeed first. Abandon
+// never restores memory and never establishes quiescence.
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_destroy(yukiplt_c_session*) YUKIPLT_C_NOEXCEPT;
+// One transaction per image, continue after errors; undo in reverse group order.
+// summary is required. Partial failure returns its first failing group's error
+// and retains every result/handle in the session. Caller serializes reads and
+// operations. No fallible restoration runs in destruction.
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_install(yukiplt_c_session*,
+                                                      yukiplt_c_summary*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_unhook(yukiplt_c_session*,
+                                                     yukiplt_c_summary*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_abandon(yukiplt_c_session*,
+                                                      yukiplt_c_summary*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_size(const yukiplt_c_session*, size_t* targets,
+                                                   size_t* groups) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session*, size_t index,
+                                                     yukiplt_c_target_record*, char* text,
+                                                     size_t capacity,
+                                                     size_t* required_text) YUKIPLT_C_NOEXCEPT;
+// group is required; indices NULL/capacity zero is count-only. On insufficient
+// capacity only required_indices is updated. No core handle is exposed.
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_group_copy(
+    const yukiplt_c_session*, size_t index, yukiplt_c_session_group*, size_t* indices,
+    size_t capacity, size_t* required_indices) YUKIPLT_C_NOEXCEPT;
+// A retained diagnostic, not current memory permissions. After abandon this
+// is the pre-abandon snapshot. Released groups have no residual page records.
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_recovery(const yukiplt_c_session*, size_t index,
+                                                       yukiplt_c_recovery_diagnostic*,
+                                                       yukiplt_c_residual_page*, size_t capacity,
+                                                       size_t* required_pages) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

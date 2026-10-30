@@ -3,6 +3,7 @@
 
 # This manifest is also usable by source-embedding hosts.
 set(YUKIPLT_SOURCES
+    "${CMAKE_CURRENT_LIST_DIR}/../src/c_session.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/c_api.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/c_metadata.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/imports.cpp"

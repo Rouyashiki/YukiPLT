@@ -460,6 +460,10 @@ int Txn::protect_page(uintptr_t page, int prot) noexcept {
 }
 
 void Txn::restore_pages(CommitResult& result) noexcept {
+  // Restore this transaction's single maps snapshot. A cooperating caller
+  // serializes other page-protection writers; another maps read here could
+  // still race mprotect. Cross-transaction residue retries separately validate
+  // the historical protection against their new prepare snapshot.
   for (size_t k = pages_.size(); k-- > 0;) {
     Page& p = pages_[k];
     if (!p.raised || p.restore_failed) continue;

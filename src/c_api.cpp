@@ -144,6 +144,12 @@ ImageView view(const yukiplt_c_image& image) noexcept {
   return {image.load_bias, static_cast<const NativeElfPhdr*>(image.program_headers),
           image.program_header_count, image.instance_token};
 }
+Result<NamedImage> named_view(const yukiplt_c_named_image& source) {
+  if (source.struct_size != sizeof(yukiplt_c_named_image) || source.image.instance_token != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  if (source.path == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  return NamedImage{view(source.image), source.path};
+}
 ImportSelector selector(const yukiplt_c_selector& source) noexcept {
   return {
       source.symbol,     static_cast<VersionMatch>(source.version_match), source.version,
@@ -326,6 +332,8 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_EXPECTED_CURRENT ||
          feature_id == YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY ||
          feature_id == YUKIPLT_C_FEATURE_ERROR_CAUSES ||
+         feature_id == YUKIPLT_C_FEATURE_ORIGINAL_LOAD ||
+         feature_id == YUKIPLT_C_FEATURE_NAMED_IMAGE ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
@@ -471,5 +479,147 @@ yukiplt_c_error yukiplt_c_image_containing(const void* address, yukiplt_c_image*
     *output = {image.load_bias, image.phdr_table, image.phdr_count, image.instance_token};
     return Error::Ok();
   });
+}
+yukiplt_c_error yukiplt_c_hook_named(const yukiplt_c_named_image* image,
+                                     const yukiplt_c_selector* target, void* replacement,
+                                     void** original, yukiplt_c_handle* handle,
+                                     yukiplt_c_slot_report* report) noexcept {
+  if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
+  const yukiplt_c_request request{*target, replacement, original};
+  return yukiplt_c_hook_batch_named(image, &request, 1, handle, report);
+}
+
+yukiplt_c_error yukiplt_c_hook_batch_named(const yukiplt_c_named_image* image,
+                                           const yukiplt_c_request* requests, size_t count,
+                                           yukiplt_c_handle* handle,
+                                           yukiplt_c_slot_report* output) noexcept {
+  return guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    auto named = named_view(*image);
+    if (!named) return named.error();
+    SelectedHookRequest converted_requests[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      if (!valid_enums(requests[i].target)) return Error::Make(ErrorCode::kInvalidArgument);
+      converted_requests[i] = {selector(requests[i].target), requests[i].replacement,
+                               requests[i].out_original};
+    }
+    auto result = hook_imports_named(named.value(), converted_requests, count, reports);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());  // transfer, do not abandon
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+}
+
+yukiplt_c_error yukiplt_c_hook_function_named(const yukiplt_c_named_image* image,
+                                              const yukiplt_c_function_selector* target,
+                                              void* replacement, void** original,
+                                              yukiplt_c_handle* handle,
+                                              yukiplt_c_slot_report* report) noexcept {
+  if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
+  const yukiplt_c_function_request request{*target, replacement, original};
+  return yukiplt_c_hook_functions_named(image, &request, 1, handle, report);
+}
+
+yukiplt_c_error yukiplt_c_hook_functions_named(const yukiplt_c_named_image* image,
+                                               const yukiplt_c_function_request* requests,
+                                               size_t count, yukiplt_c_handle* handle,
+                                               yukiplt_c_slot_report* output) noexcept {
+  return guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    auto named = named_view(*image);
+    if (!named) return named.error();
+    FunctionHookRequest converted_requests[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      FunctionImportSelector sel;
+      if (!function_selector(requests[i].target, sel))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      converted_requests[i] = {sel, requests[i].replacement, requests[i].out_original};
+    }
+    auto result = hook_function_imports_named(named.value(), converted_requests, count, reports);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());  // transfer, do not abandon
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+}
+
+yukiplt_c_error yukiplt_c_hook_functions_ex_named(
+    const yukiplt_c_named_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
+    yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
+    yukiplt_c_recovery_diagnostic* diagnostic) noexcept {
+  RecoveryDiagnostic operation;
+  operation.stage = OperationStage::kPrepare;
+  const auto error = guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    auto named = named_view(*image);
+    if (!named) return named.error();
+    FunctionHookRequestEx translated[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      if (requests[i].struct_size != sizeof(yukiplt_c_function_request_ex) ||
+          requests[i].require_current > 1 ||
+          !function_selector(requests[i].base.target, translated[i].target))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      translated[i].replacement = requests[i].base.replacement;
+      translated[i].out_original = requests[i].base.out_original;
+      translated[i].require_current = requests[i].require_current != 0;
+      translated[i].expected_current = requests[i].expected_current;
+    }
+    auto result =
+        hook_function_imports_ex_named(named.value(), translated, count, reports, &operation);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+  operation.error = Error::Sys(static_cast<ErrorCode>(error.code), error.sys_errno);
+  if (diagnostic) *diagnostic = converted(operation);
+  return error;
+}
+
+yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
+    const yukiplt_c_named_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
+    yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
+    yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
+    return converted(Error::Make(ErrorCode::kInvalidArgument));
+  OperationDiagnostic operation;
+  operation.cause = ErrorCause::kInvalidRequest;
+  const auto error = guarded([&] {
+    if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
+    if (handle->token != 0 || count == 0 || count > kLimit)
+      return Error::Make(ErrorCode::kInvalidArgument);
+    auto named = named_view(*image);
+    if (!named) return named.error();
+    FunctionHookRequestEx translated[kLimit];
+    SlotReport reports[kLimit];
+    for (size_t i = 0; i < count; ++i) {
+      if (requests[i].struct_size != sizeof(yukiplt_c_function_request_ex) ||
+          requests[i].require_current > 1 ||
+          !function_selector(requests[i].base.target, translated[i].target))
+        return Error::Make(ErrorCode::kInvalidArgument);
+      translated[i].replacement = requests[i].base.replacement;
+      translated[i].out_original = requests[i].base.out_original;
+      translated[i].require_current = requests[i].require_current != 0;
+      translated[i].expected_current = requests[i].expected_current;
+    }
+    auto result = hook_function_imports_diagnosed_named(named.value(), translated, count, reports,
+                                                        &operation);
+    handle->token = token(result.handle);
+    detail_api::set(result.handle, detail_api::invalid());
+    copy_reports(output, reports, count);
+    return result.error;
+  });
+  if (diagnostic) *diagnostic = converted(operation, error);
+  return error;
 }
 }  // extern C

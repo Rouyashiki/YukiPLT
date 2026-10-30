@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "common.hpp"
 #include "yukiplt.hpp"
@@ -86,7 +87,8 @@ class Registry {
   // Claim all slots or return kInvalidId without ownership. Requires salt_ready().
   // Copy system_path before publishing ownership; null means the exact empty
   // path, not a wildcard. Custom images do not use it.
-  uint64_t claim(const ImageIdentity& image, const SlotRecord* slots, size_t count);
+  uint64_t claim(const ImageIdentity& image, const SlotRecord* slots, size_t count,
+                 const char* system_path = nullptr);
 
   /// kPrepared -> kInstalled.  No-op on a bad id or wrong state.
   void mark_installed(uint64_t id);
@@ -122,6 +124,11 @@ class Registry {
   Error snapshot(uint64_t id, ImageIdentity& image, SlotRecord* slots, size_t cap,
                  size_t* count) const;
 
+  /// Copy the installed system image's path under op_mutex. May allocate, so
+  /// callers obtain this before beginning a restore or any memory operation.
+  /// Custom images have no system path. Empty is an exact system name.
+  Error snapshot_path(uint64_t id, std::string& path) const;
+
   /// Mark every live group for a custom image (matching load_bias, phdr and
   /// token) as invalidated.  Returns the number marked.
   size_t forget_custom_image(const ImageIdentity& image);
@@ -149,6 +156,7 @@ class Registry {
     bool in_use = false;
     GroupState state = GroupState::kPrepared;
     ImageIdentity image;
+    std::string system_path;
     SmallVec<SlotRecord, 2> slots;
     SmallVec<PageResidueRecord, 2> residue;
     RecoveryDiagnostic diagnostic;

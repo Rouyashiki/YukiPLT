@@ -19,6 +19,8 @@ YK_STATIC_ASSERT(YUKIPLT_C_RELOC_SOURCE_RELA == 1 && YUKIPLT_C_RELOC_SOURCE_ANDR
 YK_STATIC_ASSERT(YUKIPLT_C_RELOC_SOURCE_REL == 3 && YUKIPLT_C_RELOC_SOURCE_ANDROID_REL == 4);
 YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_REL_IMPORTS == 6);
 YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_ERROR_CAUSES == 7);
+YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_ORIGINAL_LOAD == 8);
+YK_STATIC_ASSERT(YUKIPLT_C_FEATURE_NAMED_IMAGE == 9);
 YK_STATIC_ASSERT(YUKIPLT_C_CAUSE_NONE == 0 && YUKIPLT_C_CAUSE_PLATFORM == 19);
 YK_STATIC_ASSERT(YUKIPLT_C_CAUSE_SLOT_DRIFT == 21);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_error) == 8 && sizeof(yukiplt_c_handle) == 8);
@@ -56,6 +58,8 @@ YK_STATIC_ASSERT(offsetof(yukiplt_c_slot_report, status) == 3 * sizeof(void*));
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, load_bias) == 0);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, program_headers) == sizeof(void*));
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, program_header_count) == 2 * sizeof(void*));
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, struct_size) == 0);
+YK_STATIC_ASSERT(YK_ALIGNOF(yukiplt_c_named_image) == YK_ALIGNOF(yukiplt_c_image));
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, struct_size) == 0);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, sources) == 4);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_selector, types) == 8);
@@ -91,6 +95,9 @@ YK_STATIC_ASSERT(sizeof(yukiplt_c_function_request_ex) == 104);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, base) == 8);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_function_request_ex, expected_current) == 96);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_image) == 32);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_named_image) == 48);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, image) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, path) == 40);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, instance_token) == 24);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_selector) == 48);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_request) == 64);
@@ -113,9 +120,15 @@ YK_STATIC_ASSERT(sizeof(yukiplt_c_function_request) == 48);
 YK_STATIC_ASSERT(sizeof(yukiplt_c_slot_report) == 16);
 #if YUKIPLT_ELF_MACHINE == 40
 YK_STATIC_ASSERT(sizeof(yukiplt_c_image) == 24);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_named_image) == 40);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, image) == 8);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, path) == 32);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, instance_token) == 16);
 #else
 YK_STATIC_ASSERT(sizeof(yukiplt_c_image) == 20);
+YK_STATIC_ASSERT(sizeof(yukiplt_c_named_image) == 28);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, image) == 4);
+YK_STATIC_ASSERT(offsetof(yukiplt_c_named_image, path) == 24);
 YK_STATIC_ASSERT(offsetof(yukiplt_c_image, instance_token) == 12);
 #endif
 #endif

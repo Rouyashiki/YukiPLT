@@ -8,6 +8,7 @@
     __cfi_chec[k];
     yukiplt_c_*;
     extern "C++" {
+      "yukiplt::load_original(void* const*)";
       "yukiplt::image_from_soname(char const*)";
       yukiplt::inspect_imports*;
       yukiplt::inspect_versioned_imports*;

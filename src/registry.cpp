@@ -206,7 +206,8 @@ void Registry::index_reserve(size_t extra) {
   index_ = std::move(table);
 }
 
-uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, size_t count) {
+uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, size_t count,
+                         const char* system_path) {
   if (slots == nullptr || count == 0 || !salt_ready_) return kInvalidId;
 
   // No slot may already be owned by a live group (one slot, one owner).  The
@@ -239,12 +240,16 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
   // residual page is a slot page, so `count` entries bound the residue too.
   r.slots.reserve(count);
   r.residue.reserve(count);
+  // Copy while the record is still free. Failure cannot leave an owner, and
+  // moving the prepared string below cannot throw after ownership is published.
+  std::string path(image.instance_token == 0 && system_path ? system_path : "");
   // Do not consume the free entry or publish ownership until all allocation
   // has succeeded. An exception leaves this record available for a retry.
   r.slots.clear();
   r.residue.clear();
   for (size_t i = 0; i < count; ++i) r.slots.push_back(slots[i]);
   r.image = image;
+  r.system_path.swap(path);
   r.diagnostic = {};
   r.state = GroupState::kPrepared;
   r.in_use = true;
@@ -309,6 +314,7 @@ void Registry::finish_restore(uint64_t id, bool released, GroupState not_release
     ++r->generation;
     r->slots.clear();
     r->residue.clear();
+    r->system_path.clear();
     free_list_.push_back(index);
     return;
   }
@@ -332,7 +338,15 @@ Error Registry::release(uint64_t id) {
   ++r->generation;
   r->slots.clear();
   r->residue.clear();
+  r->system_path.clear();
   free_list_.push_back(index);
+  return Error::Ok();
+}
+
+Error Registry::snapshot_path(uint64_t id, std::string& path) const {
+  const Record* r = resolve(id);
+  if (r == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
+  path = r->system_path;
   return Error::Ok();
 }
 

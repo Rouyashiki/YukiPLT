@@ -661,11 +661,15 @@ SessionSummary FunctionHookSession::abandon() {
   for (auto& group : images_) {
     if (!group.handle.valid()) continue;
     ++summary.attempted;
-    group.restore_error = yukiplt::abandon(group.handle);
-    group.operation = {};
-    group.operation.error = group.restore_error;
-    group.operation.stage =
-        group.restore_error ? OperationStage::kPrepare : OperationStage::kComplete;
+    RecoveryDiagnostic recovery;
+    group.restore_error = query_recovery(group.handle, &recovery);
+    if (!group.restore_error) {
+      // The registry will be discarded, while residual slots/pages stay as
+      // they are. Preserve their last known state independently of the result
+      // of relinquishing ownership.
+      group.operation = recovery;
+      group.restore_error = yukiplt::abandon(group.handle);
+    }
     if (!group.restore_error) {
       group.state = SessionState::kAbandoned;
       ++summary.succeeded;

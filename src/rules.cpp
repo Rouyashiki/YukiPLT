@@ -247,8 +247,9 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
 
   // Each new binding consumes one original slot permanently; clean retries reuse
   // that binding's slot. Disabled/capacity-failed bindings use the no-slot sentinel.
-  const size_t slot_index = new_binding ? rule.next_slot : bindings_[existing].original_index;
-  void** out = slot_index < rule.capacity ? &rule.out_originals[slot_index] : nullptr;
+  const size_t candidate_index = new_binding ? rule.next_slot : bindings_[existing].original_index;
+  const size_t slot_index = candidate_index < rule.capacity ? candidate_index : kNoOriginalIndex;
+  void** out = slot_index != kNoOriginalIndex ? &rule.out_originals[slot_index] : nullptr;
 
   // Prepare the binding and index before installation can publish ownership.
   // Superseded bindings remain history but leave the current index.
@@ -290,8 +291,8 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   ++summary.attempted;
 
   // Original storage exhausted: refuse before any mprotect/publish/CAS.
-  const bool capacity_refused = rule.capacity != 0 && slot_index >= rule.capacity;
-  if (new_binding && slot_index < rule.capacity) rule.next_slot = slot_index + 1;
+  const bool capacity_refused = rule.capacity != 0 && slot_index == kNoOriginalIndex;
+  if (new_binding && slot_index != kNoOriginalIndex) rule.next_slot = slot_index + 1;
 
   HookResult result{Error::Make(ErrorCode::kInvalidArgument), HookHandle{}};
   SlotReport report{};
@@ -635,6 +636,13 @@ Error RuleSet::prepare_undo_report(RuleOperationReport& report, uint64_t rule_id
       event.stage = stage;
       event.binding_index = n;
       event.attempted = true;
+      if (stage == RuleOperationStage::kAbandon) {
+        if (Error error = query_recovery(handles_[n], &event.recovery)) {
+          report.preparation_error = error;
+          report.events.clear();
+          return error;
+        }
+      }
       report.events.push_back(std::move(event));
     }
     return Error::Ok();
@@ -650,6 +658,9 @@ void RuleSet::finish_undo_report(RuleOperationReport& report) const {
     const auto& binding = bindings_[event.binding_index];
     event.state = binding.state;
     event.error = binding.error;
+    // Abandon consumes the registry entry, not its residual memory effects.
+    // Preserve the pre-operation snapshot even when relinquishing succeeded.
+    if (event.stage == RuleOperationStage::kAbandon) continue;
     event.recovery = {};
     event.recovery.error = binding.error;
     event.recovery.stage =

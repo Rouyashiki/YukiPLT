@@ -6,12 +6,12 @@
 #include <cstdlib>
 #include <new>
 
+#include "registry.hpp"
 #include "aps2_encoder.hpp"
 #include "elf_builder.hpp"
 #include "imports.hpp"
 #include "overrides.hpp"
 #include "memory.hpp"
-#include "registry.hpp"
 #include "system_images.hpp"
 #include "versioned_elf.hpp"
 #include "yukiplt.h"

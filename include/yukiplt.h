@@ -75,6 +75,13 @@ extern "C" {
 #define YUKIPLT_C_ABI_VERSION 1u
 #define YUKIPLT_C_ANY_RELOCATION SIZE_MAX
 
+// Calls are not async-signal-safe: do not enter from a signal handler. Thread
+// cancellation through an operation and longjmp across library frames are not
+// supported. After a multithreaded fork, the child must not call this library
+// before exec; do not fork inside an operation or callback. Callers serialize
+// access to each handle and retain images, replacements and outputs through
+// recovery and their own quiescence protocol.
+
 enum {
   YUKIPLT_C_SUCCESS = 0,
   YUKIPLT_C_INVALID_ARGUMENT = 1,
@@ -186,7 +193,9 @@ enum {
   YUKIPLT_C_FEATURE_EXPECTED_CURRENT = 4,
   YUKIPLT_C_FEATURE_ADDRESS_DISCOVERY = 5,
   YUKIPLT_C_FEATURE_REL_IMPORTS = 6,
-  YUKIPLT_C_FEATURE_ERROR_CAUSES = 7
+  YUKIPLT_C_FEATURE_ERROR_CAUSES = 7,
+  YUKIPLT_C_FEATURE_ORIGINAL_LOAD = 8,
+  YUKIPLT_C_FEATURE_NAMED_IMAGE = 9
 };
 
 enum {
@@ -266,11 +275,17 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
 // GOT slots; aliases of planned or already owned slots are rejected before
 // publication. The output handle must be zero; failure never overwrites an
 // existing handle. Non-null original outputs must be distinct and aligned, else
-// INVALID_ARGUMENT before any lock or write. A system image no longer loaded
-// returns IMAGE_INVALIDATED. Originals are release-published after every page
+// INVALID_ARGUMENT before any lock or write. A system image with no matching
+// live identity returns IMAGE_INVALIDATED. A bare image has no discovery path;
+// use the named entries to reject another path at the same address. Recorded
+// system hooks also check their installation path during unhook/live query.
+// Same-path/same-address reloads still require caller lifecycle coordination.
+// Originals are release-published after every page
 // raise succeeded and before the first CAS, and never cleared afterward; a
 // rolled-back conflict may leave a candidate original there without any hook
-// installed. Replacement must acquire-load them. They may be another hook's
+// installed. Replacement must use yukiplt_c_load_original(), or an acquire
+// fence followed by an acquire load; an acquire load alone does not order the
+// preceding PLT/GOT load on ARM. They may be another hook's
 // replacement. A clean failure leaves no net GOT change, restored protections
 // and no ownership; that excludes original outputs.
 YUKIPLT_API yukiplt_c_error yukiplt_c_hook(const yukiplt_c_image*, const yukiplt_c_selector*,
@@ -410,6 +425,49 @@ yukiplt_c_unhook_diagnosed(yukiplt_c_handle*, yukiplt_c_slot_report* reports, si
                            yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
 // Stable literal; never allocates. Unknown values return "Unknown".
 YUKIPLT_API const char* yukiplt_c_error_cause_name(uint32_t cause) YUKIPLT_C_NOEXCEPT;
+
+// Read a published original with the required preceding acquire fence and
+// acquire load. storage must be non-null, pointer-aligned, readable, alive and
+// the same stable object passed as out_original. This helper does not validate
+// memory or lifetime, allocate or lock. A null value is allowed; a non-null value
+// proves neither successful installation, provider identity nor quiescence.
+YUKIPLT_API void* yukiplt_c_load_original(void* const* storage) YUKIPLT_C_NOEXCEPT;
+
+// Frozen new layout; struct_size is exact layout validation, not an extension
+// mechanism. path is a caller-owned NUL-terminated exact dlpi_name, readable for
+// this call. NULL is invalid; "" matches only an empty name. The image must have
+// instance_token == 0. The library copies the live path before acquiring hook
+// ownership. Neither this descriptor nor its path pins the image or identifies
+// same-path/same-address reloads. Existing C image layout and entry points stay
+// unchanged. Discover the name through the loader's public enumeration API.
+typedef struct yukiplt_c_named_image {
+  uint32_t struct_size;
+  yukiplt_c_image image;
+  const char* path;
+} yukiplt_c_named_image;
+
+// Same result, handle and output contracts as the corresponding old entry
+// points, with the additional exact system-image path check before side effects.
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_named(const yukiplt_c_named_image*,
+                                                 const yukiplt_c_selector*, void* replacement,
+                                                 void** out_original, yukiplt_c_handle*,
+                                                 yukiplt_c_slot_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_named(const yukiplt_c_named_image*,
+                                                       const yukiplt_c_request*, size_t count,
+                                                       yukiplt_c_handle*,
+                                                       yukiplt_c_slot_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_function_named(
+    const yukiplt_c_named_image*, const yukiplt_c_function_selector*, void* replacement,
+    void** out_original, yukiplt_c_handle*, yukiplt_c_slot_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_named(
+    const yukiplt_c_named_image*, const yukiplt_c_function_request*, size_t count,
+    yukiplt_c_handle*, yukiplt_c_slot_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_ex_named(
+    const yukiplt_c_named_image*, const yukiplt_c_function_request_ex*, size_t count,
+    yukiplt_c_handle*, yukiplt_c_slot_report*, yukiplt_c_recovery_diagnostic*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
+    const yukiplt_c_named_image*, const yukiplt_c_function_request_ex*, size_t count,
+    yukiplt_c_handle*, yukiplt_c_slot_report*, yukiplt_c_operation_diagnostic*) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

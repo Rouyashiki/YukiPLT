@@ -128,8 +128,9 @@ Expected<SmallVec<ResolvedSlot>, Error> resolve_slots(const InspectedImage& imag
 Expected<ResolvedSlot, Error> resolve_unique_slot(const InspectedImage& image,
                                                   const char* symbol_name);
 
-// Dynamic tags for plain and Android-packed RELA, plus the REL/RELR tags we
-// must recognise in order to reject or ignore them. glibc's <elf.h> does not
+// Dynamic tags for the explicit native REL/RELA and Android-packed sources.
+// RELR is not scanned: its records do not participate in skipped counts or
+// duplicate-slot checks across these selected sources. glibc's <elf.h> does not
 // define the DT_ANDROID_* tags, so we name them here regardless of platform.
 constexpr int64_t kDtRela = 7;
 constexpr int64_t kDtRelaSz = 8;
@@ -141,10 +142,6 @@ constexpr int64_t kDtAndroidRel = 0x6000000f;
 constexpr int64_t kDtAndroidRelSz = 0x60000010;
 constexpr int64_t kDtAndroidRela = 0x60000011;
 constexpr int64_t kDtAndroidRelaSz = 0x60000012;
-constexpr int64_t kDtRelr = 0x24;
-constexpr int64_t kDtRelrSz = 0x23;
-constexpr int64_t kDtAndroidRelr = 0x6fffe000;
-constexpr int64_t kDtAndroidRelrSz = 0x6fffe001;
 
 constexpr int64_t kDtNativeRel = kNativeUsesRela ? kDtRela : kDtRel;
 constexpr int64_t kDtNativeRelSz = kNativeUsesRela ? kDtRelaSz : kDtRelSz;

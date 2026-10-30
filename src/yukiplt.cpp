@@ -23,6 +23,7 @@
 
 #include <exception>
 #endif
+#include "yukiplt.h"
 
 namespace yukiplt {
 
@@ -119,7 +120,10 @@ bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_pa
         c->matched = true;
         try {
           std::lock_guard<std::mutex> lock(detail::op_mutex());  // linker -> op
-          (*c->fn)(live);
+          if constexpr (std::is_invocable_v<Fn, const ImageView&, const char*>)
+            (*c->fn)(live, info->dlpi_name == nullptr ? "" : info->dlpi_name);
+          else
+            (*c->fn)(live);
         } catch (...) {
           c->error = std::current_exception();
         }
@@ -244,10 +248,10 @@ void publish_originals(void* context) noexcept {
   const auto& planned = *static_cast<Publication*>(context)->planned;
   for (const PlannedSlot& slot : planned) {
     if (slot.out_original == nullptr) continue;
-    // Release store: the replacement reads *out_original with an acquire load
-    // (documented), and the commit's release CAS publishes this write.  Using
-    // an atomic store (not a plain store) keeps it race-free under the C++
-    // model when a replacement on another thread is already reading it.
+    // The release CAS publishes this release store. The replacement's read
+    // protocol is a preceding acquire fence followed by an acquire load, so
+    // its earlier ordinary PLT/GOT load is ordered before reading the original.
+    // Atomic access also prevents a data race with an already-running reader.
     __atomic_store_n(slot.out_original, reinterpret_cast<void*>(slot.original), __ATOMIC_RELEASE);
   }
 }
@@ -271,7 +275,8 @@ void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<Plann
 /// versioned selector, or function selector).
 template <typename PlanFn>
 HookResult install_planned(const ImageView& view, SlotReport* reports, size_t report_cap,
-                           PlanFn&& plan_fn, RecoveryDiagnostic* diagnostic = nullptr) {
+                           PlanFn&& plan_fn, RecoveryDiagnostic* diagnostic = nullptr,
+                           const char* system_path = nullptr) {
   detail::SmallVec<PlannedSlot, 4> planned;
   Error plan = plan_fn(planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
@@ -309,7 +314,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     recs[i].replacement = planned[i].replacement;
     slot_addrs[i] = planned[i].address;
   }
-  uint64_t id = reg.claim(identity_of(view), recs, planned.size());
+  uint64_t id = reg.claim(identity_of(view), recs, planned.size(), system_path);
   if (id == Registry::kInvalidId)
     return {Error::Make(ErrorCode::kAlreadyHooked), detail_api::make(detail_api::invalid())};
 
@@ -491,37 +496,39 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
 /// Legacy name batch.
 HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
                    size_t count, SlotReport* reports, size_t report_cap,
-                   RecoveryDiagnostic* diagnostic = nullptr) {
+                   RecoveryDiagnostic* diagnostic = nullptr, const char* system_path = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
         return plan_requests(img, reqs, count, planned);
       },
-      diagnostic);
+      diagnostic, system_path);
 }
 
 /// Versioned selector batch.
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const SelectedHookRequest* selected, size_t count, SlotReport* reports,
-                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr) {
+                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
+                   const char* system_path = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
         return plan_selected_requests(img, selected, count, planned);
       },
-      diagnostic);
+      diagnostic, system_path);
 }
 
 /// Function selector batch (JUMP_SLOT + function GLOB_DAT).
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const FunctionHookRequest* reqs, size_t count, SlotReport* reports,
-                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr) {
+                   size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
+                   const char* system_path = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
         return plan_function_requests(img, reqs, count, planned);
       },
-      diagnostic);
+      diagnostic, system_path);
 }
 
 }  // namespace
@@ -635,7 +642,8 @@ HookResult hook(const ImageView& image, const char* symbol_name, void* replaceme
 
 namespace {
 HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size_t count,
-                           SlotReport* reports, RecoveryDiagnostic* diagnostic) {
+                           SlotReport* reports, RecoveryDiagnostic* diagnostic,
+                           const char* expected_path = nullptr) {
   auto fail = [](ErrorCode c) {
     return HookResult{Error::Make(c), detail_api::make(detail_api::invalid())};
   };
@@ -645,7 +653,7 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
   Error outputs = validate_outputs(reqs, count);
   if (outputs) return {outputs, detail_api::make(detail_api::invalid())};
 
-  auto apply = [&](const ImageView& live) -> HookResult {
+  auto apply = [&](const ImageView& live, const char* system_path = nullptr) -> HookResult {
     try {
       auto insp = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!insp) return {insp.error(), detail_api::make(detail_api::invalid())};
@@ -653,7 +661,7 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
         detail::note_cause(ErrorCause::kOwnImage);
         return fail(ErrorCode::kInvalidArgument);
       }
-      return install(image, insp.value(), reqs, count, reports, count, diagnostic);
+      return install(live, insp.value(), reqs, count, reports, count, diagnostic, system_path);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
       return HookResult{detail::current_exception_error(), detail_api::make(detail_api::invalid())};
@@ -664,7 +672,10 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
       // Keep inspection and installation inside the linker callback, taking op
       // after linker so unloading cannot invalidate the image during access.
       HookResult result = fail(ErrorCode::kImageInvalidated);
-      run_on_system_image(identity_of(image), [&](const ImageView& live) { result = apply(live); });
+      run_on_system_image(
+          identity_of(image),
+          [&](const ImageView& live, const char* path) { result = apply(live, path); },
+          expected_path);
       return result;
     }
 
@@ -704,14 +715,14 @@ HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
   // Reject unusable outputs before taking any lock or touching the image.
   Error outputs = validate_outputs(reqs, count);
   if (outputs) return fail(outputs);
-  auto apply = [&](const ImageView& live) -> HookResult {
+  auto apply = [&](const ImageView& live, const char* system_path = nullptr) -> HookResult {
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
       if (is_own_image(inspected.value()))
         return fail(
             detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kOwnImage));
-      return install(live, inspected.value(), reqs, count, reports, count, diagnostic);
+      return install(live, inspected.value(), reqs, count, reports, count, diagnostic, system_path);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
       return fail(detail::current_exception_error());
@@ -721,7 +732,9 @@ HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
     if (image.instance_token == 0) {
       auto result = fail(Error::Make(ErrorCode::kImageInvalidated));
       run_on_system_image(
-          identity_of(image), [&](const ImageView& live) { result = apply(live); }, expected_path);
+          identity_of(image),
+          [&](const ImageView& live, const char* path) { result = apply(live, path); },
+          expected_path);
       return result;
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -770,7 +783,7 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
   // Reject unusable outputs before taking any lock or touching the image.
   Error outputs = validate_outputs(reqs, count);
   if (outputs) return fail(outputs);
-  auto apply = [&](const ImageView& live) -> HookResult {
+  auto apply = [&](const ImageView& live, const char* system_path = nullptr) -> HookResult {
     try {
       auto inspected = detail::inspect(live.load_bias, live.phdr_table, live.phdr_count);
       if (!inspected) return fail(inspected.error());
@@ -783,9 +796,10 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
             [&](detail::SmallVec<PlannedSlot, 4>& planned) {
               return plan_function_requests(inspected.value(), reqs, count, planned);
             },
-            diagnostic);
+            diagnostic, system_path);
       } else {
-        return install(live, inspected.value(), reqs, count, reports, count, diagnostic);
+        return install(live, inspected.value(), reqs, count, reports, count, diagnostic,
+                       system_path);
       }
     } catch (...) {
       // Never unwind through the loader's C callback frame.
@@ -798,7 +812,9 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
       // the caller enumerated is no longer the one loaded there.
       auto result = fail(Error::Make(ErrorCode::kImageInvalidated));
       run_on_system_image(
-          identity_of(image), [&](const ImageView& live) { result = apply(live); }, expected_path);
+          identity_of(image),
+          [&](const ImageView& live, const char* path) { result = apply(live, path); },
+          expected_path);
       return result;
     }
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -883,6 +899,9 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
       const Error released = reg.release(id);
       if (released) return released;
       detail_api::set(handle, detail_api::invalid());
+      // The old mapping's residue is no longer retained by this consumed
+      // handle. Do not expose the preflight history as current recovery work.
+      if (diagnostic) *diagnostic = {};
     } else if (begin.code == ErrorCode::kInvalidArgument) {
       detail::note_cause(ErrorCause::kHandleInvalid);
     }
@@ -895,6 +914,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   if (!image_live) {
     reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
     detail_api::set(handle, detail_api::invalid());
+    if (diagnostic) *diagnostic = {};
     return Error::Make(ErrorCode::kImageInvalidated);
   }
 
@@ -1116,6 +1136,7 @@ Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
   try {
     // Learn the image token first (brief op-lock) so we can pick the lock order.
     ImageIdentity image;
+    std::string system_path;
     {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
       Error peek = peek_image(id, image);
@@ -1123,14 +1144,30 @@ Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
         return peek.code == ErrorCode::kInvalidArgument
                    ? detail::with_cause(peek, ErrorCause::kHandleInvalid)
                    : peek;
+      // Path copying can fail before do_restore() gets a chance to mirror the
+      // recovery record. Keep its known residue/errno in this call's diagnostic
+      // without changing the Registry's historical failure. finish_diagnostic
+      // supplies this attempt's final error (for example OutOfMemory).
+      if (diagnostic) {
+        Error recorded = Registry::instance().recovery_snapshot(id, *diagnostic, nullptr, 0);
+        if (recorded) return recorded;
+        diagnostic->stage = OperationStage::kPrepare;
+      }
+      if (image.instance_token == 0 && !image.invalidated) {
+        Error path = Registry::instance().snapshot_path(id, system_path);
+        if (path) return path;
+      }
     }
 
     if (image.instance_token == 0 && !image.invalidated) {
       // System image: restore inside the linker callback (linker -> op order).
       Error result = Error::Make(ErrorCode::kImageInvalidated);
-      bool matched = run_on_system_image(image, [&](const ImageView&) {
-        result = do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic);
-      });
+      bool matched = run_on_system_image(
+          image,
+          [&](const ImageView&) {
+            result = do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic);
+          },
+          system_path.c_str());
       if (!matched) {
         // The image is gone: consume the handle without touching memory.
         std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -1295,6 +1332,156 @@ Result<FunctionImport> find_function_import(const ImageView& image,
         if (!selected) return selected.error();
         return std::move(scan.value().records[selected.value()].entry);
       });
+}
+
+namespace {
+Error validate_named_image(const NamedImage& image) noexcept {
+  if (image.image.instance_token != 0 || image.path.find('\0') != std::string::npos)
+    return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                              ErrorCause::kInvalidRequest);
+  if (image.image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  if (image.image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  return Error::Ok();
+}
+}  // namespace
+
+Result<ImportSnapshot> inspect_imports_named(const NamedImage& image) {
+  if (Error error = validate_named_image(image)) return error;
+  return inspect_metadata<ImportSnapshot>(image.image, detail::snapshot_imports,
+                                          image.path.c_str());
+}
+
+Result<VersionedImportSnapshot> inspect_versioned_imports_named(const NamedImage& image) {
+  if (Error error = validate_named_image(image)) return error;
+  return inspect_metadata<VersionedImportSnapshot>(image.image, detail::snapshot_versioned_imports,
+                                                   image.path.c_str());
+}
+
+Result<VersionedImport> find_import_named(const NamedImage& image, const ImportSelector& selector) {
+  if (Error error = validate_named_image(image)) return error;
+  if (Error error = detail::validate_selector(selector)) return error;
+  return inspect_metadata<VersionedImport>(
+      image.image,
+      [&](const InspectedImage& inspected) -> Result<VersionedImport> {
+        auto snapshot = detail::snapshot_versioned_imports(inspected);
+        if (!snapshot) return snapshot.error();
+        auto selected = detail::select_import(snapshot.value(), selector);
+        if (!selected) return selected.error();
+        return std::move(snapshot.value().imports[selected.value()]);
+      },
+      image.path.c_str());
+}
+
+Result<FunctionImportSnapshot> inspect_function_imports_named(const NamedImage& image,
+                                                              uint32_t sources) {
+  if (Error error = validate_named_image(image)) return error;
+  if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela | kSourceRel |
+                                   kSourceAndroidRel)) != 0)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  if (sources & ~(kSourceJmprel | kSourceNativeDynamic | kSourceNativeAndroidPacked))
+    return Error::Make(ErrorCode::kUnsupportedFormat);
+  return inspect_metadata<FunctionImportSnapshot>(
+      image.image,
+      [&](const InspectedImage& inspected) {
+        return detail::snapshot_function_imports(inspected, sources);
+      },
+      image.path.c_str());
+}
+
+Result<FunctionImport> find_function_import_named(const NamedImage& image,
+                                                  const FunctionImportSelector& selector) {
+  if (Error error = validate_named_image(image)) return error;
+  if (Error error = detail::validate_function_selector(selector)) return error;
+  return inspect_metadata<FunctionImport>(
+      image.image,
+      [&](const InspectedImage& inspected) -> Result<FunctionImport> {
+        auto scan = detail::scan_function_imports(inspected, selector.sources);
+        if (!scan) return scan.error();
+        auto selected = detail::select_function_reloc(scan.value(), selector);
+        if (!selected) return selected.error();
+        return std::move(scan.value().records[selected.value()].entry);
+      },
+      image.path.c_str());
+}
+
+HookResult hook_named(const NamedImage& image, const char* symbol_name, void* replacement,
+                      void** out_original, SlotReport* report) {
+  const HookRequest request{symbol_name, replacement, out_original};
+  return hook_batch_named(image, &request, 1, report);
+}
+
+HookResult hook_batch_named(const NamedImage& image, const HookRequest* reqs, size_t count,
+                            SlotReport* reports) {
+  if (Error error = validate_named_image(image)) return {error, HookHandle{}};
+  return hook_batch_impl(image.image, reqs, count, reports, nullptr, image.path.c_str());
+}
+
+HookResult hook_import_named(const NamedImage& image, const ImportSelector& selector,
+                             void* replacement, void** out_original, SlotReport* report) {
+  const SelectedHookRequest request{selector, replacement, out_original};
+  return hook_imports_named(image, &request, 1, report);
+}
+
+HookResult hook_imports_named(const NamedImage& image, const SelectedHookRequest* reqs,
+                              size_t count, SlotReport* reports) {
+  if (Error error = validate_named_image(image)) return {error, HookHandle{}};
+  return hook_imports_impl(image.image, image.path.c_str(), reqs, count, reports, nullptr);
+}
+
+HookResult hook_function_import_named(const NamedImage& image,
+                                      const FunctionImportSelector& selector, void* replacement,
+                                      void** out_original, SlotReport* report) {
+  const FunctionHookRequest request{selector, replacement, out_original};
+  return hook_function_imports_named(image, &request, 1, report);
+}
+
+HookResult hook_function_imports_named(const NamedImage& image, const FunctionHookRequest* reqs,
+                                       size_t count, SlotReport* reports) {
+  if (Error error = validate_named_image(image)) return {error, HookHandle{}};
+  return hook_functions_impl(image.image, image.path.c_str(), reqs, count, reports);
+}
+
+HookResult hook_function_imports_ex_named(const NamedImage& image,
+                                          const FunctionHookRequestEx* reqs, size_t count,
+                                          SlotReport* reports, RecoveryDiagnostic* diagnostic) {
+  RecoveryDiagnostic value;
+  value.stage = OperationStage::kPrepare;
+  const Error invalid = validate_named_image(image);
+  auto result =
+      invalid ? HookResult{invalid, HookHandle{}}
+              : hook_functions_impl(image.image, image.path.c_str(), reqs, count, reports, &value);
+  value.error = result.error;
+  value.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
+  if (diagnostic) *diagnostic = value;
+  return result;
+}
+
+HookResult hook_batch_diagnosed_named(const NamedImage& image, const HookRequest* reqs,
+                                      size_t count, SlotReport* reports,
+                                      OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    if (Error error = validate_named_image(image)) return HookResult{error, HookHandle{}};
+    return hook_batch_impl(image.image, reqs, count, reports, recorded, image.path.c_str());
+  });
+}
+
+HookResult hook_imports_diagnosed_named(const NamedImage& image, const SelectedHookRequest* reqs,
+                                        size_t count, SlotReport* reports,
+                                        OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    if (Error error = validate_named_image(image)) return HookResult{error, HookHandle{}};
+    return hook_imports_impl(image.image, image.path.c_str(), reqs, count, reports, recorded);
+  });
+}
+
+HookResult hook_function_imports_diagnosed_named(const NamedImage& image,
+                                                 const FunctionHookRequestEx* reqs, size_t count,
+                                                 SlotReport* reports,
+                                                 OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded) {
+    if (Error error = validate_named_image(image)) return HookResult{error, HookHandle{}};
+    return hook_functions_impl(image.image, image.path.c_str(), reqs, count, reports, recorded);
+  });
 }
 
 Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageView& image,
@@ -1554,12 +1741,19 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
     // cannot unmap them mid-read; an image no longer loaded reports only the
     // recorded values.
     ImageIdentity image;
+    std::string system_path;
     SlotRecord recs[kMaxBatch];
     size_t n = 0;
     {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
       Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
       if (snap) return snap;
+      // Count-only and recorded recovery queries do not need a path copy or
+      // a linker lookup. A live query owns its path across the lock handoff.
+      if (out != nullptr && cap != 0 && image.instance_token == 0 && !image.invalidated) {
+        Error path = Registry::instance().snapshot_path(id, system_path);
+        if (path) return path;
+      }
     }
     if (n > kMaxBatch) n = kMaxBatch;
 
@@ -1567,14 +1761,17 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
       // Count-only: no live read, so no image access or transaction pages.
     } else if (image.instance_token == 0 && !image.invalidated) {
       Error result = Error::Ok();
-      bool matched = run_on_system_image(image, [&](const ImageView&) {
-        // Re-snapshot under the op lock: the group may have changed or been
-        // released between the two lock acquisitions.
-        result = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
-        if (result) return;
-        if (n > kMaxBatch) n = kMaxBatch;
-        fill_query(recs, n, /*live_image=*/true, out, cap);
-      });
+      bool matched = run_on_system_image(
+          image,
+          [&](const ImageView&) {
+            // Re-snapshot under the op lock: the group may have changed or been
+            // released between the two lock acquisitions.
+            result = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
+            if (result) return;
+            if (n > kMaxBatch) n = kMaxBatch;
+            fill_query(recs, n, /*live_image=*/true, out, cap);
+          },
+          system_path.c_str());
       if (!matched) fill_query(recs, n, /*live_image=*/false, out, cap);
       if (result) return result;
     } else {
@@ -1703,3 +1900,16 @@ ErrorCause resolve_cause(const Error& error, ErrorCause noted) noexcept {
 }
 
 }  // namespace yukiplt::detail
+
+namespace yukiplt {
+void* load_original(void* const* storage) noexcept {
+  // The plain PLT/GOT read is before this fence. A load-acquire by itself
+  // orders only subsequent accesses, so it cannot replace this read fence.
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  return __atomic_load_n(storage, __ATOMIC_ACQUIRE);
+}
+}  // namespace yukiplt
+
+extern "C" YUKIPLT_API void* yukiplt_c_load_original(void* const* storage) noexcept {
+  return yukiplt::load_original(storage);
+}

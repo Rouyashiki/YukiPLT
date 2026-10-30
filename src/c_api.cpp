@@ -12,12 +12,42 @@
 #include <stdexcept>
 
 #include "common.hpp"
+#include "memory.hpp"
 #include "registry.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
 
 namespace {
 using namespace yukiplt;
+static_assert(static_cast<uint32_t>(VersionMatch::kAny) == YUKIPLT_C_VERSION_ANY);
+static_assert(static_cast<uint32_t>(VersionMatch::kUnversioned) == YUKIPLT_C_VERSION_UNVERSIONED);
+static_assert(static_cast<uint32_t>(VersionMatch::kExact) == YUKIPLT_C_VERSION_EXACT);
+static_assert(static_cast<uint32_t>(HiddenMatch::kAny) == YUKIPLT_C_HIDDEN_ANY);
+static_assert(static_cast<uint32_t>(HiddenMatch::kNonHidden) == YUKIPLT_C_NON_HIDDEN);
+static_assert(static_cast<uint32_t>(HiddenMatch::kHidden) == YUKIPLT_C_HIDDEN);
+static_assert(static_cast<uint32_t>(SlotStatus::kUntouched) == YUKIPLT_C_UNTOUCHED);
+static_assert(static_cast<uint32_t>(SlotStatus::kInstalled) == YUKIPLT_C_INSTALLED);
+static_assert(static_cast<uint32_t>(SlotStatus::kRestored) == YUKIPLT_C_RESTORED);
+static_assert(static_cast<uint32_t>(SlotStatus::kConflict) == YUKIPLT_C_CONFLICT);
+static_assert(static_cast<uint32_t>(SlotStatus::kRolledBack) == YUKIPLT_C_ROLLED_BACK);
+static_assert(static_cast<uint32_t>(SlotStatus::kRollbackFailed) == YUKIPLT_C_ROLLBACK_FAILED);
+static_assert(static_cast<uint32_t>(OperationStage::kNone) == YUKIPLT_C_STAGE_NONE);
+static_assert(static_cast<uint32_t>(OperationStage::kPrepare) == YUKIPLT_C_STAGE_PREPARE);
+static_assert(static_cast<uint32_t>(OperationStage::kExpectedCurrent) ==
+              YUKIPLT_C_STAGE_EXPECTED_CURRENT);
+static_assert(static_cast<uint32_t>(OperationStage::kRaise) == YUKIPLT_C_STAGE_RAISE);
+static_assert(static_cast<uint32_t>(OperationStage::kCommit) == YUKIPLT_C_STAGE_COMMIT);
+static_assert(static_cast<uint32_t>(OperationStage::kRollback) == YUKIPLT_C_STAGE_ROLLBACK);
+static_assert(static_cast<uint32_t>(OperationStage::kRestorePages) ==
+              YUKIPLT_C_STAGE_RESTORE_PAGES);
+static_assert(static_cast<uint32_t>(OperationStage::kComplete) == YUKIPLT_C_STAGE_COMPLETE);
+static_assert(static_cast<uint32_t>(RelocationSource::kJmprel) == YUKIPLT_C_RELOC_SOURCE_JMPREL);
+static_assert(static_cast<uint32_t>(RelocationSource::kRela) == YUKIPLT_C_RELOC_SOURCE_RELA);
+static_assert(static_cast<uint32_t>(RelocationSource::kAndroidRela) ==
+              YUKIPLT_C_RELOC_SOURCE_ANDROID_RELA);
+static_assert(static_cast<uint32_t>(RelocationSource::kRel) == YUKIPLT_C_RELOC_SOURCE_REL);
+static_assert(static_cast<uint32_t>(RelocationSource::kAndroidRel) ==
+              YUKIPLT_C_RELOC_SOURCE_ANDROID_REL);
 constexpr size_t kLimit = 64;
 // Every public C++ enum value that crosses the C boundary is pinned to its C
 // literal, so renumbering either side fails to compile.
@@ -331,6 +361,16 @@ yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
     return forget_image(view(*image));
   });
 }
+yukiplt_c_error yukiplt_c_trim_idle_storage(void) noexcept {
+  static_assert(YUKIPLT_C_FEATURE_IDLE_STORAGE == 16);
+  try {
+    std::lock_guard<std::mutex> lock(detail::op_mutex());
+    return converted(detail::Registry::instance().trim_idle_storage());
+  } catch (...) {
+    return converted(detail::current_exception_error());
+  }
+}
+
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
   return feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||
          feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS ||
@@ -344,6 +384,7 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS ||
          feature_id == YUKIPLT_C_FEATURE_PLANS || feature_id == YUKIPLT_C_FEATURE_SESSIONS ||
          feature_id == YUKIPLT_C_FEATURE_RULES || feature_id == YUKIPLT_C_FEATURE_CANDIDATES ||
+         feature_id == YUKIPLT_C_FEATURE_IDLE_STORAGE ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,

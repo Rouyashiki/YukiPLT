@@ -141,6 +141,10 @@ class Registry {
   bool owns_live_replacement(uint64_t id) const;
   uintptr_t first_slot_of(uint64_t id) const;
   size_t live_count() const;
+  // Release only idle backing storage. Keep the salt and generation high-water
+  // mark so a reclaimed index never resurrects an old token. Caller holds op.
+  Error trim_idle_storage() noexcept;
+  bool ids_exhausted() const noexcept { return ids_exhausted_; }
   bool owns_slot(uintptr_t address) const noexcept { return slot_is_live(address); }
   void record_diagnostic(uint64_t id, const RecoveryDiagnostic& diagnostic) noexcept;
   Error recovery_snapshot(uint64_t id, RecoveryDiagnostic& diagnostic, ResidualPage* pages,
@@ -173,6 +177,7 @@ class Registry {
   Record* resolve(uint64_t id) noexcept;
   const Record* resolve(uint64_t id) const noexcept;
   bool slot_is_live(uintptr_t addr) const noexcept;
+  void advance_generation(Record& record) noexcept;
 
   // Open-addressed live-slot index. Grow before claim; backward-shift deletion
   // releases slots without allocating.
@@ -193,6 +198,8 @@ class Registry {
   size_t index_used_ = 0;
   uint64_t salt_ = 0;
   bool salt_ready_ = false;
+  uint32_t generation_floor_ = 0;
+  bool ids_exhausted_ = false;
   int salt_errno_ = 0;
 };
 

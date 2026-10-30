@@ -59,8 +59,12 @@ target. Do not also link a second copy of the archive into that host.
 
 Static hosts must localize implementation and archive symbols at final link
 and keep the owning code alive through recovery and quiescence. Before unloading,
-release all C/C++ library objects and drain library operations, callbacks and
-replacement calls, including future calls through cached pointers. The core
+release all C/C++ library objects, call `yukiplt_c_trim_idle_storage()` to release
+idle Registry backing allocations, and drain library operations, callbacks and
+replacement calls, including future calls through cached pointers. Trim refuses
+unconsumed recovery handles and does not prove unload safety. Compiler/runtime
+TLS reclamation is a separate toolchain boundary; end threads that used an
+unloadable static runtime before unloading its host. The core
 rejects hooks into the entire image that contains its implementation, including
 an embedding host. Shared-library hardening flags are not propagated to hosts.
 

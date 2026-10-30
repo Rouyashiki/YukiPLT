@@ -208,7 +208,7 @@ void Registry::index_reserve(size_t extra) {
 
 uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, size_t count,
                          const char* system_path) {
-  if (slots == nullptr || count == 0 || !salt_ready_) return kInvalidId;
+  if (slots == nullptr || count == 0 || !salt_ready_ || ids_exhausted_) return kInvalidId;
 
   // No slot may already be owned by a live group (one slot, one owner).  The
   // liveness test and the insert happen under one lock, closing the
@@ -228,7 +228,9 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
     // adding the record, so either allocation can fail without losing it.
     free_list_.reserve(records_.size() + 1);
     const auto index = static_cast<uint32_t>(records_.size());
-    records_.push_back(Record{});
+    Record record;
+    record.generation = generation_floor_;
+    records_.push_back(std::move(record));
     free_list_.push_back(index);
   }
 
@@ -256,6 +258,26 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
   free_list_.pop_back();
   for (size_t i = 0; i < count; ++i) index_insert(slots[i].address, index);
   return make_id(r.generation, index);
+}
+
+void Registry::advance_generation(Record& record) noexcept {
+  if (record.generation == UINT32_MAX) {
+    ids_exhausted_ = true;
+  } else {
+    ++record.generation;
+  }
+}
+
+Error Registry::trim_idle_storage() noexcept {
+  for (const auto& record : records_)
+    if (record.in_use) return Error::Make(ErrorCode::kInvalidArgument);
+  for (const auto& record : records_)
+    if (record.generation > generation_floor_) generation_floor_ = record.generation;
+  records_ = {};
+  free_list_ = {};
+  index_ = {};
+  index_used_ = 0;
+  return Error::Ok();
 }
 
 void Registry::mark_installed(uint64_t id) {
@@ -311,7 +333,7 @@ void Registry::finish_restore(uint64_t id, bool released, GroupState not_release
     const auto index = index_of(id);
     if (!r->image.invalidated) index_erase_record(*r, index);
     r->in_use = false;
-    ++r->generation;
+    advance_generation(*r);
     r->slots.clear();
     r->residue.clear();
     r->system_path.clear();
@@ -335,7 +357,7 @@ Error Registry::release(uint64_t id) {
   const auto index = index_of(id);
   if (!r->image.invalidated) index_erase_record(*r, index);
   r->in_use = false;
-  ++r->generation;
+  advance_generation(*r);
   r->slots.clear();
   r->residue.clear();
   r->system_path.clear();

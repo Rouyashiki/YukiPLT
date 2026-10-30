@@ -206,7 +206,8 @@ enum {
   YUKIPLT_C_FEATURE_PLANS = 12,
   YUKIPLT_C_FEATURE_SESSIONS = 13,
   YUKIPLT_C_FEATURE_RULES = 14,
-  YUKIPLT_C_FEATURE_CANDIDATES = 15
+  YUKIPLT_C_FEATURE_CANDIDATES = 15,
+  YUKIPLT_C_FEATURE_IDLE_STORAGE = 16
 };
 
 enum {
@@ -479,6 +480,15 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_ex_named(
 YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
     const yukiplt_c_named_image*, const yukiplt_c_function_request_ex*, size_t count,
     yukiplt_c_handle*, yukiplt_c_slot_report*, yukiplt_c_operation_diagnostic*) YUKIPLT_C_NOEXCEPT;
+
+// Release this copy's idle Registry allocations without touching GOT, page
+// permissions, original storage or advanced objects. INVALID_ARGUMENT preserves
+// storage if any hook/recovery record remains, including invalidated handles
+// not yet consumed. Success permits later reuse; stale tokens stay invalid.
+// This does NOT establish quiescence, restore abandoned hooks, destroy caller
+// objects or reclaim compiler/runtime TLS. Before unloading a static host,
+// separately restore all hooks, destroy all C/C++ objects and drain all calls.
+YUKIPLT_API yukiplt_c_error yukiplt_c_trim_idle_storage(void) YUKIPLT_C_NOEXCEPT;
 
 // Owned objects belong to the issuing library copy. Tokens are unique owners,
 // not pointers and not yukiplt_c_handle values. Do not copy tokens into owners.

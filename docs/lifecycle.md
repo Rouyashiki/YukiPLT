@@ -78,3 +78,23 @@ probability and are not a security boundary.
 Keep the core's owning load group alive through recovery. In bionic, a NODELETE
 dependency first loaded by an unloadable host DSO is not an independent lifetime
 guarantee. Unhook before unloading that host and establish quiescence separately.
+
+## Reclaim idle core storage
+
+After consuming every hook/recovery handle, call `yukiplt_c_trim_idle_storage()`
+(feature `YUKIPLT_C_FEATURE_IDLE_STORAGE`) to release cached Registry storage,
+including capacity retained after an allocation failure. C++ hosts may call the
+same C entry point. The operation is serialized with installation/restoration;
+any outstanding record, including an invalidated handle not yet consumed,
+returns `InvalidArgument` without changing storage. Later installation remains
+supported, and old tokens never become valid again. Generation exhaustion
+refuses further installs with `IntegerOverflow` while allowing recovery.
+
+Trim does not destroy snapshots, plans, sessions or rule sets; does not touch
+original storage or abandoned memory effects; and does not establish quiescence.
+Keep its code resident until all objects are destroyed and all API, callback and
+replacement calls (including cached pointers) are excluded. API23 toolchains can
+use emulated TLS even for trivial thread-local diagnostic values. Core storage
+reclamation cannot reclaim private compiler/runtime TLS blocks: for an unloadable
+static-runtime host, end its participating threads before host unload. A host
+that cannot satisfy its runtime lifetime requirements must remain resident.

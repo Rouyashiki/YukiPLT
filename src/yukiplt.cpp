@@ -295,6 +295,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
       if (output == target.address) return {alias, HookHandle{}};
   }
 
+  if (reg.ids_exhausted()) return {Error::Make(ErrorCode::kIntegerOverflow), HookHandle{}};
   const size_t ps = detail::page_size();
   if (ps == 0)
     return {detail::with_cause(Error::Make(ErrorCode::kUnsupportedFormat), ErrorCause::kPlatform),

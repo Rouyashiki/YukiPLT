@@ -691,171 +691,22 @@ namespace yukiplt {
 // null; a non-null value proves neither installation, provider identity nor quiescence.
 YUKIPLT_API void* load_original(void* const* storage) noexcept;
 
-/// \brief YukiPLT public API — PLT/GOT hooking for native Android ELF.
-///
-/// ## Quick start
-///
-///     void* original = nullptr;
-///     auto r = yukiplt::hook(image, "target_func", (void*)replacement, &original);
-///     if (r.ok()) {
-///         // Hook is active.  Calls through the image's PLT now go to
-///         // replacement. Read `original` with load_original() (see below)
-///         // and cast it to the function type to call the original.
-///     } else if (r.handle.valid()) {
-///         // kIndeterminate: not cleanly installed; recover with
-///         // unhook()/abandon().
-///     }
-///     // Later:
-///     const auto undo = yukiplt::unhook(r.handle);
-///     if (!undo.ok()) { /* retain r.handle and retry before releasing context */ }
-///
-/// ## Semantics
-///
-/// - Android API23+: ARM64/ARM32 guaranteed; x86_64/x86 environment-dependent.
-///   Each binary handles only its process's native ABI; other ISAs are rejected.
-///   Android API 21 and 22 are not supported.
-///
-/// - PLT hooks only intercept calls that go through the target image's GOT.
-///   Direct calls within the defining library, dlsym-obtained pointers,
-///   and GLOB_DAT-obtained function pointers are NOT intercepted.
-///
-/// - "Original function address" means the value found in the GOT slot at
-///   hook time.  It may be another hook's replacement, not the real function.
-///   A replacement that calls through it must read `*out_original` with
-///   load_original(), or an acquire fence followed by an acquire load: the
-///   install release-publishes the pointer, but the PLT load/branch that reaches
-///   the replacement is not itself an acquire. An acquire load alone does not
-///   order that preceding GOT load on ARM.
-///
-/// - If a symbol name matches more than one distinct GOT slot (e.g. the same
-///   name imported under several symbol versions),  do not choose: the
-///   call returns kAmbiguousSymbol and modifies nothing.  Multiple relocation
-///   records naming one slot mean a malformed image (kCorruptedElf).
-///
-/// - One slot, one owner.  A second hook of a slot this library already owns
-///   returns kAlreadyHooked.  There is no hook stacking, no reference counting.
-///
-/// - Ownership is per copy of YukiPLT.  Each copy loaded in a process (for
-///   example two DSOs that each link or bundle it) has its own registry and
-///   operation lock and is a third party to every other copy.  Another copy can
-///   install over this copy's replacement, taking it as the "original", and
-///   CAS cannot coordinate two copies' page-protection changes on a shared
-///   page.  Callers must not let two copies hook the same slot and must
-///   serialize their operations on shared pages.  Handles are only valid with
-///   the copy that issued them; each copy salts its handle ids from the system
-///   random source, so a foreign handle is rejected with high probability
-///   (kInvalidArgument), which is misuse detection, not a security boundary.
-///   If the random source is unavailable, installation fails with
-///   kUnsupportedFormat and its errno, and no predictable salt is used.
-///
-/// - Imports must already be eagerly bound before installation. For custom
-///   loaders, finish relocation before exposing the image. A lazy resolver
-///   could overwrite the hook or be mistaken for an original function. NOW
-///   flags are not used as proof: Android's loader binds PLT relocations eagerly.
-///
-/// ## Threading contract (applies to the C++ and C interfaces alike)
-///
-/// - Every free function may be called concurrently from any thread.  Image
-///   operations serialize on one operation lock per copy of the library;
-///   system images additionally run under the dynamic linker's lock (lock
-///   order linker -> operation, never the reverse).
-/// - One HookHandle (or C handle token) must not be used by two threads at
-///   once; hand it between threads with external synchronization.
-/// - HookSession, FunctionHookSession and RuleSet objects are not thread-safe:
-///   the caller serializes every operation on one object and every read of its
-///   results.  Distinct objects may be used concurrently.
-/// - No user callback runs while either lock is held.
-/// - Installed replacements may run on any thread. Read their stable
-///   out_original objects with load_original()/yukiplt_c_load_original(), or an
-///   acquire fence followed by an acquire load. An acquire load alone does not
-///   order the preceding PLT/GOT load on ARM.
-/// - Entrypoints are not async-signal-safe: do not call them from a signal
-///   handler. Cancellation through a library operation and longjmp across its
-///   stack frames are unsupported. In a child of a multithreaded fork, do not
-///   call the library before exec. Do not fork from a library operation or its
-///   callback; a single-threaded parent must also have no operation in flight.
-///
-/// - Installing into the image containing this copy of YukiPLT is rejected
-///   with kInvalidArgument before ownership or original-pointer publication.
-///   When YukiPLT is linked statically, the image it is linked into (for
-///   example the main executable) is that image: every installation there
-///   fails, while inspection still works.  To hook such an image, load
-///   YukiPLT as a separate shared library.
-///   Do not arrange synchronous API reentry through functions the library may
-///   call while holding its linker/operation locks (including interposition,
-///   allocator hooks and destructors). A replacement reached outside those
-///   operations may call the API subject to the threading contract above.
-///
-/// - Only private, readable, non-executable mappings are written.  A shared,
-///   executable or unreadable slot page fails with kPermissionDenied (cause
-///   kVmaPolicy).  In particular, a fully-RELRO 4K library loaded in a 16K
-///   device's page-size compatibility mode has its GOT mapped r-x by the linker
-///   and cannot be hooked.
-///
-/// ## Batches and atomicity
-///
-/// - hook() installs one slot; hook_batch() installs several as one unit over
-///   a single image, rolling back on any conflict so the batch leaves either
-///   every slot installed or none.  A batch never spans two images.
-///
-/// - No cross-slot atomicity is promised: another thread may briefly see some
-///   slots switched and others not.  The guarantee is on commit and failure
-///   recovery, not a simultaneous switch.
-///
-/// ## Lifecycle
-///
-/// - The caller must keep the target image mapped until every handle for it is
-///   released or abandoned.  For a system-linker image, every call validates
-///   the image under the dynamic linker's lock (dl_iterate_phdr) and never
-///   dereferences a stale pointer. A structurally valid view with no matching
-///   loaded identity returns kImageInvalidated (kImageNotFound is for name lookup that
-///   finds nothing).  For a custom (e.g. YukiLinker) image, set instance_token
-///   to a value unique to that load and call forget_image() before unmapping.
-///   A missing page in /proc/self/maps never invalidates a custom image by
-///   itself: the maps file is not an atomic snapshot.
-///
-/// - Same-address reload is an ABA hazard: after dlclose + dlopen at the same
-///   address, CAS cannot by itself prove the slot is still the same instance.
-///   The caller's lifecycle contract above is what closes that gap; this
-///   library does not claim to eliminate the unload race.
-///   A bare ImageView has no discovery-time path: a different image reusing its
-///   bias/PHDR/count before installation cannot be distinguished. Use the
-///   *_named entry points to additionally bind the exact discovery path. Every
-///   system-image installation records its live path for later unhook/query;
-///   even that path cannot distinguish a same-path, same-address reload.
-///
-/// - Unhook can fail and must be called explicitly; HookHandle's destructor
-///   does NOT unhook.  Destroying or move-overwriting a handle that still owns
-///   an installed hook logs a warning and leaves the hook in place.
-///
-/// - After a successful unhook a thread may still be executing the
-///   replacement.  Do not unload the replacement's code until the caller has
-///   established quiescence.
-///
-/// ## Original-pointer outputs
-///
-/// - Every non-null out_original must be aligned for void* and distinct within
-///   one call; otherwise the call returns kInvalidArgument before taking any
-///   lock or writing anything.
-///   Outputs must be caller-owned writable storage, separate from GOT slots.
-///   Aliasing this transaction's targets or another live Registry owner's Slot
-///   is rejected under the operation lock before any claim/publication. Plans
-///   also reject outputs aliasing a target in a different image group.
-///
-/// - The library release-publishes each prior slot value to its out_original
-///   after validation and page raises, before the first slot CAS. Replacements
-///   reached through that committed slot must use the original-read protocol
-///   above. Separately cached replacement pointers require caller-provided
-///   publication and lifetime synchronization.
-///   A failure after that point (a CAS conflict that rolled back) may therefore
-///   leave a candidate original in *out_original.  That value does not mean the
-///   hook is installed and is never cleared.
-///
-/// Failure never returns "success".  A clean failure modifies nothing: no net
-/// GOT change, every page protection restored and no Registry ownership left.
-/// This guarantee covers neither out_original (see above) nor the transient
-/// protection change made during the attempt.  See kIndeterminate for the one
-/// state where recovery is partial.
+// Android API23+ PLT/GOT hooks. Bind imports first; keep images, original
+// outputs and replacement code/context alive through recovery and quiescence.
+// Read originals with load_original or OriginalSlot::load; never clear or reuse them.
+// Select one slot explicitly; duplicate records are corrupt. Hooks affect future
+// slot reads only. Indeterminate retains a recovery handle; no cross-slot atomicity
+// or ABA protection is promised. Serialize external page changes and remapping.
+// System images use linker -> op locking; custom loads require unique nonzero
+// tokens and forget_image. Named APIs also bind the path; callers handle reload ABA.
+// Serialize each handle/session/RuleSet and its result reads. Synchronous reentry
+// from functions called under internal locks is forbidden; lock-free host callbacks
+// may reenter. No signals, cancellation/longjmp across API frames, or calls after
+// multithreaded fork before exec. Never fork during an operation or callback.
+// Destructors do not unhook. Each copy owns separate locks/handles; coordinate
+// shared pages across copies. Self-image installs are rejected. Salted ids detect
+// misuse, not attacks; entropy failure rejects installation.
+// See docs/integration.md and docs/lifecycle.md.
 
 struct NamedImage;
 struct RecoveryDiagnostic;
@@ -1793,6 +1644,9 @@ class RuleSet {
 
   /// Remove a rule: undo all its bindings (reverse order), keep failures, and
   /// stop it participating in future refreshes.
+  /// A third-party slot value does not release this library's ownership. Retry
+  /// release_image()/unhook() after resolving the conflict, or explicitly
+  /// abandon() the whole RuleSet; there is no single-binding abandon operation.
   YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id);
 
   /// Undo all of this RuleSet's hooks (reverse order), keeping failures.  The

@@ -20,6 +20,7 @@ if(CMAKE_CROSSCOMPILING)
         LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/yukiplt.map")
     target_link_options(yukiplt PRIVATE
         "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/yukiplt.map" -Wl,--exclude-libs,ALL)
+    target_link_options(yukiplt PRIVATE -Wl,-Bsymbolic-functions)
     install(TARGETS yukiplt LIBRARY DESTINATION lib COMPONENT production)
     install(FILES "${PROJECT_SOURCE_DIR}/include/yukiplt.h"
     "${PROJECT_SOURCE_DIR}/include/yukiplt.hpp"
@@ -36,3 +37,6 @@ target_include_directories(yukiplt PUBLIC "${PROJECT_SOURCE_DIR}/include"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_options(yukiplt PRIVATE ${YUKIPLT_COMPILE_OPTIONS})
 set_target_properties(yukiplt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+install(DIRECTORY "${PROJECT_SOURCE_DIR}/docs/" DESTINATION share/doc/YukiPLT
+    COMPONENT production FILES_MATCHING PATTERN "*.md")

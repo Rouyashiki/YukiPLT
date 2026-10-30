@@ -41,4 +41,12 @@ static_assert(alignof(yukiplt::FunctionHookPlan) == alignof(void*));
 static_assert(alignof(yukiplt::HookSession) == alignof(void*));
 static_assert(alignof(yukiplt::FunctionHookSession) == alignof(void*));
 #endif
+#if defined(__ANDROID__) && defined(_LIBCPP_VERSION)
+static_assert(sizeof(yukiplt::RuleSet) == (sizeof(void*) == 8 ? 120 : 64));
+static_assert(alignof(yukiplt::RuleSet) == alignof(uint64_t));
+static_assert(sizeof(yukiplt::VersionedImport) == (sizeof(void*) == 8 ? 104 : 56));
+static_assert(sizeof(yukiplt::PlannedTarget) == (sizeof(void*) == 8       ? 152
+                                                 : alignof(uint64_t) == 8 ? 88
+                                                                          : 84));
+#endif
 #endif

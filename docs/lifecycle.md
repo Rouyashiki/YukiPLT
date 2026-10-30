@@ -1,0 +1,80 @@
+# Lifetime and recovery
+
+Keep the image, replacement code/context and original-output storage alive
+until restoration finishes. Then establish quiescence before freeing code,
+context or original-output storage: successful unhook does not wait for calls already executing or prevent
+future calls through cached function pointers. Hook handles and sessions do
+not implicitly perform fallible restoration in their destructors.
+
+## Recover an incomplete operation
+
+`Indeterminate` means rollback or page restoration could not be confirmed.
+Retain the handle and inspect its recovery diagnostic, slot states and residual
+pages. These records describe the last operation, not current memory mappings.
+Resolve the underlying mapping, permission or ownership conflict, then retry
+unhook. Retry reads current maps and restores only values/protections still
+owned by the operation. A third party's slot value is never overwritten.
+
+Successful unhook and confirmed `ImageInvalidated` consume the handle.
+Preflight conflicts, maps errors, permission failures, allocation failures and
+`Indeterminate` retain it. `abandon()` relinquishes bookkeeping without restoring
+memory; it does not make replacement code safe to unload.
+
+## System and custom images
+
+System-image work validates identity inside `dl_iterate_phdr`. Named entry
+points also require the exact saved path; all successful system installations
+record the live path for subsequent restoration and live queries. A bare
+`ImageView` cannot distinguish a different occupant already present before
+installation. Even a named view cannot detect same-path, same-address reload.
+Coordinate unhook and unload yourself.
+
+For a custom image, assign a unique nonzero `instance_token` for every load and
+keep mappings and metadata stable. Call `notify_loaded()` after relocation and
+final page protections, and `notify_unloading()` before unmapping. Notifications
+are synchronous and accept only custom images. Do not hold a loader lock or
+call them from `dl_iterate_phdr`. If restoration fails, keep the image and
+handles alive; resolve the failure and retry. `forget_image()` explicitly marks
+an instance invalid and never substitutes for restoration of a live mapping.
+
+## Rule sets
+
+Register rules with caller-owned original storage. Call `refresh()` explicitly;
+there is no background loading tracker. Enumeration and report preparation
+finish before installation. Preparation failure installs nothing; later image
+operations may partly succeed. Operation `retained` counts only this call's
+enumerated targets. Use `statistics()` for all outstanding bindings.
+
+Clean installation failure retries in place using the same original slot.
+Released or invalidated bindings become new bindings on a later refresh or
+load notification, consuming new original slots. Abandoned bindings do not
+reapply. Use `remove_rule()` to stop a rule permanently, and still check any
+restoration failure. Capacity exhaustion remains terminal; register a new rule
+with larger storage to recover.
+
+`prune_history()` removes released/invalidated records without live handles.
+It keeps failed and abandoned records, never recycles original slots and does
+not reset capacity. Copy needed reports first: successful pruning invalidates
+binding references and indices. Allocation failure preserves the object.
+
+## Thread and loader coordination
+
+Free functions support concurrent calls. Serialize operations and result reads
+on each handle, session or RuleSet. The lock order is linker then operation;
+host callbacks run outside both. Avoid synchronous reentry through hooks on
+allocators or other functions used inside YukiPLT operations. Calls from signal
+handlers, cancellation/longjmp across library frames and calls in the child of
+a multithreaded fork before exec are unsupported.
+
+Serialize other writers of page permissions against YukiPLT. An operation
+reads maps once and cannot atomically exclude external `mprotect` or remapping.
+CAS does not prove ownership history or prevent address/value ABA.
+
+Each loaded copy owns a separate registry and operation lock. Do not let copies
+hook the same slot; serialize their work on shared pages. Obtain entry points
+from the intended library handle. Salted handle IDs detect misuse with high
+probability and are not a security boundary.
+
+Keep the core's owning load group alive through recovery. In bionic, a NODELETE
+dependency first loaded by an unloadable host DSO is not an independent lifetime
+guarantee. Unhook before unloading that host and establish quiescence separately.

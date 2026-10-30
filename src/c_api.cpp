@@ -343,6 +343,7 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_OWNED_IMAGES ||
          feature_id == YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS ||
          feature_id == YUKIPLT_C_FEATURE_PLANS || feature_id == YUKIPLT_C_FEATURE_SESSIONS ||
+         feature_id == YUKIPLT_C_FEATURE_RULES || feature_id == YUKIPLT_C_FEATURE_CANDIDATES ||
          (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,

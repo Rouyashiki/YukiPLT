@@ -13,7 +13,7 @@
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail::c_objects {
-enum class Kind { kImages, kImports, kPlan, kSession };
+enum class Kind { kImages, kImports, kPlan, kSession, kRules, kRuleReport, kBindings, kCandidates };
 struct Object {
   explicit Object(Kind value) noexcept : kind(value) {}
   virtual ~Object() = default;

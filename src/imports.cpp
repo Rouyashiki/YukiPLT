@@ -1064,8 +1064,9 @@ Result<OwnedPattern> copy_pattern(const CandidatePattern& pattern, detail::ScanB
 }
 }  // namespace
 
-Result<std::vector<FunctionCandidate>> expand_function_candidates(
-    const NamedImage* images, size_t count, const CandidateSelection& selection) {
+static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* images, size_t count,
+                                                          const CandidateSelection& selection,
+                                                          detail::ScanBudget& budget) {
   if ((!images && count != 0) || (!selection.exclude && selection.exclude_count != 0))
     return Error::Make(ErrorCode::kNullPointer);
   const FunctionImportSelector validation{{"candidate"}, selection.sources, selection.types};
@@ -1078,7 +1079,6 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
   void* const context = selection.context;
   const uint32_t sources = selection.sources, types = selection.types;
   try {
-    detail::ScanBudget budget;
     auto include = copy_pattern(selection.include, budget);
     if (!include) return include.error();
     std::vector<OwnedPattern> exclusions;
@@ -1170,11 +1170,11 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates(
   }
 }
 
-Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
-    const NamedImage* images, size_t count, const CandidateSelection& selection,
+Result<std::vector<FunctionCandidate>> detail::expand_candidates_budgeted(
+    const NamedImage* images, size_t count, const CandidateSelection& selection, ScanBudget& budget,
     OperationDiagnostic* diagnostic) {
   detail::CauseScope scope;
-  auto result = expand_function_candidates(images, count, selection);
+  auto result = expand_impl(images, count, selection, budget);
   if (diagnostic) {
     *diagnostic = {};
     diagnostic->error = result ? Error::Ok() : result.error();
@@ -1182,5 +1182,16 @@ Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
     diagnostic->cause = detail::resolve_cause(diagnostic->error, detail::noted_cause());
   }
   return result;
+}
+Result<std::vector<FunctionCandidate>> expand_function_candidates(
+    const NamedImage* images, size_t count, const CandidateSelection& selection) {
+  detail::ScanBudget budget;
+  return expand_impl(images, count, selection, budget);
+}
+Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
+    const NamedImage* images, size_t count, const CandidateSelection& selection,
+    OperationDiagnostic* diagnostic) {
+  detail::ScanBudget budget;
+  return detail::expand_candidates_budgeted(images, count, selection, budget, diagnostic);
 }
 }  // namespace yukiplt

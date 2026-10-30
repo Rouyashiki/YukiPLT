@@ -73,6 +73,11 @@ Error validate_function_selector(const FunctionImportSelector& selector) noexcep
 Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
                                      const FunctionImportSelector& selector);
 
+// Adapters debit their temporary metadata before entering the same scanner.
+Result<std::vector<FunctionCandidate>> expand_candidates_budgeted(const NamedImage*, size_t,
+                                                                  const CandidateSelection&,
+                                                                  ScanBudget&,
+                                                                  OperationDiagnostic*);
 }  // namespace yukiplt::detail
 
 #endif  // YUKIPLT_IMPORTS_HPP_

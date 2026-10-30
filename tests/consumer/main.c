@@ -11,6 +11,7 @@
 #endif
 
 #include "yukiplt.h"
+int run_c_scenarios(void);
 static int metadata_anchor;
 static int owned_metadata(void) {
   yukiplt_c_image_list images = {0};
@@ -62,6 +63,8 @@ int main(void) {
   }
 #endif
   if (owned_metadata()) return 3;
+  const int scenarios = run_c_scenarios();
+  if (scenarios) return scenarios;
   puts("c_consumer: passed");
   return 0;
 }

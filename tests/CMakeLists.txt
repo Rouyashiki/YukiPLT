@@ -24,6 +24,7 @@ find_package(Threads REQUIRED)
 add_library(yukiplt_regression_core STATIC
     "${YUKIPLT_ROOT}/src/c_api.cpp"
     "${YUKIPLT_ROOT}/src/c_metadata.cpp"
+    "${YUKIPLT_ROOT}/src/c_rules.cpp"
     "${YUKIPLT_ROOT}/src/c_session.cpp"
     "${YUKIPLT_ROOT}/src/imports.cpp"
     "${YUKIPLT_ROOT}/src/yukiplt.cpp"

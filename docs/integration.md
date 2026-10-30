@@ -109,3 +109,24 @@ replacement/context/original storage still require the caller's quiescence.
 Original outputs are borrowed stable storage. They are not owned by the C plan
 or session and must not be reset or reused after publication. The `original`
 field in a copied target record is diagnostic, not an atomic reader.
+
+## C rules, reports and candidates
+
+Probe `YUKIPLT_C_FEATURE_RULES` and create a `yukiplt_c_rules` owner. Register
+plain or function selectors with stable original arrays, then explicitly refresh
+or send custom-loader notifications. Each mutating operation takes a zero report
+owner. A failure can still return a report; always query and destroy nonzero
+reports. The report owns its events and survives later RuleSet operations.
+`summary.retained` is operation-local; use statistics for all live handles.
+Destroy refuses a RuleSet with any live/recovery handle. Pruning never reuses
+original slots or removes abandoned history. Binding snapshots own their paths
+and remain readable after pruning, but copied binding indices are historical.
+
+Probe `YUKIPLT_C_FEATURE_CANDIDATES` to expand candidates from an explicit list
+of images. Byte-based exact/prefix/suffix/substring filters have no pattern
+syntax. Optional host predicates receive borrowed metadata outside all internal
+locks, can reenter other APIs, and must explicitly accept/reject or return an
+error. Failure returns no candidate list; callback side effects are not undone.
+C adaptation and the core scanner share the same operation-wide materialization
+budget. Copy selected metadata into caller buffers before building an explicit
+function plan; a candidate address alone never authorizes a patch.

@@ -8,6 +8,8 @@
 
 #include "c_api.hpp"
 #include "common.hpp"
+#include "imports.hpp"
+#include "yukiplt.hpp"
 
 namespace {
 using namespace yukiplt;
@@ -214,6 +216,183 @@ yukiplt_c_error yukiplt_c_import_snapshot_copy(const yukiplt_c_import_snapshot* 
           return Error::Ok();
         },
         value);
+  });
+}
+}  // extern "C"
+
+namespace {
+using namespace yukiplt;
+using namespace yukiplt::detail::c_objects;
+using namespace yukiplt::detail::c_copy;
+static_assert(YUKIPLT_C_FEATURE_CANDIDATES == 15);
+static_assert(YUKIPLT_C_TEXT_ANY == 0 && static_cast<uint32_t>(TextMatchKind::kAny) == 0);
+static_assert(YUKIPLT_C_TEXT_EXACT == 1 && static_cast<uint32_t>(TextMatchKind::kExact) == 1);
+static_assert(YUKIPLT_C_TEXT_PREFIX == 2 && static_cast<uint32_t>(TextMatchKind::kPrefix) == 2);
+static_assert(YUKIPLT_C_TEXT_SUFFIX == 3 && static_cast<uint32_t>(TextMatchKind::kSuffix) == 3);
+static_assert(YUKIPLT_C_TEXT_SUBSTRING == 4 &&
+              static_cast<uint32_t>(TextMatchKind::kSubstring) == 4);
+struct Candidates final : Object {
+  Candidates() : Object(Kind::kCandidates) {}
+  std::vector<FunctionCandidate> value;
+};
+bool valid_text(const yukiplt_c_text_match& text) noexcept {
+  return text.kind <= YUKIPLT_C_TEXT_SUBSTRING && (text.text || !text.length) &&
+         (text.kind != YUKIPLT_C_TEXT_ANY || !text.length);
+}
+bool valid_pattern(const yukiplt_c_candidate_pattern& p) noexcept {
+  return valid_text(p.path) && valid_text(p.symbol);
+}
+TextMatch match(const yukiplt_c_text_match& text) noexcept {
+  return {static_cast<TextMatchKind>(text.kind), {text.text ? text.text : "", text.length}};
+}
+CandidatePattern pattern(const yukiplt_c_candidate_pattern& p) noexcept {
+  return {match(p.path), match(p.symbol)};
+}
+struct Predicate {
+  yukiplt_c_candidate_predicate call;
+  void* context;
+  Error failure;
+};
+Result<bool> predicate(const FunctionCandidate& candidate, void* context) {
+  auto& host = *static_cast<Predicate*>(context);
+  const auto exact = candidate.selector();
+  const auto& i = candidate.selected;
+  yukiplt_c_candidate_view view{};
+  view.image = image(candidate.image);
+  view.path = candidate.path.c_str();
+  view.selector = {sizeof(view.selector),
+                   exact.sources,
+                   exact.types,
+                   static_cast<uint32_t>(exact.index_source),
+                   {exact.base.symbol, static_cast<uint32_t>(exact.base.version_match),
+                    exact.base.version, exact.base.dependency,
+                    static_cast<uint32_t>(exact.base.hidden), exact.base.relocation_index}};
+  view.slot_address = i.base.import.slot_address;
+  view.symbol_index = i.base.import.symbol_index;
+  view.version_index = i.base.version.index;
+  view.version_table_present = i.base.version.table_present;
+  view.version_source = static_cast<uint32_t>(i.base.version.source);
+  view.relocation_type = i.relocation_type;
+  view.symbol_type = i.symbol_type;
+  uint32_t accept = 2;
+  const auto result = host.call(&view, host.context, &accept);
+  if (result.code > YUKIPLT_C_VMA_UNAVAILABLE || (!result.code && accept > 1)) {
+    host.failure = invalid();
+    return detail::with_cause(host.failure, ErrorCause::kHostCallback);
+  }
+  if (result.code) {
+    host.failure = Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+    return detail::with_cause(host.failure, ErrorCause::kHostCallback);
+  }
+  return accept != 0;
+}
+}  // namespace
+
+extern "C" {
+yukiplt_c_error yukiplt_c_expand_candidates(const yukiplt_c_candidate_image* input, size_t count,
+                                            const yukiplt_c_candidate_selection* options,
+                                            yukiplt_c_candidates* out,
+                                            yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  if (diagnostic && diagnostic->struct_size != sizeof(*diagnostic)) return converted(invalid());
+  detail::CauseScope scope;
+  OperationDiagnostic detail_result;
+  auto result = boundary([&]() -> Error {
+    if (!options || !out || (!input && count)) return Error::Make(ErrorCode::kNullPointer);
+    if (out->token || options->struct_size != sizeof(*options) ||
+        !valid_pattern(options->include) || (!options->exclude && options->exclude_count))
+      return invalid();
+    detail::ScanBudget budget;
+    if (auto e = budget.take_objects<NamedImage>(count)) return e;
+    std::vector<NamedImage> images;
+    images.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      if (input[i].struct_size != sizeof(input[i]) || !input[i].path) return invalid();
+      const auto length = std::strlen(input[i].path);
+      size_t bytes;
+      if (!detail::safe_add(length, size_t{1}, bytes))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+      if (auto e = budget.take_bytes(bytes)) return e;
+      images.push_back({image(input[i].image), input[i].path});
+    }
+    if (auto e = budget.take_objects<CandidatePattern>(options->exclude_count)) return e;
+    std::vector<CandidatePattern> exclusions;
+    exclusions.reserve(options->exclude_count);
+    for (size_t i = 0; i < options->exclude_count; ++i) {
+      if (!valid_pattern(options->exclude[i])) return invalid();
+      exclusions.push_back(pattern(options->exclude[i]));
+    }
+    Predicate host{options->predicate, options->context, {}};
+    CandidateSelection selection{options->sources,
+                                 options->types,
+                                 pattern(options->include),
+                                 exclusions.data(),
+                                 exclusions.size(),
+                                 options->predicate ? &predicate : nullptr,
+                                 &host,
+                                 {options->text_bytes, options->candidates}};
+    auto expanded = detail::expand_candidates_budgeted(images.data(), images.size(), selection,
+                                                       budget, &detail_result);
+    if (!expanded) {
+      if (host.failure && host.failure.code == expanded.error().code &&
+          host.failure.sys_errno == expanded.error().sys_errno)
+        detail_result.cause = ErrorCause::kHostCallback;
+      return expanded.error();
+    }
+    auto owned = std::make_shared<Candidates>();
+    owned->value = std::move(expanded.value());
+    auto token = publish(owned);
+    if (!token) return token.error();
+    out->token = token.value();
+    return Error::Ok();
+  });
+  if (diagnostic) {
+    const bool from_core = static_cast<uint32_t>(detail_result.error.code) == result.code &&
+                           detail_result.error.sys_errno == result.sys_errno;
+    yukiplt_c_operation_diagnostic d{};
+    d.struct_size = sizeof(d);
+    d.stage = static_cast<uint32_t>(from_core ? detail_result.stage : OperationStage::kPrepare);
+    d.cause = static_cast<uint32_t>(
+        from_core ? detail_result.cause
+                  : detail::resolve_cause(
+                        Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno),
+                        detail::noted_cause()));
+    d.error = result;
+    *diagnostic = d;
+  }
+  return result;
+}
+yukiplt_c_error yukiplt_c_candidates_destroy(yukiplt_c_candidates* h) noexcept {
+  return boundary([&] {
+    return h ? destroy(h->token, Kind::kCandidates) : Error::Make(ErrorCode::kNullPointer);
+  });
+}
+yukiplt_c_error yukiplt_c_candidates_copy(const yukiplt_c_candidates* h,
+                                          yukiplt_c_candidate_record* rows, size_t capacity,
+                                          char* text, size_t text_capacity, size_t* required_count,
+                                          size_t* required_text) noexcept {
+  return boundary([&]() -> Error {
+    if (!h) return Error::Make(ErrorCode::kNullPointer);
+    auto base = acquire(h->token, Kind::kCandidates);
+    if (!base) return invalid();
+    auto& values = static_cast<Candidates&>(*base).value;
+    size_t bytes = 0;
+    for (const auto& c : values) {
+      if (!append_size(bytes, c.path) || !append_size(bytes, c.selected.base.import.symbol) ||
+          !append_size(bytes, c.selected.base.version.name) ||
+          !append_size(bytes, c.selected.base.version.dependency))
+        return Error::Make(ErrorCode::kIntegerOverflow);
+    }
+    bool sizes_only = false;
+    if (auto e = buffers(values.size(), bytes, rows, capacity, text, text_capacity, required_count,
+                         required_text, sizes_only))
+      return e;
+    if (sizes_only) return Error::Ok();
+    size_t offset = 0, index = 0;
+    for (const auto& c : values) {
+      auto path = copy_text(c.path, text, offset);
+      rows[index++] = {image(c.image), path, copy_import(record(c.selected), text, offset)};
+    }
+    return Error::Ok();
   });
 }
 }  // extern "C"

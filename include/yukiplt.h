@@ -204,7 +204,9 @@ enum {
   YUKIPLT_C_FEATURE_OWNED_IMAGES = 10,
   YUKIPLT_C_FEATURE_IMPORT_SNAPSHOTS = 11,
   YUKIPLT_C_FEATURE_PLANS = 12,
-  YUKIPLT_C_FEATURE_SESSIONS = 13
+  YUKIPLT_C_FEATURE_SESSIONS = 13,
+  YUKIPLT_C_FEATURE_RULES = 14,
+  YUKIPLT_C_FEATURE_CANDIDATES = 15
 };
 
 enum {
@@ -696,6 +698,220 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_session_recovery(const yukiplt_c_session*,
                                                        yukiplt_c_recovery_diagnostic*,
                                                        yukiplt_c_residual_page*, size_t capacity,
                                                        size_t* required_pages) YUKIPLT_C_NOEXCEPT;
+
+// Rule sets retain history until explicit pruning. Original slots are stable,
+// grow-only caller storage; capacity zero disables original publication.
+#define YUKIPLT_C_NO_ORIGINAL_INDEX SIZE_MAX
+typedef struct yukiplt_c_rules {
+  uint64_t token;
+} yukiplt_c_rules;
+typedef struct yukiplt_c_rule_report {
+  uint64_t token;
+} yukiplt_c_rule_report;
+typedef struct yukiplt_c_bindings {
+  uint64_t token;
+} yukiplt_c_bindings;
+enum {
+  YUKIPLT_C_RULE_PENDING = 0,
+  YUKIPLT_C_RULE_INSTALLED = 1,
+  YUKIPLT_C_RULE_INSTALL_FAILED = 2,
+  YUKIPLT_C_RULE_INDETERMINATE = 3,
+  YUKIPLT_C_RULE_RELEASED = 4,
+  YUKIPLT_C_RULE_INVALIDATED = 5,
+  YUKIPLT_C_RULE_RESTORE_FAILED = 6,
+  YUKIPLT_C_RULE_ABANDONED = 7,
+  YUKIPLT_C_RULE_CAPACITY_EXHAUSTED = 8
+};
+enum {
+  YUKIPLT_C_RULE_VALIDATE = 0,
+  YUKIPLT_C_RULE_ENUMERATE = 1,
+  YUKIPLT_C_RULE_BINDING_PREPARE = 2,
+  YUKIPLT_C_RULE_CAPACITY = 3,
+  YUKIPLT_C_RULE_INSTALL = 4,
+  YUKIPLT_C_RULE_RESTORE = 5,
+  YUKIPLT_C_RULE_ABANDON = 6,
+  YUKIPLT_C_RULE_VERIFY = 7
+};
+typedef struct yukiplt_c_rule_event {
+  uint64_t rule_id;
+  yukiplt_c_image image;
+  yukiplt_c_text_ref path;
+  uint32_t stage;
+  yukiplt_c_error error;
+  uint32_t attempted;
+  uint32_t state;
+  size_t binding_index;
+  yukiplt_c_recovery_diagnostic recovery;
+} yukiplt_c_rule_event;
+typedef struct yukiplt_c_rule_report_info {
+  yukiplt_c_summary summary;
+  yukiplt_c_error preparation_error;
+  yukiplt_c_error operation_error;
+} yukiplt_c_rule_report_info;
+typedef struct yukiplt_c_binding_record {
+  uint64_t rule_id;
+  yukiplt_c_image image;
+  yukiplt_c_text_ref path;
+  size_t original_index;
+  uint32_t state;
+  yukiplt_c_error error;
+  yukiplt_c_slot_report install_report;
+  yukiplt_c_slot_report restore_report;
+} yukiplt_c_binding_record;
+typedef struct yukiplt_c_rules_statistics {
+  size_t registered_rules;
+  size_t active_rules;
+  size_t bindings;
+  size_t active_handles;
+} yukiplt_c_rules_statistics;
+typedef struct yukiplt_c_rule_statistics {
+  uint64_t rule_id;
+  uint32_t removed;
+  uint32_t original_storage_enabled;
+  size_t original_capacity;
+  size_t original_used;
+  size_t original_remaining;
+  size_t bindings;
+  size_t active_handles;
+} yukiplt_c_rule_statistics;
+
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_create(yukiplt_c_rules*) YUKIPLT_C_NOEXCEPT;
+// Rejects ANY active/recovery handle, including targets absent from last refresh.
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_destroy(yukiplt_c_rules*) YUKIPLT_C_NOEXCEPT;
+// Copies selector/filter strings; borrows original slots through recovery and
+// quiescence. On error rule_id is unchanged. All output storage is disjoint.
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_add(yukiplt_c_rules*, const yukiplt_c_image_selector*,
+                                                const yukiplt_c_selector*, void* replacement,
+                                                void** originals, size_t capacity,
+                                                uint64_t* rule_id) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_add_function(
+    yukiplt_c_rules*, const yukiplt_c_image_selector*, const yukiplt_c_function_selector*,
+    void* replacement, void** originals, size_t capacity, uint64_t* rule_id) YUKIPLT_C_NOEXCEPT;
+// Reports are required zero output owners. Report allocation/token registration
+// precedes effects; a nonzero report can be returned even on operation failure.
+// Query and destroy it regardless of the error. Reports remain independent of
+// later RuleSet changes/destruction. Preparation errors install nothing. Later
+// targets may partly succeed; the first failing event in report order is returned. retained is
+// this operation's target population, not the complete RuleSet ownership count.
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_refresh(yukiplt_c_rules*,
+                                                    yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_release_image(
+    yukiplt_c_rules*, const yukiplt_c_image*, yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+// Notifications accept only stable custom instances with nonzero tokens. Call
+// after relocation/final protections, or before unmapping, outside loader locks.
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_notify_loaded(yukiplt_c_rules*, const yukiplt_c_image*,
+                                                          const char* path, yukiplt_c_rule_report*)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_notify_unloading(
+    yukiplt_c_rules*, const yukiplt_c_image*, yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_remove(yukiplt_c_rules*, uint64_t rule_id,
+                                                   yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_unhook(yukiplt_c_rules*,
+                                                   yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_abandon(yukiplt_c_rules*,
+                                                    yukiplt_c_rule_report*) YUKIPLT_C_NOEXCEPT;
+// Removes only released/invalidated history without handles, never abandoned
+// records or original capacity. Existing copied reports remain intact, but their
+// binding indices no longer identify the current mutable RuleSet vector.
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_prune_history(yukiplt_c_rules*,
+                                                          size_t* removed) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_get_statistics(
+    const yukiplt_c_rules*, yukiplt_c_rules_statistics*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_get_rule_statistics(
+    const yukiplt_c_rules*, uint64_t rule_id, yukiplt_c_rule_statistics*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_rules_snapshot_bindings(const yukiplt_c_rules*, yukiplt_c_bindings*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_bindings_destroy(yukiplt_c_bindings*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_bindings_copy(const yukiplt_c_bindings*,
+                                                    yukiplt_c_binding_record*, size_t capacity,
+                                                    char* text, size_t text_capacity,
+                                                    size_t* required_count,
+                                                    size_t* required_text) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rule_report_destroy(yukiplt_c_rule_report*)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rule_report_get_info(
+    const yukiplt_c_rule_report*, yukiplt_c_rule_report_info*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rule_report_copy(const yukiplt_c_rule_report*,
+                                                       yukiplt_c_rule_event*, size_t capacity,
+                                                       char* text, size_t text_capacity,
+                                                       size_t* required_count,
+                                                       size_t* required_text) YUKIPLT_C_NOEXCEPT;
+
+// Candidate expansion is read-only. Explicit images only; no global match-all.
+typedef struct yukiplt_c_candidates {
+  uint64_t token;
+} yukiplt_c_candidates;
+typedef struct yukiplt_c_candidate_image {
+  uint32_t struct_size;
+  yukiplt_c_image image;
+  const char* path;  // Exact system path, or caller-supplied custom instance path.
+} yukiplt_c_candidate_image;
+enum {
+  YUKIPLT_C_TEXT_ANY = 0,
+  YUKIPLT_C_TEXT_EXACT = 1,
+  YUKIPLT_C_TEXT_PREFIX = 2,
+  YUKIPLT_C_TEXT_SUFFIX = 3,
+  YUKIPLT_C_TEXT_SUBSTRING = 4
+};
+typedef struct yukiplt_c_text_match {
+  uint32_t kind;
+  const char* text;
+  size_t length;
+} yukiplt_c_text_match;
+typedef struct yukiplt_c_candidate_pattern {
+  yukiplt_c_text_match path;
+  yukiplt_c_text_match symbol;
+} yukiplt_c_candidate_pattern;
+typedef struct yukiplt_c_candidate_view {
+  yukiplt_c_image image;
+  const char* path;
+  yukiplt_c_function_selector selector;
+  uintptr_t slot_address;
+  uint32_t symbol_index;
+  uint32_t version_index;
+  uint32_t version_table_present;
+  uint32_t version_source;
+  uint32_t relocation_type;
+  uint32_t symbol_type;
+} yukiplt_c_candidate_view;
+// All pointers in view are borrowed for this invocation only. The callback runs
+// after owning snapshots exist and outside linker/op/object-table locks; it may
+// call other APIs. On success set accept to 0 or 1. Error or invalid accept fails
+// the complete expansion, with no partial candidate list. Callback side effects
+// are not rolled back. No exceptions, longjmp or Rust panic may cross this ABI.
+typedef yukiplt_c_error (*yukiplt_c_candidate_predicate)(const yukiplt_c_candidate_view*,
+                                                         void* context, uint32_t* accept);
+typedef struct yukiplt_c_candidate_selection {
+  uint32_t struct_size;
+  uint32_t sources;
+  uint32_t types;
+  yukiplt_c_candidate_pattern include;
+  const yukiplt_c_candidate_pattern* exclude;
+  size_t exclude_count;
+  yukiplt_c_candidate_predicate predicate;
+  void* context;
+  size_t text_bytes;  // At most 8 MiB; counted with the existing candidate policy.
+  size_t candidates;  // At most 4096. Both limits may only be lowered.
+} yukiplt_c_candidate_selection;
+typedef struct yukiplt_c_candidate_record {
+  yukiplt_c_image image;
+  yukiplt_c_text_ref path;
+  yukiplt_c_import_record selected;
+} yukiplt_c_candidate_record;
+// Inputs are borrowed for the call; text matches use explicit byte lengths, not
+// NUL termination. Any requires length zero. A zero-length null text is valid.
+// diagnostic is optional, exact struct_size on input, written on every valid-
+// layout return. No candidate pins an image or authorizes installation without
+// revalidation. Build an explicit function plan from the selected metadata.
+YUKIPLT_API yukiplt_c_error yukiplt_c_expand_candidates(
+    const yukiplt_c_candidate_image*, size_t count, const yukiplt_c_candidate_selection*,
+    yukiplt_c_candidates*, yukiplt_c_operation_diagnostic*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_candidates_destroy(yukiplt_c_candidates*) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_candidates_copy(const yukiplt_c_candidates*,
+                                                      yukiplt_c_candidate_record*, size_t capacity,
+                                                      char* text, size_t text_capacity,
+                                                      size_t* required_count,
+                                                      size_t* required_text) YUKIPLT_C_NOEXCEPT;
 
 #ifdef __cplusplus
 }

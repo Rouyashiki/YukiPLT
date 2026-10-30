@@ -3,6 +3,8 @@
 
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "yukiplt.h"
 
@@ -92,11 +94,131 @@ static int invalidation(void) {
   return yukiplt_c_session_destroy(&session).code ? 16 : 0;
 }
 
-int main(void) {
+static void* candidate_original;
+static void* rule_originals[1];
+static int candidate_replacement(int x) {
+  return ((function)yukiplt_c_load_original(&candidate_original))(x) + 100;
+}
+static int rule_replacement(int x) {
+  return ((function)yukiplt_c_load_original(&rule_originals[0]))(x) + 100;
+}
+static yukiplt_c_error accept_candidate(const yukiplt_c_candidate_view* view, void* context,
+                                        uint32_t* accept) {
+  yukiplt_c_rules temporary = {0};
+  yukiplt_c_error error = yukiplt_c_rules_create(&temporary);
+  if (error.code) return error;
+  error = yukiplt_c_rules_destroy(&temporary);
+  if (error.code) return error;
+  ++*(unsigned*)context;
+  *accept = strcmp(view->selector.base.symbol, "sample_add") == 0;
+  return (yukiplt_c_error){0, 0};
+}
+static int rules_and_candidates(void) {
+  void* library = dlopen("./libhook_target.so", RTLD_NOW | RTLD_LOCAL);
+  if (!library) return 20;
+  void* address = dlsym(library, "call_import");
+  function call = (function)address;
+  yukiplt_c_image_list images = {0};
+  yukiplt_c_image_record image_record;
+  size_t count = 0, bytes = 0;
+  if (yukiplt_c_find_image_containing(address, &images).code ||
+      yukiplt_c_image_list_copy(&images, NULL, 0, NULL, 0, &count, &bytes).code || count != 1)
+    return 21;
+  char* path_text = (char*)malloc(bytes);
+  if (!path_text ||
+      yukiplt_c_image_list_copy(&images, &image_record, 1, path_text, bytes, &count, &bytes).code)
+    return 22;
+  if (yukiplt_c_image_list_destroy(&images).code) return 23;
+  const char* path = path_text + image_record.path.offset;
+  yukiplt_c_candidate_image input = {sizeof(input), image_record.image, path};
+  yukiplt_c_candidate_selection selection = {0};
+  selection.struct_size = sizeof(selection);
+  selection.sources = YUKIPLT_C_SOURCE_JMPREL;
+  selection.types = YUKIPLT_C_TYPE_JUMP_SLOT;
+  selection.include.symbol =
+      (yukiplt_c_text_match){YUKIPLT_C_TEXT_EXACT, "sample_add", sizeof("sample_add") - 1};
+  selection.text_bytes = 8 * 1024 * 1024;
+  selection.candidates = 4096;
+  unsigned callbacks = 0;
+  selection.predicate = accept_candidate;
+  selection.context = &callbacks;
+  yukiplt_c_candidates candidates = {0};
+  if (yukiplt_c_expand_candidates(&input, 1, &selection, &candidates, NULL).code || callbacks != 1)
+    return 24;
+  if (yukiplt_c_candidates_copy(&candidates, NULL, 0, NULL, 0, &count, &bytes).code || count != 1)
+    return 25;
+  char* text = (char*)malloc(bytes);
+  yukiplt_c_candidate_record candidate;
+  if (!text ||
+      yukiplt_c_candidates_copy(&candidates, &candidate, 1, text, bytes, &count, &bytes).code)
+    return 26;
+  if (yukiplt_c_candidates_destroy(&candidates).code) return 27;
+  yukiplt_c_function_selector exact =
+      YUKIPLT_C_FUNCTION_SELECTOR(text + candidate.selected.symbol.offset);
+  exact.sources = 1u << candidate.selected.relocation_source;
+  exact.types = YUKIPLT_C_TYPE_JUMP_SLOT;
+  exact.index_source = candidate.selected.relocation_source;
+  exact.base.relocation_index = candidate.selected.relocation_index;
+  exact.base.version_match = candidate.selected.version_index >= 2 ? YUKIPLT_C_VERSION_EXACT
+                                                                   : YUKIPLT_C_VERSION_UNVERSIONED;
+  exact.base.version =
+      candidate.selected.version_index >= 2 ? text + candidate.selected.version.offset : NULL;
+  exact.base.dependency =
+      candidate.selected.dependency.length ? text + candidate.selected.dependency.offset : NULL;
+  exact.base.hidden = candidate.selected.version_hidden ? YUKIPLT_C_HIDDEN : YUKIPLT_C_NON_HIDDEN;
+  yukiplt_c_function_target target = {0};
+  target.struct_size = sizeof(target);
+  target.image = candidate.image;
+  target.request.struct_size = sizeof(target.request);
+  target.request.base.target = exact;
+  target.request.base.replacement = (void*)candidate_replacement;
+  target.request.base.out_original = &candidate_original;
+  yukiplt_c_plan plan = {0};
+  yukiplt_c_session session = {0};
+  yukiplt_c_summary summary;
+  if (yukiplt_c_build_function_plan(&target, 1, &plan, NULL).code ||
+      yukiplt_c_prepare_session(&plan, &session).code || yukiplt_c_plan_destroy(&plan).code)
+    return 28;
+  if (yukiplt_c_session_install(&session, &summary).code || call(1) != 111) return 29;
+  if (yukiplt_c_session_unhook(&session, &summary).code || call(1) != 11 ||
+      yukiplt_c_session_destroy(&session).code)
+    return 30;
+  yukiplt_c_rules rules = {0};
+  yukiplt_c_image_selector filter = {sizeof(filter), YUKIPLT_C_IMAGE_PATH, path, 0};
+  uint64_t rule_id = 0;
+  if (yukiplt_c_rules_create(&rules).code ||
+      yukiplt_c_rules_add_function(&rules, &filter, &exact, (void*)rule_replacement, rule_originals,
+                                   1, &rule_id)
+          .code)
+    return 31;
+  free(text);
+  free(path_text);
+  yukiplt_c_rule_report installed = {0}, restored = {0};
+  if (yukiplt_c_rules_refresh(&rules, &installed).code || call(1) != 111) return 32;
+  if (yukiplt_c_rules_destroy(&rules).code != YUKIPLT_C_INVALID_ARGUMENT) return 33;
+  if (yukiplt_c_rules_remove(&rules, rule_id, &restored).code || call(1) != 11) return 34;
+  size_t removed = 0;
+  if (yukiplt_c_rules_prune_history(&rules, &removed).code || removed != 1 ||
+      yukiplt_c_rules_destroy(&rules).code)
+    return 35;
+  if (dlclose(library)) return 36;
+  yukiplt_c_rule_report_info info;
+  if (yukiplt_c_rule_report_get_info(&installed, &info).code || info.summary.retained != 1 ||
+      yukiplt_c_rule_report_copy(&installed, NULL, 0, NULL, 0, &count, &bytes).code || count != 1)
+    return 37;
+  if (yukiplt_c_rule_report_destroy(&installed).code ||
+      yukiplt_c_rule_report_destroy(&restored).code)
+    return 38;
+  return 0;
+}
+
+int run_c_scenarios(void) {
   int result = invalidation();
   if (!result) result = exercise(0);
   if (!result) result = exercise(1);
   if (!result && retained_library && dlclose(retained_library)) result = 17;
+  if (!result) result = rules_and_candidates();
+  if (!result && yukiplt_c_trim_idle_storage().code) result = 39;
   printf("session_consumer: %d\n", result);
   return result;
 }

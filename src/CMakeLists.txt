@@ -15,7 +15,8 @@ target_include_directories(yukiplt PUBLIC
     "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>"
     "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>"
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
-target_compile_options(yukiplt PRIVATE ${YUKIPLT_COMPILE_OPTIONS})
+target_compile_options(yukiplt PRIVATE ${YUKIPLT_COMPILE_OPTIONS}
+    "$<$<AND:$<CONFIG:Release>,$<COMPILE_LANG_AND_ID:CXX,Clang>>:-Oz>")
 target_link_libraries(yukiplt PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
 if(WIN32)
     target_link_libraries(yukiplt PRIVATE bcrypt)

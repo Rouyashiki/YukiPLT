@@ -46,6 +46,7 @@
       yukiplt::RuleSet::unhook*;
       yukiplt::RuleSet::abandon*;
       yukiplt::RuleSet::statistics*;
+      yukiplt::RuleSet::prune_history*;
     };
   local:
     *;

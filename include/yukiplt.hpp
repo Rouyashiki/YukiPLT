@@ -1819,6 +1819,16 @@ class RuleSet {
   [[nodiscard]] YUKIPLT_API RuleSetStatistics statistics() const noexcept;
   [[nodiscard]] YUKIPLT_API Result<RuleStatistics> statistics(uint64_t rule_id) const noexcept;
 
+  /// Explicitly discard released/invalidated bindings with no live handle and
+  /// return the number removed. Other states, including abandoned tombstones,
+  /// remain. Does not touch images, Registry, permissions or original outputs;
+  /// published original indices are never recycled and capacity is not reset.
+  /// Allocation failure leaves the object unchanged. A successful removal
+  /// invalidates bindings() references and all previously reported binding_index
+  /// values; caller-owned report contents remain valid. This bounds reclaimable
+  /// history only, not the population of live/failed/abandoned bindings.
+  [[nodiscard]] YUKIPLT_API Result<size_t> prune_history();
+
   /// Per-(rule, image instance) results.  Valid until the next mutation.
   [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
 

@@ -6,6 +6,7 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 
@@ -485,6 +486,51 @@ RuleSetStatistics RuleSet::statistics() const noexcept {
   for (const auto& rule : rules_)
     if (!rule.removed) ++result.active_rules;
   return result;
+}
+
+Result<size_t> RuleSet::prune_history() {
+  const auto removable = [&](size_t i) {
+    return !handles_[i].valid() && (bindings_[i].state == RuleState::kReleased ||
+                                    bindings_[i].state == RuleState::kInvalidated);
+  };
+  size_t removed = 0;
+  for (size_t i = 0; i < bindings_.size(); ++i)
+    if (removable(i)) ++removed;
+  if (removed == 0) return size_t{0};
+  try {
+    const size_t retained = bindings_.size() - removed;
+    std::vector<size_t> remap(bindings_.size(), ~size_t{0});
+    size_t next = 0;
+    for (size_t i = 0; i < bindings_.size(); ++i)
+      if (!removable(i)) remap[i] = next++;
+    std::vector<RuleBinding> bindings;
+    std::vector<HookHandle> handles;
+    decltype(binding_index_) index;
+    bindings.reserve(retained);
+    handles.reserve(retained);
+    index.reserve(std::min(retained, binding_index_.size()));
+    // Only current mappings may survive: never promote an older historical
+    // record to replace a current mapping being removed.
+    for (const auto& entry : binding_index_)
+      if (remap[entry.second] != ~size_t{0}) index.emplace(entry.first, remap[entry.second]);
+
+    // All allocation has finished. Move live handles exactly once, without
+    // invoking their move-assignment/drop behavior or exposing a partial state.
+    static_assert(std::is_nothrow_move_constructible_v<RuleBinding>);
+    static_assert(std::is_nothrow_move_constructible_v<HookHandle>);
+    static_assert(std::is_nothrow_swappable_v<decltype(binding_index_)>);
+    for (size_t i = 0; i < bindings_.size(); ++i) {
+      if (remap[i] == ~size_t{0}) continue;
+      bindings.push_back(std::move(bindings_[i]));
+      handles.push_back(std::move(handles_[i]));
+    }
+    bindings_.swap(bindings);
+    handles_.swap(handles);
+    binding_index_.swap(index);
+    return removed;
+  } catch (...) {
+    return detail::current_exception_error();
+  }
 }
 
 Result<RuleStatistics> RuleSet::statistics(uint64_t rule_id) const noexcept {

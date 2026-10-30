@@ -1641,14 +1641,15 @@ YUKIPLT_API Result<FunctionHookSession> prepare_function_session(const FunctionH
 
 /// State of one (rule, image instance) binding.
 enum class RuleState : uint8_t {
-  kPending,        ///< Matched but not yet installed (e.g. a prior conflict/OOM).
-  kInstalled,      ///< Installed and owned.
-  kInstallFailed,  ///< A clean install failure (conflict, capacity, OOM); retryable.
-  kIndeterminate,  ///< Partial install; handle retained, must unhook/abandon.
-  kReleased,       ///< Cleanly unhooked (by remove_rule/release_image/unhook).
-  kInvalidated,    ///< Image no longer loaded; handle consumed by the core.
-  kRestoreFailed,  ///< Unhook failed; handle retained, retryable.
-  kAbandoned,      ///< Ownership relinquished without touching memory.
+  kPending,            ///< Matched but not yet installed (e.g. a prior conflict/OOM).
+  kInstalled,          ///< Installed and owned.
+  kInstallFailed,      ///< A clean install failure (conflict, OOM); retryable.
+  kIndeterminate,      ///< Partial install; handle retained, must unhook/abandon.
+  kReleased,           ///< Cleanly unhooked (by remove_rule/release_image/unhook).
+  kInvalidated,        ///< Image no longer loaded; handle consumed by the core.
+  kRestoreFailed,      ///< Unhook failed; handle retained, retryable.
+  kAbandoned,          ///< Ownership relinquished without touching memory.
+  kCapacityExhausted,  ///< No original slot available; terminal for this rule.
 };
 
 /// No original-output slot was assigned (output disabled or capacity refused).
@@ -1708,6 +1709,13 @@ struct RuleOperationEvent {
   /// were restored. This snapshot is not a live inspection after abandonment.
   RecoveryDiagnostic recovery;
 };
+/// Recover the cause recorded unambiguously by an event's stage. Other failures
+/// return kNone: events do not retain every core operation's detailed cause.
+[[nodiscard]] inline ErrorCause rule_event_cause(const RuleOperationEvent& event) noexcept {
+  return event.stage == RuleOperationStage::kCapacity && !event.error.ok()
+             ? ErrorCause::kOriginalCapacity
+             : ErrorCause::kNone;
+}
 /// Caller-owned results. Preparation errors precede every side effect; events
 /// own their text and are not references into the RuleSet. An ImageView remains
 /// an identity, not a lifetime guarantee. kImageNotFound enumeration is normal.

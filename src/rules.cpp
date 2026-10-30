@@ -237,6 +237,16 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   bool retry_in_place = false;
   if (existing != ~size_t{0}) {
     const RuleState st = bindings_[existing].state;
+    if (st == RuleState::kCapacityExhausted) {
+      ++summary.failed;
+      if (event) {
+        event->stage = RuleOperationStage::kCapacity;
+        event->attempted = false;
+        event->recovery = {};
+        event->recovery.error = bindings_[existing].error;
+      }
+      return;
+    }
     if (st == RuleState::kPending || st == RuleState::kInstallFailed) {
       retry_in_place = true;
     } else if (st != RuleState::kReleased && st != RuleState::kInvalidated) {
@@ -302,14 +312,15 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   }
 
   if (new_binding) {
-    pending.state = install_state(result);
+    pending.state = capacity_refused ? RuleState::kCapacityExhausted : install_state(result);
     pending.error = result.error;
     pending.install_report = report;
     bindings_.push_back(std::move(pending));  // reserved above: no throw
     handles_.push_back(std::move(result.handle));
   } else {
     if (result.ok() || result.handle.valid()) bindings_[existing].path.swap(retry_path);
-    bindings_[existing].state = install_state(result);
+    bindings_[existing].state =
+        capacity_refused ? RuleState::kCapacityExhausted : install_state(result);
     bindings_[existing].error = result.error;
     bindings_[existing].install_report = report;
     handles_[existing] = std::move(result.handle);

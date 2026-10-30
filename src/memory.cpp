@@ -143,6 +143,8 @@ void MapsCoverage::feed_line(const char* line, size_t len) noexcept {
 }
 
 Error MapsCoverage::finish() const noexcept {
+  if (failure_ == ErrorCode::kOutOfBounds)
+    return with_cause(Error::Make(failure_), ErrorCause::kMapsCoverage);
   if (failure_ != ErrorCode::kSuccess) return Error::Make(failure_);
   if (next_ != count_)
     return with_cause(Error::Make(ErrorCode::kOutOfBounds), ErrorCause::kMapsCoverage);

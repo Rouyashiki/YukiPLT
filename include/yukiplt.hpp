@@ -1101,6 +1101,12 @@ YUKIPLT_API HookResult hook_function_imports_ex_named(const NamedImage& image,
 YUKIPLT_API HookResult hook_batch_diagnosed_named(const NamedImage& image, const HookRequest* reqs,
                                                   size_t count, SlotReport* reports,
                                                   OperationDiagnostic* diagnostic);
+/// Named JUMP_SLOT batch that rejects a zero original under the operation lock,
+/// before publication or writes. Other entry points keep their zero-slot behavior.
+YUKIPLT_API HookResult hook_batch_nonnull_diagnosed_named(const NamedImage& image,
+                                                          const HookRequest* reqs, size_t count,
+                                                          SlotReport* reports,
+                                                          OperationDiagnostic* diagnostic);
 YUKIPLT_API HookResult hook_imports_diagnosed_named(const NamedImage& image,
                                                     const SelectedHookRequest* reqs, size_t count,
                                                     SlotReport* reports,

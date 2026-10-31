@@ -27,6 +27,12 @@ Eligible `GLOB_DAT` imports must be undefined `STT_FUNC`, have effective addend
 zero and a nonzero current slot. A zero `JUMP_SLOT` is allowed. An ineligible
 matched import rejects the entire request before modification.
 
+Use `hook_batch_nonnull_diagnosed_named()` when every replacement needs a callable
+original. It keeps the name-based `JUMP_SLOT` selection rules, including defined
+symbols, and rejects any zero original under the operation lock before publishing
+originals or writing slots. Other name-based entry points continue to allow zero
+`JUMP_SLOT` values.
+
 ## Install and retain recovery state
 
 Finish binding imports before installation. Custom loaders must complete all

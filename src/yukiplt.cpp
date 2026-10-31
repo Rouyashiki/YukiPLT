@@ -507,11 +507,14 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
 HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
                    size_t count, SlotReport* reports, size_t report_cap,
                    RecoveryDiagnostic* diagnostic = nullptr, const char* system_path = nullptr,
-                   detail::CauseContext* cause = nullptr) {
+                   detail::CauseContext* cause = nullptr, bool require_nonnull = false) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
-        return plan_requests(img, reqs, count, planned, cause);
+        Error error = plan_requests(img, reqs, count, planned, cause);
+        if (error.ok() && require_nonnull)
+          for (auto& slot : planned) slot.reject_zero_original = true;
+        return error;
       },
       diagnostic, system_path, cause);
 }
@@ -655,7 +658,7 @@ namespace {
 HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size_t count,
                            SlotReport* reports, RecoveryDiagnostic* diagnostic,
                            const char* expected_path = nullptr,
-                           detail::CauseContext* cause = nullptr) {
+                           detail::CauseContext* cause = nullptr, bool require_nonnull = false) {
   auto fail = [](ErrorCode c) {
     return HookResult{Error::Make(c), detail_api::make(detail_api::invalid())};
   };
@@ -674,7 +677,7 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
         return fail(ErrorCode::kInvalidArgument);
       }
       return install(live, insp.value(), reqs, count, reports, count, diagnostic, system_path,
-                     cause);
+                     cause, require_nonnull);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
       return HookResult{detail::current_exception_error(detail::ExceptionOrigin::kInternal, cause),
@@ -1492,6 +1495,18 @@ HookResult hook_batch_diagnosed_named(const NamedImage& image, const HookRequest
     if (Error error = validate_named_image(image, cause)) return HookResult{error, HookHandle{}};
     return hook_batch_impl(image.image, reqs, count, reports, recorded, image.path.c_str(), cause);
   });
+}
+
+HookResult hook_batch_nonnull_diagnosed_named(const NamedImage& image, const HookRequest* reqs,
+                                              size_t count, SlotReport* reports,
+                                              OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic,
+                           [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+                             if (Error error = validate_named_image(image, cause))
+                               return HookResult{error, HookHandle{}};
+                             return hook_batch_impl(image.image, reqs, count, reports, recorded,
+                                                    image.path.c_str(), cause, true);
+                           });
 }
 
 HookResult hook_imports_diagnosed_named(const NamedImage& image, const SelectedHookRequest* reqs,

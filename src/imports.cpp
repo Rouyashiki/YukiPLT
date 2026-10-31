@@ -1088,6 +1088,7 @@ Result<OwnedPattern> copy_pattern(const CandidatePattern& pattern, detail::ScanB
 static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* images, size_t count,
                                                           const CandidateSelection& selection,
                                                           detail::ScanBudget& budget) {
+  if (Error e = detail::process_entry()) return e;
   if ((!images && count != 0) || (!selection.exclude && selection.exclude_count != 0))
     return Error::Make(ErrorCode::kNullPointer);
   const FunctionImportSelector validation{{"candidate"}, selection.sources, selection.types};

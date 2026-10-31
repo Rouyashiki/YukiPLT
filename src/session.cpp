@@ -9,6 +9,7 @@
 
 #include "common.hpp"
 #include "imports.hpp"
+#include "maps_cache.hpp"
 #include "system_images.hpp"
 #include "yukiplt.hpp"
 
@@ -104,6 +105,7 @@ Result<bool> system_contains_address(const ImageView& view, uintptr_t address) {
 }  // namespace
 
 Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
+  if (Error e = detail::process_entry()) return e;
   if (Error invalid = detail::validate_image_selector(selector)) return invalid;
 #if defined(__linux__) || defined(__ANDROID__)
   struct Context {
@@ -159,6 +161,7 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
 }
 
 Result<NamedImage> find_image_containing(const void* address) {
+  if (Error e = detail::process_entry()) return e;
   uintptr_t query_address = reinterpret_cast<uintptr_t>(address);
 #if defined(__ANDROID__) && defined(__aarch64__)
   // Android ARM64 data pointers can carry a TBI/HWASan tag. Compare the virtual
@@ -245,6 +248,7 @@ Error validate_image_selector(const ImageSelector& selector) noexcept {
 namespace yukiplt {
 
 Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t* failed_target) {
+  if (Error e = detail::process_entry()) return e;
   if (failed_target) *failed_target = ~size_t{0};
   if (targets == nullptr || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -326,6 +330,7 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
 }
 
 Result<HookSession> prepare_session(const HookPlan& plan) {
+  if (Error e = detail::process_entry()) return e;
   if (plan.targets().empty()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
     HookSession session;
@@ -351,7 +356,8 @@ Result<HookSession> prepare_session(const HookPlan& plan) {
   }
 }
 
-SessionSummary HookSession::install() {
+SessionSummary HookSession::install_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (size_t g = 0; g < images_.size(); ++g) {
     auto& group = images_[g];
@@ -371,7 +377,7 @@ SessionSummary HookSession::install() {
       // A system image must still carry the path it had when planned.
       const char* path =
           group.image.instance_token == 0 && g < paths_.size() ? paths_[g].c_str() : nullptr;
-      auto result = detail::hook_imports_at(group.image, path, requests, n, reports);
+      auto result = detail::hook_imports_at(group.image, path, requests, n, reports, cache);
       group.install_error = result.error;
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled
@@ -394,15 +400,20 @@ SessionSummary HookSession::install() {
   }
   return summary;
 }
+SessionSummary HookSession::install() { return install_impl(nullptr); }
+SessionSummary HookSession::install_cached(MapsCache& cache) { return install_impl(&cache); }
 
-SessionSummary HookSession::unhook() {
+SessionSummary HookSession::unhook_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto it = images_.rbegin(); it != images_.rend(); ++it) {
     auto& group = *it;
     if (!group.handle.valid()) continue;
     ++summary.attempted;
     SlotReport reports[kGroupLimit];
-    group.restore_error = yukiplt::unhook(group.handle, reports, group.target_indices.size());
+    group.restore_error =
+        cache ? yukiplt::unhook_cached(*cache, group.handle, reports, group.target_indices.size())
+              : yukiplt::unhook(group.handle, reports, group.target_indices.size());
     if (!group.restore_error) {
       group.state = SessionState::kReleased;
       ++summary.succeeded;
@@ -418,8 +429,11 @@ SessionSummary HookSession::unhook() {
   }
   return summary;
 }
+SessionSummary HookSession::unhook() { return unhook_impl(nullptr); }
+SessionSummary HookSession::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
 
 SessionSummary HookSession::abandon() {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto& group : images_) {
     if (!group.handle.valid()) continue;
@@ -470,6 +484,7 @@ FunctionImportSelector exact_function_selector(const FunctionImport& chosen) noe
 }
 Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targets, size_t count,
                                                   size_t* failed_target) {
+  if (Error e = detail::process_entry()) return e;
   if (failed_target) *failed_target = ~size_t{0};
   if (!targets || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -553,6 +568,7 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
   }
 }
 Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& plan) {
+  if (Error e = detail::process_entry()) return e;
   if (plan.targets().empty()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
     FunctionHookSession session;
@@ -578,7 +594,8 @@ Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& pla
   }
 }
 
-SessionSummary FunctionHookSession::install() {
+SessionSummary FunctionHookSession::install_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (size_t g = 0; g < images_.size(); ++g) {
     auto& group = images_[g];
@@ -600,7 +617,7 @@ SessionSummary FunctionHookSession::install() {
       const char* path =
           group.image.instance_token == 0 && g < paths_.size() ? paths_[g].c_str() : nullptr;
       auto result = detail::hook_function_imports_ex_at(group.image, path, requests, n, reports,
-                                                        &group.operation);
+                                                        &group.operation, cache);
       group.install_error = result.error;
       group.handle = std::move(result.handle);
       group.state = result.ok()            ? SessionState::kInstalled
@@ -623,15 +640,22 @@ SessionSummary FunctionHookSession::install() {
   }
   return summary;
 }
+SessionSummary FunctionHookSession::install() { return install_impl(nullptr); }
+SessionSummary FunctionHookSession::install_cached(MapsCache& cache) {
+  return install_impl(&cache);
+}
 
-SessionSummary FunctionHookSession::unhook() {
+SessionSummary FunctionHookSession::unhook_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto it = images_.rbegin(); it != images_.rend(); ++it) {
     auto& group = *it;
     if (!group.handle.valid()) continue;
     ++summary.attempted;
     SlotReport reports[kGroupLimit];
-    group.restore_error = yukiplt::unhook(group.handle, reports, group.target_indices.size());
+    group.restore_error =
+        cache ? yukiplt::unhook_cached(*cache, group.handle, reports, group.target_indices.size())
+              : yukiplt::unhook(group.handle, reports, group.target_indices.size());
     group.operation = {};
     group.operation.error = group.restore_error;
     group.operation.stage =
@@ -655,8 +679,11 @@ SessionSummary FunctionHookSession::unhook() {
   }
   return summary;
 }
+SessionSummary FunctionHookSession::unhook() { return unhook_impl(nullptr); }
+SessionSummary FunctionHookSession::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
 
 SessionSummary FunctionHookSession::abandon() {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto& group : images_) {
     if (!group.handle.valid()) continue;

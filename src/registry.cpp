@@ -6,6 +6,8 @@
 #include <cerrno>
 #include <stdexcept>
 
+#include "maps_cache.hpp"
+
 #if defined(__linux__) || defined(__ANDROID__)
 #include <fcntl.h>
 #include <sys/syscall.h>
@@ -332,6 +334,8 @@ void Registry::finish_restore(uint64_t id, bool released, GroupState not_release
   if (released) {
     const auto index = index_of(id);
     if (!r->image.invalidated) index_erase_record(*r, index);
+    if (r->image.invalidated) invalidate_cache(id);
+    r->cache.reset();
     r->in_use = false;
     advance_generation(*r);
     r->slots.clear();
@@ -356,6 +360,8 @@ Error Registry::release(uint64_t id) {
   if (r == nullptr) return Error::Make(ErrorCode::kInvalidArgument);
   const auto index = index_of(id);
   if (!r->image.invalidated) index_erase_record(*r, index);
+  if (!r->residue.empty() || r->image.invalidated) invalidate_cache(id);
+  r->cache.reset();
   r->in_use = false;
   advance_generation(*r);
   r->slots.clear();
@@ -413,6 +419,8 @@ size_t Registry::forget_custom_image(const ImageIdentity& image) {
       // An invalidated group no longer owns its slots; drop them from the index
       // so a new instance at the same address can be claimed.
       index_erase_record(r, static_cast<uint32_t>(index));
+      invalidate_cache(make_id(r.generation, static_cast<uint32_t>(index)));
+      r.cache.reset();
       r.image.invalidated = true;
       ++n;
     }
@@ -450,4 +458,123 @@ size_t Registry::live_count() const {
   return n;
 }
 
+}  // namespace yukiplt::detail
+
+namespace yukiplt::detail {
+Error Registry::check_cache(uint64_t id, const MapsCacheState* cache) const noexcept {
+  const auto* record = resolve(id);
+  if (!record || !cache || cache->invalid) return Error::Make(ErrorCode::kInvalidArgument);
+  if (record->cache && record->cache.get() != cache)
+    return Error::Make(ErrorCode::kInvalidArgument);
+  if (record->cache.get() == cache) return Error::Ok();
+  if (!record->cache && !record->residue.empty()) return Error::Make(ErrorCode::kInvalidArgument);
+  for (const auto& slot : record->slots) {
+    uintptr_t page = slot.address & ~(uintptr_t(cache->page_size) - 1);
+    for (const auto& other : records_) {
+      if (!other.in_use || other.image.invalidated || !other.cache || other.cache.get() == cache)
+        continue;
+      for (const auto& target : other.slots)
+        if ((target.address & ~(uintptr_t(cache->page_size) - 1)) == page)
+          return Error::Make(ErrorCode::kInvalidArgument);
+    }
+  }
+  return Error::Ok();
+}
+Error Registry::bind_cache(uint64_t id, const std::shared_ptr<MapsCacheState>& cache) {
+  auto* record = resolve(id);
+  if (!record || !cache || cache->invalid) return Error::Make(ErrorCode::kInvalidArgument);
+  if (record->cache && record->cache != cache) return Error::Make(ErrorCode::kInvalidArgument);
+  if (record->cache == cache) return Error::Ok();
+  if (record->state != GroupState::kPrepared &&
+      (record->state != GroupState::kInstalled || !record->residue.empty()))
+    return Error::Make(ErrorCode::kInvalidArgument);
+  const size_t ps = cache->page_size;
+  for (const auto& slot : record->slots) {
+    const uintptr_t page = slot.address & ~(static_cast<uintptr_t>(ps) - 1);
+    for (const auto& other : records_) {
+      if (!other.in_use || other.image.invalidated || !other.cache || other.cache == cache)
+        continue;
+      for (const auto& target : other.slots)
+        if ((target.address & ~(static_cast<uintptr_t>(ps) - 1)) == page)
+          return Error::Make(ErrorCode::kInvalidArgument);
+    }
+    VmaInfo vma;
+    if (Error e = cache->lookup(page, vma)) return e;
+    if (Error e = cache->remember_page(page, vma)) return e;
+  }
+  record->cache = cache;
+  return Error::Ok();
+}
+CachedPage* Registry::cached_page(uintptr_t page) noexcept {
+  for (auto& record : records_) {
+    if (!record.in_use || record.image.invalidated || !record.cache) continue;
+    const size_t ps = record.cache->page_size;
+    for (const auto& slot : record.slots) {
+      if ((slot.address & ~(static_cast<uintptr_t>(ps) - 1)) != page) continue;
+      auto it = record.cache->pages.find(page);
+      if (it != record.cache->pages.end()) return &it->second;
+    }
+  }
+  return nullptr;
+}
+bool Registry::cache_bound(const MapsCacheState* cache) const noexcept {
+  for (const auto& record : records_)
+    if (record.in_use && record.cache.get() == cache) return true;
+  return false;
+}
+Error Registry::prepare_cache_update(const MapsCacheState* cache, MapsCacheState& next) const {
+  for (const auto& record : records_) {
+    if (!record.in_use || record.image.invalidated) continue;
+    if (!cache || record.cache.get() != cache) {
+      // A foreign residual page can change protection after this snapshot is
+      // published. Require a refresh before using it through this cache.
+      for (const auto& page : record.residue) {
+        VmaInfo vma;
+        Error coverage = next.lookup(page.page, vma, true);
+        if (coverage.code == ErrorCode::kOutOfBounds) continue;
+        if (coverage) return coverage;
+        if (Error e = next.remember_page(page.page, vma)) return e;
+        next.pages.find(page.page)->second.invalid = true;
+      }
+      continue;
+    }
+    for (const auto& slot : record.slots) {
+      VmaInfo vma;
+      if (Error e = next.lookup(slot.address & ~(uintptr_t(next.page_size) - 1), vma)) return e;
+      if (!vma.readable || vma.executable || vma.shared)
+        return Error::Make(ErrorCode::kPermissionDenied);
+    }
+    for (const auto& page : record.residue) {
+      VmaInfo vma;
+      if (Error e = next.lookup(page.page, vma)) return e;
+      int prot = prot_of(vma);
+      if (prot != page.original_prot && prot != (page.original_prot | kProtWrite))
+        return Error::Make(ErrorCode::kPermissionDenied);
+    }
+  }
+  return Error::Ok();
+}
+bool Registry::page_pending(uintptr_t page) const noexcept {
+  for (const auto& record : records_) {
+    if (!record.in_use || record.image.invalidated) continue;
+    for (const auto& residue : record.residue)
+      if (residue.page == page) return true;
+  }
+  return false;
+}
+bool Registry::fork_clean() const noexcept {
+  for (const auto& record : records_)
+    if (record.in_use && (record.state != GroupState::kInstalled || !record.residue.empty()))
+      return false;
+  return true;
+}
+void Registry::invalidate_cache(uint64_t id) noexcept {
+  auto* record = resolve(id);
+  if (!record || !record->cache) return;
+  for (const auto& slot : record->slots) {
+    auto page = slot.address & ~(uintptr_t(record->cache->page_size) - 1);
+    auto it = record->cache->pages.find(page);
+    if (it != record->cache->pages.end()) it->second.invalid = true;
+  }
+}
 }  // namespace yukiplt::detail

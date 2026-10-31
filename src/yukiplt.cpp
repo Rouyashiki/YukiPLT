@@ -13,6 +13,7 @@
 #include "common.hpp"
 #include "elf.hpp"
 #include "imports.hpp"
+#include "maps_cache.hpp"
 #include "memory.hpp"
 #include "registry.hpp"
 #include "system_images.hpp"
@@ -90,6 +91,7 @@ ImageIdentity identity_of(const ImageView& v) noexcept {
 template <typename Fn>
 bool run_on_system_image(const ImageIdentity& want, Fn&& fn, const char* want_path = nullptr,
                          detail::CauseContext* cause = nullptr) {
+  if (detail::process_entry()) return false;
 #if defined(__linux__) || defined(__ANDROID__)
   struct Ctx {
     const ImageIdentity* want;
@@ -280,8 +282,8 @@ void write_reports(SlotReport* reports, size_t cap, const detail::SmallVec<Plann
 template <typename PlanFn>
 HookResult install_planned(const ImageView& view, SlotReport* reports, size_t report_cap,
                            PlanFn&& plan_fn, RecoveryDiagnostic* diagnostic = nullptr,
-                           const char* system_path = nullptr,
-                           detail::CauseContext* cause = nullptr) {
+                           const char* system_path = nullptr, detail::CauseContext* cause = nullptr,
+                           MapsCache* cache = nullptr) {
   detail::SmallVec<PlannedSlot, 4> planned;
   Error plan = plan_fn(planned);
   if (plan) return {plan, detail_api::make(detail_api::invalid())};
@@ -315,7 +317,7 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
 
   // Reserve ownership of every slot before any write (one slot, one owner).
   SlotRecord recs[kMaxBatch];
-  uintptr_t slot_addrs[kMaxBatch];
+  uintptr_t slot_addrs[kMaxBatch]{};
   for (size_t i = 0; i < planned.size(); ++i) {
     recs[i].address = planned[i].address;
     recs[i].replacement = planned[i].replacement;
@@ -334,7 +336,25 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
     }
   } claim{reg, id};
 
-  Txn txn(detail::active_ops(), ps);
+  for (size_t i = 0; i < planned.size(); ++i)
+    if (reg.page_pending(slot_addrs[i] & ~(uintptr_t(ps) - 1)))
+      return {detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                 ErrorCause::kCacheConflict, cause),
+              HookHandle{}};
+  auto cache_state = cache ? detail::MapsCacheAccess::get(*cache) : nullptr;
+  if (cache) {
+    if (!cache_state || cache_state->invalid)
+      return {detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                 ErrorCause::kCacheInvalid, cause),
+              HookHandle{}};
+    if (Error e = reg.bind_cache(id, cache_state))
+      return {detail::with_cause(e,
+                                 e.code == ErrorCode::kOutOfBounds ? ErrorCause::kMapsCoverage
+                                                                   : ErrorCause::kCacheConflict,
+                                 cause),
+              HookHandle{}};
+  }
+  Txn txn(detail::active_ops(), ps, cache_state.get());
   Error prep = txn.prepare(slot_addrs, planned.size(), nullptr, 0, cause);
   if (prep) {
     return {prep, detail_api::make(detail_api::invalid())};
@@ -507,7 +527,8 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
 HookResult install(const ImageView& view, const InspectedImage& img, const HookRequest* reqs,
                    size_t count, SlotReport* reports, size_t report_cap,
                    RecoveryDiagnostic* diagnostic = nullptr, const char* system_path = nullptr,
-                   detail::CauseContext* cause = nullptr, bool require_nonnull = false) {
+                   detail::CauseContext* cause = nullptr, bool require_nonnull = false,
+                   MapsCache* cache = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
@@ -516,33 +537,35 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
           for (auto& slot : planned) slot.reject_zero_original = true;
         return error;
       },
-      diagnostic, system_path, cause);
+      diagnostic, system_path, cause, cache);
 }
 
 /// Versioned selector batch.
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const SelectedHookRequest* selected, size_t count, SlotReport* reports,
                    size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
-                   const char* system_path = nullptr, detail::CauseContext* cause = nullptr) {
+                   const char* system_path = nullptr, detail::CauseContext* cause = nullptr,
+                   MapsCache* cache = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
         return plan_selected_requests(img, selected, count, planned, cause);
       },
-      diagnostic, system_path, cause);
+      diagnostic, system_path, cause, cache);
 }
 
 /// Function selector batch (JUMP_SLOT + function GLOB_DAT).
 HookResult install(const ImageView& view, const InspectedImage& img,
                    const FunctionHookRequest* reqs, size_t count, SlotReport* reports,
                    size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
-                   const char* system_path = nullptr, detail::CauseContext* cause = nullptr) {
+                   const char* system_path = nullptr, detail::CauseContext* cause = nullptr,
+                   MapsCache* cache = nullptr) {
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
         return plan_function_requests(img, reqs, count, planned, cause);
       },
-      diagnostic, system_path, cause);
+      diagnostic, system_path, cause, cache);
 }
 
 }  // namespace
@@ -563,6 +586,7 @@ HookHandle& HookHandle::operator=(HookHandle&& o) noexcept {
 // once and fall back to a generic warning when it is held (for example by a
 // thread inside an operation), or when locking reports an error.
 void HookHandle::warn_if_installed() const noexcept {
+  if (detail::process_entry()) return;
   if (id_ == kInvalid) return;
   try {
     std::unique_lock<std::mutex> lock(detail::op_mutex(), std::try_to_lock);
@@ -588,6 +612,7 @@ void HookHandle::warn_if_installed() const noexcept {
 // image_from_soname
 
 Result<ImageView> image_from_soname(const char* soname) {
+  if (Error e = detail::process_entry()) return e;
 #if defined(__linux__) || defined(__ANDROID__)
   struct CallbackData {
     const char* target;
@@ -658,7 +683,10 @@ namespace {
 HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size_t count,
                            SlotReport* reports, RecoveryDiagnostic* diagnostic,
                            const char* expected_path = nullptr,
-                           detail::CauseContext* cause = nullptr, bool require_nonnull = false) {
+                           detail::CauseContext* cause = nullptr, bool require_nonnull = false,
+                           MapsCache* cache = nullptr) {
+  if (Error e = detail::process_entry())
+    return {detail::with_cause(e, ErrorCause::kForkProtocol, cause), HookHandle{}};
   auto fail = [](ErrorCode c) {
     return HookResult{Error::Make(c), detail_api::make(detail_api::invalid())};
   };
@@ -677,7 +705,7 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
         return fail(ErrorCode::kInvalidArgument);
       }
       return install(live, insp.value(), reqs, count, reports, count, diagnostic, system_path,
-                     cause, require_nonnull);
+                     cause, require_nonnull, cache);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
       return HookResult{detail::current_exception_error(detail::ExceptionOrigin::kInternal, cause),
@@ -721,8 +749,10 @@ HookResult hook_import(const ImageView& image, const ImportSelector& selector, v
 namespace {
 HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
                              const SelectedHookRequest* reqs, size_t count, SlotReport* reports,
-                             RecoveryDiagnostic* diagnostic,
-                             detail::CauseContext* cause = nullptr) {
+                             RecoveryDiagnostic* diagnostic, detail::CauseContext* cause = nullptr,
+                             MapsCache* cache = nullptr) {
+  if (Error e = detail::process_entry())
+    return {detail::with_cause(e, ErrorCause::kForkProtocol, cause), HookHandle{}};
   auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
   if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
   if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
@@ -742,7 +772,7 @@ HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
         return fail(detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
                                        ErrorCause::kOwnImage, cause));
       return install(live, inspected.value(), reqs, count, reports, count, diagnostic, system_path,
-                     cause);
+                     cause, cache);
     } catch (...) {
       // Never unwind through the loader's C callback frame.
       return fail(detail::current_exception_error(detail::ExceptionOrigin::kInternal, cause));
@@ -792,7 +822,9 @@ template <typename Request>
 HookResult hook_functions_impl(const ImageView& image, const char* expected_path,
                                const Request* reqs, size_t count, SlotReport* reports,
                                RecoveryDiagnostic* diagnostic = nullptr,
-                               detail::CauseContext* cause = nullptr) {
+                               detail::CauseContext* cause = nullptr, MapsCache* cache = nullptr) {
+  if (Error e = detail::process_entry())
+    return {detail::with_cause(e, ErrorCause::kForkProtocol, cause), HookHandle{}};
   auto fail = [](Error error) { return HookResult{error, HookHandle{}}; };
   if (reqs == nullptr) return fail(Error::Make(ErrorCode::kNullPointer));
   if (count == 0 || count > kMaxBatch) return fail(Error::Make(ErrorCode::kInvalidArgument));
@@ -817,10 +849,10 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
             [&](detail::SmallVec<PlannedSlot, 4>& planned) {
               return plan_function_requests(inspected.value(), reqs, count, planned, cause);
             },
-            diagnostic, system_path, cause);
+            diagnostic, system_path, cause, cache);
       } else {
         return install(live, inspected.value(), reqs, count, reports, count, diagnostic,
-                       system_path, cause);
+                       system_path, cause, cache);
       }
     } catch (...) {
       // Never unwind through the loader's C callback frame.
@@ -852,8 +884,8 @@ HookResult hook_functions_impl(const ImageView& image, const char* expected_path
 namespace yukiplt::detail {
 HookResult hook_function_imports_at(const ImageView& image, const char* expected_path,
                                     const FunctionHookRequest* reqs, size_t count,
-                                    SlotReport* reports) {
-  return hook_functions_impl(image, expected_path, reqs, count, reports);
+                                    SlotReport* reports, MapsCache* cache) {
+  return hook_functions_impl(image, expected_path, reqs, count, reports, nullptr, nullptr, cache);
 }
 }  // namespace yukiplt::detail
 
@@ -867,17 +899,18 @@ HookResult hook_function_imports_ex(const ImageView& image, const FunctionHookRe
 
 HookResult detail::hook_imports_at(const ImageView& image, const char* expected_path,
                                    const SelectedHookRequest* reqs, size_t count,
-                                   SlotReport* reports) {
-  return hook_imports_impl(image, expected_path, reqs, count, reports, nullptr);
+                                   SlotReport* reports, MapsCache* cache) {
+  return hook_imports_impl(image, expected_path, reqs, count, reports, nullptr, nullptr, cache);
 }
 
 HookResult detail::hook_function_imports_ex_at(const ImageView& image, const char* expected_path,
                                                const FunctionHookRequestEx* reqs, size_t count,
-                                               SlotReport* reports,
-                                               RecoveryDiagnostic* diagnostic) {
+                                               SlotReport* reports, RecoveryDiagnostic* diagnostic,
+                                               MapsCache* cache) {
   RecoveryDiagnostic value;
   value.stage = OperationStage::kPrepare;
-  auto result = hook_functions_impl(image, expected_path, reqs, count, reports, &value);
+  auto result =
+      hook_functions_impl(image, expected_path, reqs, count, reports, &value, nullptr, cache);
   value.error = result.error;
   value.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
   if (diagnostic) *diagnostic = value;
@@ -892,7 +925,8 @@ namespace {
 /// be mapped right now: for a system image, because we are inside
 /// dl_iterate_phdr; for a custom image, by the caller's contract.
 Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* reports, size_t cap,
-                 RecoveryDiagnostic* diagnostic = nullptr, detail::CauseContext* cause = nullptr) {
+                 RecoveryDiagnostic* diagnostic = nullptr, detail::CauseContext* cause = nullptr,
+                 MapsCache* cache = nullptr) {
   Registry& reg = Registry::instance();
   // Mirror each recorded stage into the caller's immediate diagnostic too.
   auto record = [&](const RecoveryDiagnostic& value) {
@@ -913,6 +947,17 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   size_t slot_count = 0;
   PageResidueRecord pages[kMaxBatch];
   size_t page_count = 0;
+  auto cache_state = cache ? detail::MapsCacheAccess::get(*cache) : nullptr;
+  if (cache && image_live) {
+    if (!cache_state || cache_state->invalid)
+      return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kCacheInvalid,
+                                cause);
+    if (Error e = reg.bind_cache(id, cache_state))
+      return detail::with_cause(e,
+                                e.code == ErrorCode::kOutOfBounds ? ErrorCause::kMapsCoverage
+                                                                  : ErrorCause::kCacheConflict,
+                                cause);
+  }
   Error begin =
       reg.begin_restore(id, image, recs, kMaxBatch, &slot_count, pages, kMaxBatch, &page_count);
   if (begin) {
@@ -933,6 +978,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
 
   // A system image that we could not find under the linker lock is gone.
   if (!image_live) {
+    reg.invalidate_cache(id);
     reg.finish_restore(id, true, GroupState::kInstalled, nullptr, 0, nullptr, 0);
     detail_api::set(handle, detail_api::invalid());
     if (diagnostic) *diagnostic = {};
@@ -954,7 +1000,7 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   for (size_t i = 0; i < slot_count; ++i) slot_addrs[i] = recs[i].address;
   for (size_t i = 0; i < page_count; ++i) extra_pages[i] = pages[i].page;
 
-  Txn txn(detail::active_ops(), ps);
+  Txn txn(detail::active_ops(), ps, cache_state.get(), true);
   Error prep;
   try {
     prep = txn.prepare(slot_count > 0 ? slot_addrs : nullptr, slot_count,
@@ -975,6 +1021,25 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     return prep;
   }
 
+  if (cache_state) {
+    for (size_t i = 0; i < page_count; ++i) {
+      auto found = cache_state->pages.find(pages[i].page);
+      if (found == cache_state->pages.end() || found->second.invalid || !found->second.unknown)
+        continue;
+      const int error = txn.repair_page(pages[i].page, pages[i].original_prot);
+      if (error) {
+        pages[i].sys_errno = error;
+        reg.finish_restore(id, false, GroupState::kIndeterminate, recs, slot_count, pages,
+                           page_count);
+        Error failure = Error::Sys(ErrorCode::kIndeterminate, error);
+        record({OperationStage::kRestorePages, failure, 0, error, false, false, page_count});
+        return failure;
+      }
+      found->second.unknown = false;
+      found->second.vma.readable = (pages[i].original_prot & detail::kProtRead) != 0;
+      found->second.vma.writable = (pages[i].original_prot & detail::kProtWrite) != 0;
+    }
+  }
   // Never-written slots need no recovery. CAS replacement to original; accept
   // already-original values and preserve conflicting third-party values.
   SlotOp ops[kMaxBatch];
@@ -1000,8 +1065,8 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
     r = txn.commit(ops, op_count, CommitMode::kAllOrNothing);
   }
 
-  // Restore residual pages after CAS using live maps: accept original protection,
-  // restore raised protection, and retain conflicts with third-party protection.
+  // Cached recovery confirms every residual target with mprotect, including
+  // when a refreshed snapshot reports the original protection.
   PageResidueRecord leftover[kMaxBatch];
   size_t leftover_count = 0;
   int restore_errno = r.restore_errno;
@@ -1013,8 +1078,9 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
       continue;
     }
     const int live_prot = detail::prot_of(live);
-    if (live_prot == pages[i].original_prot) continue;
-    const bool conflict = live_prot != (pages[i].original_prot | detail::kProtWrite);
+    if (live_prot == pages[i].original_prot && !cache_state) continue;
+    const bool conflict = live_prot != pages[i].original_prot &&
+                          live_prot != (pages[i].original_prot | detail::kProtWrite);
     const int error = conflict ? 0 : txn.protect_page(pages[i].page, pages[i].original_prot);
     if (conflict || error != 0) {
       pages[i].sys_errno = error;
@@ -1151,7 +1217,9 @@ Error peek_image(uint64_t id, ImageIdentity& out) {
 
 namespace {
 Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
-                  RecoveryDiagnostic* diagnostic, detail::CauseContext* cause = nullptr) {
+                  RecoveryDiagnostic* diagnostic, detail::CauseContext* cause = nullptr,
+                  MapsCache* cache = nullptr) {
+  if (Error e = detail::process_entry()) return e;
   if (!handle.valid())
     return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kHandleInvalid,
                               cause);
@@ -1188,20 +1256,22 @@ Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
       bool matched = run_on_system_image(
           image,
           [&](const ImageView&) {
-            result = do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic, cause);
+            result =
+                do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic, cause, cache);
           },
           system_path.c_str(), cause);
       if (!matched) {
         // The image is gone: consume the handle without touching memory.
         std::lock_guard<std::mutex> lock(detail::op_mutex());
-        return do_restore(id, handle, /*image_live=*/false, reports, cap, diagnostic, cause);
+        return do_restore(id, handle, /*image_live=*/false, reports, cap, diagnostic, cause, cache);
       }
       return result;
     }
 
     // Custom image (or already-forgotten): the caller guarantees mapping.
     std::lock_guard<std::mutex> lock(detail::op_mutex());
-    return do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic, cause);
+    return do_restore(id, handle, /*image_live=*/true, reports, cap, diagnostic, cause,
+                      image.invalidated ? nullptr : cache);
   } catch (...) {
     return detail::current_exception_error(detail::ExceptionOrigin::kInternal, cause);
   }
@@ -1283,6 +1353,7 @@ template <typename Snapshot, typename Collect>
 Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metadata,
                                   const char* expected_path = nullptr,
                                   detail::CauseContext* cause = nullptr) {
+  if (Error e = detail::process_entry()) return e;
   if (image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
   if (image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   // Contain every exception inside the callable as well: it runs inside a C
@@ -1577,10 +1648,15 @@ Result<std::string> detail::system_image_path(const ImageView& image) {
 }
 
 Error detail::verify_installed_bindings(InstalledBindingVerification* entries, size_t count,
-                                        BindingVerificationStatistics* statistics) {
+                                        BindingVerificationStatistics* statistics,
+                                        MapsCache* cache) {
   if (statistics) *statistics = {};
   if (count == 0) return Error::Ok();
   if (entries == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  if (Error e = detail::process_entry()) return e;
+  auto cache_state = cache ? detail::MapsCacheAccess::get(*cache) : nullptr;
+  if (cache && (!cache_state || cache_state->invalid))
+    return Error::Make(ErrorCode::kInvalidArgument);
   try {
     struct Work {
       size_t index;
@@ -1660,6 +1736,11 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
           entry.error = Error::Make(ErrorCode::kInvalidArgument);
           continue;
         }
+        if (cache) {
+          entry.error =
+              Registry::instance().check_cache(detail_api::id(*entry.handle), cache_state.get());
+          if (entry.error) continue;
+        }
         item.eligible = true;
         addresses.push_back(item.slot.address);  // capacity reserved before enumeration
       }
@@ -1667,12 +1748,12 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
       std::sort(addresses.begin(), addresses.end());
       addresses.erase(std::unique(addresses.begin(), addresses.end()), addresses.end());
       const size_t ps = detail::page_size();
-      Txn transaction(detail::active_ops(), ps);
+      Txn transaction(detail::active_ops(), ps, cache_state.get());
       Error prepared;
       if (ps == 0) {
         prepared = Error::Make(ErrorCode::kUnsupportedFormat);
       } else {
-        if (statistics) ++statistics->maps_reads;
+        if (statistics && !cache) ++statistics->maps_reads;
         prepared = transaction.prepare(addresses.data(), addresses.size());
       }
       if (prepared.code == ErrorCode::kOutOfMemory) return prepared;
@@ -1726,6 +1807,7 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
 }
 
 Error abandon(HookHandle& handle) {
+  if (Error e = detail::process_entry()) return e;
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -1740,10 +1822,11 @@ Error abandon(HookHandle& handle) {
 namespace {
 /// Read live values under the operation lock and, for system images, linker lock.
 /// Try one maps read for the group; fall back to individual slots on failure.
-void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* out, size_t cap) {
+Error fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* out, size_t cap,
+                 detail::MapsCacheState* cache = nullptr) {
   const size_t ps = detail::page_size();
   const size_t filled = n < cap ? n : cap;
-  if (out == nullptr) return;
+  if (out == nullptr) return Error::Ok();
   for (size_t i = 0; i < filled; ++i) {
     out[i].address = recs[i].address;
     out[i].value_before = recs[i].original;
@@ -1753,12 +1836,13 @@ void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* o
     // observed value from the recorded replacement.
     out[i].status = SlotStatus::kUntouched;
   }
-  if (ps == 0 || !live_image || filled == 0) return;
+  if (ps == 0 || !live_image || filled == 0) return Error::Ok();
 
   uintptr_t addrs[kMaxBatch];
   for (size_t i = 0; i < filled; ++i) addrs[i] = recs[i].address;
-  Txn all(detail::active_ops(), ps);
-  if (!all.prepare(addrs, filled)) {
+  Txn all(detail::active_ops(), ps, cache);
+  Error prepared = all.prepare(addrs, filled);
+  if (!prepared) {
     for (size_t i = 0; i < filled; ++i) {
       uintptr_t cur = 0;
       if (all.load(recs[i].address, cur)) {
@@ -1766,10 +1850,11 @@ void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* o
         out[i].status = SlotStatus::kInstalled;
       }
     }
-    return;
+    return Error::Ok();
   }
+  if (cache) return prepared;
   for (size_t i = 0; i < filled; ++i) {
-    Txn txn(detail::active_ops(), ps);
+    Txn txn(detail::active_ops(), ps, cache);
     uintptr_t one = recs[i].address;
     if (!txn.prepare(&one, 1)) {
       uintptr_t cur = 0;
@@ -1779,10 +1864,15 @@ void fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* o
       }
     }
   }
+  return Error::Ok();
 }
 }  // namespace
 
-Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count) {
+static Error query_impl(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count,
+                        MapsCache* cache = nullptr) {
+  if (Error e = detail::process_entry()) return e;
+  auto state = cache ? detail::MapsCacheAccess::get(*cache) : nullptr;
+  if (cache && (!state || state->invalid)) return Error::Make(ErrorCode::kInvalidArgument);
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   const uint64_t id = detail_api::id(handle);
   try {
@@ -1796,6 +1886,9 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
     size_t n = 0;
     {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
+      if (cache) {
+        if (Error e = Registry::instance().check_cache(id, state.get())) return e;
+      }
       Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
       if (snap) return snap;
       // Count-only and recorded recovery queries do not need a path copy or
@@ -1816,20 +1909,27 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
           [&](const ImageView&) {
             // Re-snapshot under the op lock: the group may have changed or been
             // released between the two lock acquisitions.
+            if (cache) {
+              result = Registry::instance().check_cache(id, state.get());
+              if (result) return;
+            }
             result = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
             if (result) return;
             if (n > kMaxBatch) n = kMaxBatch;
-            fill_query(recs, n, /*live_image=*/true, out, cap);
+            result = fill_query(recs, n, /*live_image=*/true, out, cap, state.get());
           },
           system_path.c_str());
-      if (!matched) fill_query(recs, n, /*live_image=*/false, out, cap);
+      if (!matched) (void)fill_query(recs, n, /*live_image=*/false, out, cap, state.get());
       if (result) return result;
     } else {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
+      if (cache) {
+        if (Error e = Registry::instance().check_cache(id, state.get())) return e;
+      }
       Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
       if (snap) return snap;
       if (n > kMaxBatch) n = kMaxBatch;
-      fill_query(recs, n, !image.invalidated, out, cap);
+      if (Error e = fill_query(recs, n, !image.invalidated, out, cap, state.get())) return e;
     }
     if (count != nullptr) *count = n;
     return Error::Ok();
@@ -1838,7 +1938,16 @@ Error query(const HookHandle& handle, SlotReport* out, size_t cap, size_t* count
   }
 }
 
+Error query(const HookHandle& h, SlotReport* out, size_t cap, size_t* count) {
+  return query_impl(h, out, cap, count);
+}
+Error query_cached(MapsCache& cache, const HookHandle& h, SlotReport* out, size_t cap,
+                   size_t* count) {
+  return query_impl(h, out, cap, count, &cache);
+}
+
 Error forget_image(const ImageView& custom_image) {
+  if (Error e = detail::process_entry()) return e;
   if (custom_image.instance_token == 0) return Error::Make(ErrorCode::kInvalidArgument);
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -1851,6 +1960,7 @@ Error forget_image(const ImageView& custom_image) {
 
 Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, ResidualPage* pages,
                      size_t capacity) {
+  if (Error e = detail::process_entry()) return e;
   if (diagnostic == nullptr || (pages == nullptr && capacity != 0))
     return Error::Make(ErrorCode::kNullPointer);
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1889,10 +1999,11 @@ constexpr CausePolicy policy(ErrorCode code) noexcept {
       return {C::kMetadataBounds,
               bit(C::kMetadataBounds) | bit(C::kScanBudget) | bit(C::kMapsCoverage)};
     case ErrorCode::kInvalidArgument:
-      return {C::kInvalidRequest, bit(C::kInvalidRequest) | bit(C::kHandleInvalid) |
-                                      bit(C::kOwnImage) | bit(C::kDuplicateTarget) |
-                                      bit(C::kOutputAlias) | bit(C::kReplacementIsCurrent) |
-                                      bit(C::kOriginalCapacity) | bit(C::kHostCallback)};
+      return {C::kInvalidRequest,
+              bit(C::kCacheInvalid) | bit(C::kCacheConflict) | bit(C::kForkProtocol) |
+                  bit(C::kInvalidRequest) | bit(C::kHandleInvalid) | bit(C::kOwnImage) |
+                  bit(C::kDuplicateTarget) | bit(C::kOutputAlias) | bit(C::kReplacementIsCurrent) |
+                  bit(C::kOriginalCapacity) | bit(C::kHostCallback)};
     case ErrorCode::kNullPointer:
       return {C::kInvalidRequest, bit(C::kInvalidRequest)};
     case ErrorCode::kPermissionDenied:
@@ -1953,3 +2064,96 @@ void* load_original(void* const* storage) noexcept {
 extern "C" YUKIPLT_API void* yukiplt_c_load_original(void* const* storage) noexcept {
   return yukiplt::load_original(storage);
 }
+
+namespace yukiplt {
+HookResult hook_batch_cached(MapsCache& cache, const ImageView& image, const HookRequest* reqs,
+                             size_t count, SlotReport* reports, OperationDiagnostic* diagnostic) {
+  return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded,
+                                           detail::CauseContext* cause) {
+    return hook_batch_impl(image, reqs, count, reports, recorded, nullptr, cause, false, &cache);
+  });
+}
+HookResult hook_batch_named_cached(MapsCache& cache, const NamedImage& image,
+                                   const HookRequest* reqs, size_t count, SlotReport* reports,
+                                   OperationDiagnostic* diagnostic) {
+  if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
+    Error error = Error::Make(ErrorCode::kInvalidArgument);
+    finish_diagnostic(diagnostic, {}, error);
+    return {error, HookHandle{}};
+  }
+  return diagnosed_install(diagnostic,
+                           [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+                             return hook_batch_impl(image.image, reqs, count, reports, recorded,
+                                                    image.path.c_str(), cause, false, &cache);
+                           });
+}
+HookResult hook_imports_cached(MapsCache& cache, const ImageView& image,
+                               const SelectedHookRequest* reqs, size_t count, SlotReport* reports,
+                               OperationDiagnostic* diagnostic) {
+  return diagnosed_install(
+      diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+        return hook_imports_impl(image, nullptr, reqs, count, reports, recorded, cause, &cache);
+      });
+}
+HookResult hook_imports_named_cached(MapsCache& cache, const NamedImage& image,
+                                     const SelectedHookRequest* reqs, size_t count,
+                                     SlotReport* reports, OperationDiagnostic* diagnostic) {
+  if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
+    Error error = Error::Make(ErrorCode::kInvalidArgument);
+    finish_diagnostic(diagnostic, {}, error);
+    return {error, HookHandle{}};
+  }
+  return diagnosed_install(diagnostic,
+                           [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+                             return hook_imports_impl(image.image, image.path.c_str(), reqs, count,
+                                                      reports, recorded, cause, &cache);
+                           });
+}
+HookResult hook_function_imports_cached(MapsCache& cache, const ImageView& image,
+                                        const FunctionHookRequestEx* reqs, size_t count,
+                                        SlotReport* reports, OperationDiagnostic* diagnostic) {
+  return diagnosed_install(
+      diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+        return hook_functions_impl(image, nullptr, reqs, count, reports, recorded, cause, &cache);
+      });
+}
+HookResult hook_function_imports_named_cached(MapsCache& cache, const NamedImage& image,
+                                              const FunctionHookRequestEx* reqs, size_t count,
+                                              SlotReport* reports,
+                                              OperationDiagnostic* diagnostic) {
+  if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
+    Error error = Error::Make(ErrorCode::kInvalidArgument);
+    finish_diagnostic(diagnostic, {}, error);
+    return {error, HookHandle{}};
+  }
+  return diagnosed_install(diagnostic,
+                           [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+                             return hook_functions_impl(image.image, image.path.c_str(), reqs,
+                                                        count, reports, recorded, cause, &cache);
+                           });
+}
+HookResult hook_batch_nonnull_named_cached(MapsCache& cache, const NamedImage& image,
+                                           const HookRequest* reqs, size_t count,
+                                           SlotReport* reports, OperationDiagnostic* diagnostic) {
+  if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
+    Error error = Error::Make(ErrorCode::kInvalidArgument);
+    finish_diagnostic(diagnostic, {}, error);
+    return {error, HookHandle{}};
+  }
+  return diagnosed_install(diagnostic,
+                           [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
+                             return hook_batch_impl(image.image, reqs, count, reports, recorded,
+                                                    image.path.c_str(), cause, true, &cache);
+                           });
+}
+Error unhook_cached(MapsCache& cache, HookHandle& handle, SlotReport* reports, size_t cap,
+                    OperationDiagnostic* diagnostic) {
+  detail::CauseContext cause;
+  RecoveryDiagnostic recorded;
+  bool held = handle.valid();
+  Error error = unhook_impl(handle, reports, cap, &recorded, &cause, &cache);
+  finish_diagnostic(diagnostic, recorded, error, &cause);
+  if (diagnostic) diagnostic->handle_consumed = held && !handle.valid();
+  return error;
+}
+}  // namespace yukiplt

@@ -329,3 +329,81 @@ yukiplt_c_error yukiplt_c_rule_report_copy(const yukiplt_c_rule_report* h,
   });
 }
 }  // extern "C"
+
+extern "C" {
+yukiplt_c_error yukiplt_c_rules_refresh_cached(const yukiplt_c_maps_cache* cache,
+                                               yukiplt_c_rules* h,
+                                               yukiplt_c_rule_report* out) noexcept {
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.refresh_cached(lease->value, report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+yukiplt_c_error yukiplt_c_rules_unhook_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
+                                              yukiplt_c_rule_report* out) noexcept {
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.unhook_cached(lease->value, report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+yukiplt_c_error yukiplt_c_rules_release_image_cached(const yukiplt_c_maps_cache* cache,
+                                                     yukiplt_c_rules* h, const yukiplt_c_image* v,
+                                                     yukiplt_c_rule_report* out) noexcept {
+  if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.release_image_cached(lease->value, image(*v), report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+yukiplt_c_error yukiplt_c_rules_notify_loaded_cached(const yukiplt_c_maps_cache* cache,
+                                                     yukiplt_c_rules* h, const yukiplt_c_image* v,
+                                                     const char* path,
+                                                     yukiplt_c_rule_report* out) noexcept {
+  if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.notify_loaded_cached(lease->value, image(*v), path, report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+yukiplt_c_error yukiplt_c_rules_notify_unloading_cached(const yukiplt_c_maps_cache* cache,
+                                                        yukiplt_c_rules* h,
+                                                        const yukiplt_c_image* v,
+                                                        yukiplt_c_rule_report* out) noexcept {
+  if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.notify_unloading_cached(lease->value, image(*v), report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+yukiplt_c_error yukiplt_c_rules_remove_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
+                                              uint64_t id, yukiplt_c_rule_report* out) noexcept {
+  return boundary([&]() -> Error {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    auto result = run(h, out, [&](RuleSet& r, RuleOperationReport& report) {
+      return r.remove_rule_cached(lease->value, id, report);
+    });
+    return Error::Sys(static_cast<ErrorCode>(result.code), result.sys_errno);
+  });
+}
+}

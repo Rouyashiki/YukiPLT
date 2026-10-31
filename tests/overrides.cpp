@@ -25,4 +25,14 @@ ImageEnumerator wrapped_image_enumerator() noexcept {
 void set_active_image_enumerator(ImageEnumerator enumerator) noexcept {
   g_image_enumerator.store(enumerator, std::memory_order_release);
 }
+std::atomic<SystemIterator> g_system_iterator{nullptr};
+void set_system_iterator(SystemIterator iterator) noexcept {
+  g_system_iterator.store(iterator, std::memory_order_release);
+}
 }  // namespace yukiplt::detail
+
+extern "C" int __real_dl_iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* data);
+extern "C" int __wrap_dl_iterate_phdr(int (*callback)(dl_phdr_info*, size_t, void*), void* data) {
+  auto iterator = yukiplt::detail::g_system_iterator.load(std::memory_order_acquire);
+  return iterator ? iterator(callback, data) : __real_dl_iterate_phdr(callback, data);
+}

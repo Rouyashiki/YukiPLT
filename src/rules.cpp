@@ -12,6 +12,7 @@
 
 #include "common.hpp"
 #include "imports.hpp"
+#include "maps_cache.hpp"
 #include "system_images.hpp"
 #include "yukiplt.hpp"
 
@@ -122,6 +123,7 @@ size_t RuleSet::retained_for(uint64_t rule_id, const ImageView* image,
 Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
                                    const FunctionImportSelector& selector, void* replacement,
                                    void** out_originals, size_t capacity) {
+  if (Error e = detail::process_entry()) return e;
   if (next_rule_id_ == 0) return Error::Make(ErrorCode::kIntegerOverflow);
   if (replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
   // Validate the filter and selector up front (same rules as find_images() and
@@ -158,6 +160,7 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
 
 Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter, const ImportSelector& selector,
                                    void* replacement, void** out_originals, size_t capacity) {
+  if (Error e = detail::process_entry()) return e;
   // Promote a plain name/version selector to a JUMP_SLOT-only function selector.
   FunctionImportSelector func;
   func.base = selector;
@@ -224,7 +227,7 @@ bool filter_matches(const ImageSelector& filter, const ImageView& image,
 // the linker lock (null: no path check).
 void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
                                   const char* expected_path, RuleSummary& summary,
-                                  RuleOperationEvent* event) {
+                                  RuleOperationEvent* event, MapsCache* cache) {
   const size_t existing = find_binding(rule.id, image);
   if (event && existing != ~size_t{0}) {
     event->binding_index = existing;
@@ -309,7 +312,7 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
   SlotReport report{};
   if (!capacity_refused) {
     FunctionHookRequest request{rule.selector, rule.replacement, out};
-    result = detail::hook_function_imports_at(image, expected_path, &request, 1, &report);
+    result = detail::hook_function_imports_at(image, expected_path, &request, 1, &report, cache);
   }
 
   if (new_binding) {
@@ -362,20 +365,26 @@ void RuleSet::record_verification(size_t index, Error error, RuleSummary& summar
   event.attempted = true;
 }
 
-RuleSummary RuleSet::refresh() {
+RuleSummary RuleSet::refresh_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   RuleOperationReport report;
-  return refresh(report);
+  return refresh_impl(report, cache);
 }
+RuleSummary RuleSet::refresh() { return refresh_impl(nullptr); }
+RuleSummary RuleSet::refresh_cached(MapsCache& cache) { return refresh_impl(&cache); }
 
 namespace {
 
 // Undo one binding through the public unhook(), updating its state.  Returns
 // true on a clean release.
-bool undo_binding(RuleBinding& binding, HookHandle& handle, RuleSummary& summary) {
+bool undo_binding(RuleBinding& binding, HookHandle& handle, RuleSummary& summary,
+                  MapsCache* cache) {
   if (!handle.valid()) return false;
   ++summary.attempted;
   SlotReport report{};
-  Error error = yukiplt::unhook(handle, &report, 1);
+  Error error = cache ? yukiplt::unhook_cached(*cache, handle, &report, 1)
+                      : yukiplt::unhook(handle, &report, 1);
   binding.restore_report = report;
   binding.error = error;
   if (!error) {
@@ -396,18 +405,29 @@ bool undo_binding(RuleBinding& binding, HookHandle& handle, RuleSummary& summary
 
 }  // namespace
 
-RuleSummary RuleSet::release_image(const ImageView& image) {
+RuleSummary RuleSet::release_image_impl(const ImageView& image, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   RuleSummary summary;
   // Reverse order so dependent installs undo last-in-first-out.
   for (size_t n = bindings_.size(); n-- > 0;) {
     if (!same_image(bindings_[n].image, image)) continue;
-    undo_binding(bindings_[n], handles_[n], summary);
+    undo_binding(bindings_[n], handles_[n], summary, cache);
   }
   summary.retained = retained_for(0, &image);
   return summary;
 }
+RuleSummary RuleSet::release_image(const ImageView& image) {
+  return release_image_impl(image, nullptr);
+}
+RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image) {
+  return release_image_impl(image, &cache);
+}
 
-RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
+RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path,
+                                        MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   RuleSummary summary;
   // A loader notifies about a specific custom instance; a system image (token 0)
   // has no stable instance identity here and is handled through refresh().
@@ -420,7 +440,7 @@ RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
     if (rule.removed) continue;
     rebind_selector(rule);
     if (!filter_matches(rule.filter, image, path)) continue;
-    apply_rule_to_image(rule, image, path, nullptr, summary);
+    apply_rule_to_image(rule, image, path, nullptr, summary, nullptr, cache);
   }
   summary.retained = 0;
   for (const auto& rule : rules_)
@@ -428,15 +448,32 @@ RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
       summary.retained += retained_for(rule.id, &image);
   return summary;
 }
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
+  return notify_loaded_impl(image, path, nullptr);
+}
+RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                          const char* path) {
+  return notify_loaded_impl(image, path, &cache);
+}
 
-RuleSummary RuleSet::notify_unloading(const ImageView& image) {
+RuleSummary RuleSet::notify_unloading_impl(const ImageView& image, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   if (image.instance_token == 0) return {1, 0, 1, 0};
   // Undo exactly this instance's bindings; identical to release_image(), named
   // for the loader lifecycle pairing with notify_loaded().
-  return release_image(image);
+  return release_image_impl(image, cache);
+}
+RuleSummary RuleSet::notify_unloading(const ImageView& image) {
+  return notify_unloading_impl(image, nullptr);
+}
+RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image) {
+  return notify_unloading_impl(image, &cache);
 }
 
-RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
+RuleSummary RuleSet::remove_rule_impl(uint64_t rule_id, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   RuleSummary summary;
   Rule* rule = find_rule(rule_id);
   if (rule == nullptr) {
@@ -446,7 +483,7 @@ RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
   }
   for (size_t n = bindings_.size(); n-- > 0;) {
     if (bindings_[n].rule_id != rule_id) continue;
-    undo_binding(bindings_[n], handles_[n], summary);
+    undo_binding(bindings_[n], handles_[n], summary, cache);
   }
   // Stop participating in future refreshes regardless; a retained failed handle
   // is still reachable through bindings()/unhook() for a retry.
@@ -454,15 +491,25 @@ RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
   summary.retained = retained_for(rule_id);
   return summary;
 }
+RuleSummary RuleSet::remove_rule(uint64_t rule_id) { return remove_rule_impl(rule_id, nullptr); }
+RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id) {
+  return remove_rule_impl(rule_id, &cache);
+}
 
-RuleSummary RuleSet::unhook() {
+RuleSummary RuleSet::unhook_impl(MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   RuleSummary summary;
-  for (size_t n = bindings_.size(); n-- > 0;) undo_binding(bindings_[n], handles_[n], summary);
+  for (size_t n = bindings_.size(); n-- > 0;)
+    undo_binding(bindings_[n], handles_[n], summary, cache);
   summary.retained = retained_for();
   return summary;
 }
+RuleSummary RuleSet::unhook() { return unhook_impl(nullptr); }
+RuleSummary RuleSet::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
 
 RuleSummary RuleSet::abandon() {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   RuleSummary summary;
   for (size_t n = bindings_.size(); n-- > 0;) {
     if (!handles_[n].valid()) continue;
@@ -489,6 +536,7 @@ RuleSetStatistics RuleSet::statistics() const noexcept {
 }
 
 Result<size_t> RuleSet::prune_history() {
+  if (Error e = detail::process_entry()) return e;
   const auto removable = [&](size_t i) {
     return !handles_[i].valid() && (bindings_[i].state == RuleState::kReleased ||
                                     bindings_[i].state == RuleState::kInvalidated);
@@ -562,19 +610,21 @@ RuleSummary report_failure(RuleOperationReport& report, Error error, size_t reta
 }
 }  // namespace
 
-RuleSummary RuleSet::refresh(RuleOperationReport& report) {
+RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   reset_report(report);
   std::vector<detail::InstalledBindingVerification> verification;
   std::vector<size_t> verification_events;
   try {
     // Finish enumeration and all diagnostic string allocation before the first
     // installation. An enumeration error belongs to its rule, not to an unload.
-    RefreshImages cache;
+    RefreshImages enumeration_cache;
     std::unordered_set<BindingKey, BindingKeyHash> targets;
     for (auto& rule : rules_) {
       if (rule.removed) continue;
       rebind_selector(rule);
-      const auto& images = cache.get(rule.filter);
+      const auto& images = enumeration_cache.get(rule.filter);
       if (!images) {
         RuleOperationEvent event;
         event.rule_id = rule.id;
@@ -614,7 +664,8 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
                               {}});
       verification_events.push_back(i);
     }
-    if (Error error = detail::verify_installed_bindings(verification.data(), verification.size()))
+    if (Error error = detail::verify_installed_bindings(verification.data(), verification.size(),
+                                                        nullptr, cache))
       return report_failure(report, error, 0);
   } catch (...) {
     return report_failure(report, detail::current_exception_error(), 0);
@@ -631,7 +682,8 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
       continue;
     }
     Rule& rule = *rule_by_id(event.rule_id);
-    apply_rule_to_image(rule, event.image, event.path.c_str(), event.path.c_str(), summary, &event);
+    apply_rule_to_image(rule, event.image, event.path.c_str(), event.path.c_str(), summary, &event,
+                        cache);
   }
   summary.retained = 0;
   for (const auto& event : report.events)
@@ -639,9 +691,15 @@ RuleSummary RuleSet::refresh(RuleOperationReport& report) {
       ++summary.retained;
   return summary;
 }
+RuleSummary RuleSet::refresh(RuleOperationReport& report) { return refresh_impl(report, nullptr); }
+RuleSummary RuleSet::refresh_cached(MapsCache& cache, RuleOperationReport& report) {
+  return refresh_impl(report, &cache);
+}
 
-RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
-                                   RuleOperationReport& report) {
+RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path,
+                                        RuleOperationReport& report, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   // Inputs may refer to the previous report's owned metadata.
   RuleOperationReport previous = std::move(report);
   report = {};
@@ -671,10 +729,18 @@ RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
   RuleSummary summary;
   for (auto& event : report.events)
     apply_rule_to_image(*rule_by_id(event.rule_id), image, event.path.c_str(), nullptr, summary,
-                        &event);
+                        &event, cache);
   summary.retained = 0;
   for (const auto& event : report.events) summary.retained += retained_for(event.rule_id, &image);
   return summary;
+}
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
+                                   RuleOperationReport& report) {
+  return notify_loaded_impl(image, path, report, nullptr);
+}
+RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                          const char* path, RuleOperationReport& report) {
+  return notify_loaded_impl(image, path, report, &cache);
 }
 
 Error RuleSet::prepare_undo_report(RuleOperationReport& report, uint64_t rule_id,
@@ -728,37 +794,78 @@ void RuleSet::finish_undo_report(RuleOperationReport& report) const {
   }
 }
 
-RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report) {
+RuleSummary RuleSet::release_image_impl(const ImageView& image, RuleOperationReport& report,
+                                        MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   const ImageView target = image;  // image may live in the report being replaced.
   if (Error e = prepare_undo_report(report, 0, &target, RuleOperationStage::kRestore))
     return {0, 0, 1, retained_for(0, &target)};
-  auto summary = release_image(target);
+  auto summary = release_image_impl(target, cache);
   finish_undo_report(report);
   return summary;
 }
-RuleSummary RuleSet::notify_unloading(const ImageView& image, RuleOperationReport& report) {
+RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report) {
+  return release_image_impl(image, report, nullptr);
+}
+RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image,
+                                          RuleOperationReport& report) {
+  return release_image_impl(image, report, &cache);
+}
+
+RuleSummary RuleSet::notify_unloading_impl(const ImageView& image, RuleOperationReport& report,
+                                           MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   if (image.instance_token == 0)
     return report_failure(report, Error::Make(ErrorCode::kInvalidArgument), 0);
-  return release_image(image, report);
+  return release_image_impl(image, report, cache);
 }
-RuleSummary RuleSet::remove_rule(uint64_t rule_id, RuleOperationReport& report) {
+RuleSummary RuleSet::notify_unloading(const ImageView& image, RuleOperationReport& report) {
+  return notify_unloading_impl(image, report, nullptr);
+}
+RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image,
+                                             RuleOperationReport& report) {
+  return notify_unloading_impl(image, report, &cache);
+}
+
+RuleSummary RuleSet::remove_rule_impl(uint64_t rule_id, RuleOperationReport& report,
+                                      MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   if (find_rule(rule_id) == nullptr)
     return report_failure(report, Error::Make(ErrorCode::kInvalidArgument),
                           rule_id == 0 ? 0 : retained_for(rule_id));
   if (Error e = prepare_undo_report(report, rule_id, nullptr, RuleOperationStage::kRestore))
     return {0, 0, 1, retained_for(rule_id)};
-  auto summary = remove_rule(rule_id);
+  auto summary = remove_rule_impl(rule_id, cache);
   finish_undo_report(report);
   return summary;
 }
-RuleSummary RuleSet::unhook(RuleOperationReport& report) {
+RuleSummary RuleSet::remove_rule(uint64_t rule_id, RuleOperationReport& report) {
+  return remove_rule_impl(rule_id, report, nullptr);
+}
+RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id,
+                                        RuleOperationReport& report) {
+  return remove_rule_impl(rule_id, report, &cache);
+}
+
+RuleSummary RuleSet::unhook_impl(RuleOperationReport& report, MapsCache* cache) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
+
   if (Error e = prepare_undo_report(report, 0, nullptr, RuleOperationStage::kRestore))
     return {0, 0, 1, retained_for()};
-  auto summary = unhook();
+  auto summary = unhook_impl(cache);
   finish_undo_report(report);
   return summary;
 }
+RuleSummary RuleSet::unhook(RuleOperationReport& report) { return unhook_impl(report, nullptr); }
+RuleSummary RuleSet::unhook_cached(MapsCache& cache, RuleOperationReport& report) {
+  return unhook_impl(report, &cache);
+}
+
 RuleSummary RuleSet::abandon(RuleOperationReport& report) {
+  if (detail::process_entry()) return {0, 0, 1, 0};
   if (Error e = prepare_undo_report(report, 0, nullptr, RuleOperationStage::kAbandon))
     return {0, 0, 1, retained_for()};
   auto summary = abandon();

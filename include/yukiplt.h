@@ -80,10 +80,15 @@ extern "C" {
 #define YUKIPLT_C_ABI_VERSION 1u
 #define YUKIPLT_C_ANY_RELOCATION SIZE_MAX
 
+typedef struct yukiplt_c_maps_cache {
+  uint64_t token;
+} yukiplt_c_maps_cache;
+
 // Calls are not async-signal-safe: do not enter from a signal handler. Thread
 // cancellation through an operation and longjmp across library frames are not
-// supported. After a multithreaded fork, the child must not call this library
-// before exec; do not fork inside an operation or callback. Callers serialize
+// supported. After a multithreaded fork, calls before exec require the controlled
+// fork protocol and host runtime coordination. Never fork inside an operation
+// or callback. Callers serialize
 // access to each handle and retain images, replacements and outputs through
 // recovery and their own quiescence protocol.
 
@@ -148,7 +153,7 @@ typedef struct yukiplt_c_selector {
   size_t relocation_index;  // YUKIPLT_C_ANY_RELOCATION for no index filter.
 } yukiplt_c_selector;
 #define YUKIPLT_C_SELECTOR(name) \
-  {(name), YUKIPLT_C_VERSION_ANY, NULL, NULL, YUKIPLT_C_HIDDEN_ANY, YUKIPLT_C_ANY_RELOCATION}
+  { (name), YUKIPLT_C_VERSION_ANY, NULL, NULL, YUKIPLT_C_HIDDEN_ANY, YUKIPLT_C_ANY_RELOCATION }
 typedef struct yukiplt_c_request {
   yukiplt_c_selector target;
   void* replacement;
@@ -207,7 +212,9 @@ enum {
   YUKIPLT_C_FEATURE_SESSIONS = 13,
   YUKIPLT_C_FEATURE_RULES = 14,
   YUKIPLT_C_FEATURE_CANDIDATES = 15,
-  YUKIPLT_C_FEATURE_IDLE_STORAGE = 16
+  YUKIPLT_C_FEATURE_IDLE_STORAGE = 16,
+  YUKIPLT_C_FEATURE_CACHED_MAPS = 17,
+  YUKIPLT_C_FEATURE_CONTROLLED_FORK = 18
 };
 
 enum {
@@ -257,12 +264,14 @@ typedef struct yukiplt_c_function_selector {
   uint32_t index_source;  // YUKIPLT_C_RELOC_SOURCE_*; scopes base.relocation_index.
   yukiplt_c_selector base;
 } yukiplt_c_function_selector;
-#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                             \
-  {(uint32_t)sizeof(yukiplt_c_function_selector),                                     \
-   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
-       YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
-   YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
-   YUKIPLT_C_SELECTOR(name)}
+#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                                  \
+  {                                                                                        \
+    (uint32_t)sizeof(yukiplt_c_function_selector),                                         \
+        YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
+            YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
+        YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
+        YUKIPLT_C_SELECTOR(name)                                                           \
+  }
 typedef struct yukiplt_c_function_request {
   yukiplt_c_function_selector target;
   void* replacement;
@@ -409,7 +418,10 @@ enum {
   YUKIPLT_C_CAUSE_RANDOM_SOURCE = 18,
   YUKIPLT_C_CAUSE_PLATFORM = 19,
   YUKIPLT_C_CAUSE_IDENTITY_MISMATCH = 20,
-  YUKIPLT_C_CAUSE_SLOT_DRIFT = 21
+  YUKIPLT_C_CAUSE_SLOT_DRIFT = 21,
+  YUKIPLT_C_CAUSE_CACHE_INVALID = 22,
+  YUKIPLT_C_CAUSE_CACHE_CONFLICT = 23,
+  YUKIPLT_C_CAUSE_FORK_PROTOCOL = 24
 };
 // A new struct (version 1); existing structs are unchanged.  struct_size must
 // equal sizeof(yukiplt_c_operation_diagnostic) on input, else INVALID_ARGUMENT
@@ -923,6 +935,82 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_candidates_copy(const yukiplt_c_candidates
                                                       size_t* required_count,
                                                       size_t* required_text) YUKIPLT_C_NOEXCEPT;
 
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_image* image,
+    const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_named_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
+    const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output) YUKIPLT_C_NOEXCEPT;
+// Diagnostic variants also report cache, permission and fork protocol causes.
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_diagnosed_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_image* image,
+    const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_diagnosed_named_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
+    const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+// Name-only selectors (YUKIPLT_C_SELECTOR) with nonzero original values required.
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_batch_nonnull_named_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
+    const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_image* image,
+    const yukiplt_c_function_request_ex* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named_cached(
+    const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
+    const yukiplt_c_function_request_ex* requests, size_t count, yukiplt_c_handle* handle,
+    yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_unhook_diagnosed_cached(
+    const yukiplt_c_maps_cache* cache, yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
+    size_t capacity, yukiplt_c_operation_diagnostic* diagnostic) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_query_cached(const yukiplt_c_maps_cache* cache,
+                                                   const yukiplt_c_handle* handle,
+                                                   yukiplt_c_slot_report* output, size_t capacity,
+                                                   size_t* total) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_create(yukiplt_c_maps_cache* out)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_capture(yukiplt_c_maps_cache* cache)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_import_text(yukiplt_c_maps_cache* cache,
+                                                             const char* text,
+                                                             size_t length) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_invalidate(yukiplt_c_maps_cache* cache)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_destroy(yukiplt_c_maps_cache* cache)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_prepare_fork(void) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_after_fork_parent(void) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_after_fork_child(void) YUKIPLT_C_NOEXCEPT;
+
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_session_install_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_session* h,
+                                 yukiplt_c_summary* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_session_unhook_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_session* h,
+                                yukiplt_c_summary* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_rules_refresh_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
+                               yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_rules_unhook_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
+                              yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_release_image_cached(
+    const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h, const yukiplt_c_image* v,
+    yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_notify_loaded_cached(
+    const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h, const yukiplt_c_image* v,
+    const char* path, yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_rules_notify_unloading_cached(
+    const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h, const yukiplt_c_image* v,
+    yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error
+yukiplt_c_rules_remove_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h, uint64_t id,
+                              yukiplt_c_rule_report* out) YUKIPLT_C_NOEXCEPT;
 #ifdef __cplusplus
 }
 #endif

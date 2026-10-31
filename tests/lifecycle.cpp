@@ -98,7 +98,10 @@ struct ContractFixture : testing::Test {
     set_slot(1, 0x2000);
     detail::set_active_ops(&ops);
   }
-  void TearDown() override { detail::set_active_ops(nullptr); }
+  void TearDown() override {
+    detail::set_active_ops(nullptr);
+    detail::set_system_iterator(nullptr);
+  }
 
   ImageView view(uint64_t token = 0x51) const {
     return {image.load_bias(), image.phdr_table(), image.phdr_count, token};
@@ -116,6 +119,152 @@ void* const kReplA = reinterpret_cast<void*>(uintptr_t{0xA000});
 void* const kReplB = reinterpret_cast<void*>(uintptr_t{0xB000});
 
 }  // namespace
+
+TEST_F(ContractFixture, RefreshedOriginalProtectionStillRequiresConfirmedRecovery) {
+  char text[160];
+  std::snprintf(text, sizeof(text), "%zx-%zx r--p 00000000 00:00 0\n", first_page, end_page);
+  MapsCache cache;
+  ASSERT_TRUE(cache.import_text(text, std::strlen(text)).ok());
+  HookRequest request{"alpha", kReplA, &outputs[0]};
+  fail_restore = EPERM;
+  auto result = hook_batch_cached(cache, view(), &request, 1);
+  ASSERT_EQ(result.error.code, ErrorCode::kIndeterminate);
+  set_slot(0, 0x1000);
+  writable = false;
+  ASSERT_TRUE(cache.import_text(text, std::strlen(text)).ok());
+  reset_counts();
+  EXPECT_EQ(unhook_cached(cache, result.handle).code, ErrorCode::kIndeterminate);
+  EXPECT_TRUE(result.handle.valid());
+  EXPECT_GT(protect_calls, 0u);
+  fail_restore = 0;
+  EXPECT_TRUE(unhook_cached(cache, result.handle).ok());
+  EXPECT_FALSE(result.handle.valid());
+  EXPECT_FALSE(writable);
+  EXPECT_EQ(cas_calls, 0u);
+  EXPECT_EQ(maps_calls, 0u);
+}
+
+TEST_F(ContractFixture, CachedOwnersConflictPerPageAndInvalidationBlocksReads) {
+  char text[160];
+  std::snprintf(text, sizeof(text), "%zx-%zx r--p 00000000 00:00 0\n", first_page, end_page);
+  MapsCache first, second;
+  ASSERT_TRUE(second.import_text(text, std::strlen(text)).ok());
+  HookRequest alpha{"alpha", kReplA, &outputs[0]}, beta{"beta", kReplB, &outputs[1]};
+  fail_restore = EPERM;
+  auto live = hook(view(), "alpha", kReplA, nullptr);
+  ASSERT_EQ(live.error.code, ErrorCode::kIndeterminate);
+  ASSERT_TRUE(writable);
+  std::snprintf(text, sizeof(text), "%zx-%zx rw-p 00000000 00:00 0\n", first_page, end_page);
+  ASSERT_TRUE(first.import_text(text, std::strlen(text)).ok());
+  ASSERT_TRUE(second.import_text(text, std::strlen(text)).ok());
+  fail_restore = 0;
+  ASSERT_TRUE(unhook(live.handle).ok());
+  ASSERT_FALSE(writable);
+  reset_counts();
+  EXPECT_EQ(hook_batch_cached(first, view(), &alpha, 1).error.code, ErrorCode::kInvalidArgument);
+  EXPECT_EQ(hook_batch_cached(second, view(), &alpha, 1).error.code, ErrorCode::kInvalidArgument);
+  EXPECT_EQ(cas_calls, 0u);
+  EXPECT_EQ(maps_calls, 0u);
+  std::snprintf(text, sizeof(text), "%zx-%zx r--p 00000000 00:00 0\n", first_page, end_page);
+  ASSERT_TRUE(first.import_text(text, std::strlen(text)).ok());
+  ASSERT_TRUE(second.import_text(text, std::strlen(text)).ok());
+  auto a = hook_batch_cached(first, view(), &alpha, 1);
+  ASSERT_TRUE(a.ok());
+  auto b = hook_batch_cached(second, view(), &beta, 1);
+  EXPECT_FALSE(b.ok());
+  EXPECT_FALSE(b.handle.valid());
+  b = hook_batch_cached(first, view(), &beta, 1);
+  ASSERT_TRUE(b.ok());
+  SlotReport report;
+  size_t count = 0;
+  EXPECT_FALSE(query_cached(second, a.handle, &report, 1, &count).ok());
+  EXPECT_TRUE(query_cached(first, a.handle, &report, 1, &count).ok());
+  ASSERT_TRUE(first.invalidate().ok());
+  EXPECT_FALSE(query_cached(first, a.handle, &report, 1, &count).ok());
+  EXPECT_FALSE(unhook_cached(first, a.handle).ok());
+  EXPECT_TRUE(unhook(a.handle).ok());
+  EXPECT_TRUE(unhook(b.handle).ok());
+}
+
+TEST(MapsCache, RejectsMalformedAndOversizedInput) {
+  MapsCache cache;
+  EXPECT_TRUE(cache.capture().ok());
+  EXPECT_EQ(cache.import_text("", 0).code, ErrorCode::kVmaUnavailable);
+  const char overlap[] = "1000-3000 r--p 0 00:00 0\n2000-4000 rw-p 0 00:00 0\n";
+  EXPECT_EQ(cache.import_text(overlap, sizeof(overlap) - 1).code, ErrorCode::kVmaUnavailable);
+  EXPECT_EQ(cache.import_text("x", 64u * 1024u * 1024u + 1).code, ErrorCode::kOutOfBounds);
+  for (const char* damaged :
+       {"1000-2000 r--p", "1000-2000 r--p garbage", "1000-2000 r--p 0 00:zz 0",
+        "1000-2000 r--p 0 00:00 -1", "1000-2000 r--p 0 00:00 18446744073709551616",
+        "00000000000001000-2000 r--p 0 00:00 0"}) {
+    EXPECT_EQ(cache.import_text(damaged, std::strlen(damaged)).code, ErrorCode::kVmaUnavailable);
+  }
+}
+
+TEST_F(ContractFixture, SystemCachedQueryRechecksOwnershipAfterLockHandoff) {
+  char text[160];
+  std::snprintf(text, sizeof(text), "%zx-%zx r--p 00000000 00:00 0\n", first_page, end_page);
+  MapsCache cache, other;
+  ASSERT_TRUE(cache.import_text(text, std::strlen(text)).ok());
+  ASSERT_TRUE(other.import_text(text, std::strlen(text)).ok());
+  struct Context {
+    ContractFixture* fixture;
+    MapsCache* other_cache;
+    HookResult other_hook;
+    bool interleave = false;
+  } context{this, &other, {}};
+  static Context* current = nullptr;
+  current = &context;
+  detail::set_system_iterator([](int (*callback)(dl_phdr_info*, size_t, void*), void* data) {
+    auto& fixture = *current->fixture;
+    if (current->interleave) {
+      current->interleave = false;
+      HookRequest request{"beta", kReplB, &fixture.outputs[1]};
+      current->other_hook = hook_batch_cached(*current->other_cache, fixture.view(), &request, 1);
+    }
+    dl_phdr_info info{};
+    info.dlpi_addr = fixture.view().load_bias;
+    info.dlpi_phdr = fixture.view().phdr_table;
+    info.dlpi_phnum = static_cast<ElfW(Half)>(fixture.view().phdr_count);
+    info.dlpi_name = "fixture.so";
+    return callback(&info, sizeof(info), data);
+  });
+  auto installed = hook(view(0), "alpha", kReplA, &outputs[0]);
+  ASSERT_TRUE(installed.ok());
+  context.interleave = true;
+  SlotReport report;
+  size_t count = 0;
+  EXPECT_EQ(query_cached(cache, installed.handle, &report, 1, &count).code,
+            ErrorCode::kInvalidArgument);
+  ASSERT_TRUE(context.other_hook.ok());
+  EXPECT_TRUE(unhook_cached(other, context.other_hook.handle).ok());
+  EXPECT_TRUE(unhook(installed.handle).ok());
+  current = nullptr;
+}
+
+TEST_F(ContractFixture, OldForgottenHandleCannotInvalidateNewCacheBinding) {
+  char text[160];
+  std::snprintf(text, sizeof(text), "%zx-%zx r--p 00000000 00:00 0\n", first_page, end_page);
+  MapsCache cache;
+  ASSERT_TRUE(cache.import_text(text, std::strlen(text)).ok());
+  HookRequest first{"alpha", kReplA, &outputs[0]};
+  fail_restore = EPERM;
+  auto old = hook_batch_cached(cache, view(101), &first, 1);
+  ASSERT_EQ(old.error.code, ErrorCode::kIndeterminate);
+  ASSERT_TRUE(forget_image(view(101)).ok());
+  fail_restore = 0;
+  writable = false;
+  set_slot(0, 0x1000);
+  ASSERT_TRUE(cache.import_text(text, std::strlen(text)).ok());
+  HookRequest next{"alpha", kReplB, &outputs[1]};
+  auto current = hook_batch_cached(cache, view(102), &next, 1);
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(unhook_cached(cache, old.handle).code, ErrorCode::kImageInvalidated);
+  EXPECT_FALSE(old.handle.valid());
+  EXPECT_TRUE(unhook_cached(cache, current.handle).ok());
+  EXPECT_EQ(slot(0), 0x1000u);
+  EXPECT_EQ(maps_calls, 0u);
+}
 
 TEST_F(ContractFixture, SuccessPublishesBeforeTheReplacementIsReachable) {
   output_at_first_cas = reinterpret_cast<void*>(uintptr_t{1});

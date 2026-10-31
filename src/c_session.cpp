@@ -111,7 +111,7 @@ Error target_copy(const T& target, yukiplt_c_target_record* out, char* text, siz
   return Error::Ok();
 }
 enum class Action { kInstall, kUnhook, kAbandon };
-Error operate(Session& owned, Action action, yukiplt_c_summary* out) {
+Error operate(Session& owned, Action action, yukiplt_c_summary* out, MapsCache* cache = nullptr) {
   if (!out) return Error::Make(ErrorCode::kNullPointer);
   return std::visit(
       [&](auto& session) -> Error {
@@ -138,9 +138,11 @@ Error operate(Session& owned, Action action, yukiplt_c_summary* out) {
               return Error::Make(ErrorCode::kOutOfBounds);
           }
         }
-        const auto result = action == Action::kInstall  ? session.install()
-                            : action == Action::kUnhook ? session.unhook()
-                                                        : session.abandon();
+        const auto result = action == Action::kInstall
+                                ? (cache ? session.install_cached(*cache) : session.install())
+                            : action == Action::kUnhook
+                                ? (cache ? session.unhook_cached(*cache) : session.unhook())
+                                : session.abandon();
         *out = {result.attempted, result.succeeded, result.failed, result.retained};
         if (!result.failed) return Error::Ok();
         for (size_t n = 0; n < groups.size(); ++n) {
@@ -374,3 +376,24 @@ yukiplt_c_error yukiplt_c_session_recovery(const yukiplt_c_session* h, size_t in
   });
 }
 }  // extern "C"
+
+extern "C" {
+yukiplt_c_error yukiplt_c_session_install_cached(const yukiplt_c_maps_cache* cache,
+                                                 yukiplt_c_session* h,
+                                                 yukiplt_c_summary* out) noexcept {
+  return with_session(h, [&](Session& session) {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    return operate(session, Action::kInstall, out, &lease->value);
+  });
+}
+yukiplt_c_error yukiplt_c_session_unhook_cached(const yukiplt_c_maps_cache* cache,
+                                                yukiplt_c_session* h,
+                                                yukiplt_c_summary* out) noexcept {
+  return with_session(h, [&](Session& session) {
+    auto lease = get_cache(cache);
+    if (!lease) return invalid();
+    return operate(session, Action::kUnhook, out, &lease->value);
+  });
+}
+}

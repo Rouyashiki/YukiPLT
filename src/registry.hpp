@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 
 #include "common.hpp"
@@ -68,6 +69,8 @@ struct PageResidueRecord {
 // Per-copy Registry; every operation requires op_mutex. Callers receive copies.
 // Ids combine generation/index with a random per-copy salt; unavailable
 // randomness blocks claims. The salt detects misuse, not a security boundary.
+struct MapsCacheState;
+struct CachedPage;
 class Registry {
  public:
   static constexpr uint64_t kInvalidId = ~uint64_t(0);
@@ -78,6 +81,14 @@ class Registry {
   static_assert((kInvalidId & kIndexLimit) != 0);
 
   static Registry& instance();
+  Error check_cache(uint64_t id, const MapsCacheState* cache) const noexcept;
+  Error bind_cache(uint64_t id, const std::shared_ptr<MapsCacheState>& cache);
+  CachedPage* cached_page(uintptr_t page) noexcept;
+  bool cache_bound(const MapsCacheState* cache) const noexcept;
+  Error prepare_cache_update(const MapsCacheState* cache, MapsCacheState& next) const;
+  bool page_pending(uintptr_t page) const noexcept;
+  bool fork_clean() const noexcept;
+  void invalidate_cache(uint64_t id) noexcept;
 
   /// False if the per-copy salt could not be drawn from the system random
   /// source; claim() then always fails.  salt_errno() is the source's errno.
@@ -164,6 +175,7 @@ class Registry {
     SmallVec<SlotRecord, 2> slots;
     SmallVec<PageResidueRecord, 2> residue;
     RecoveryDiagnostic diagnostic;
+    std::shared_ptr<MapsCacheState> cache;
   };
 
   static bool is_live(GroupState /*s*/) noexcept { return true; }  // all stored states are live

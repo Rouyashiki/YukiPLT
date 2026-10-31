@@ -13,7 +13,17 @@
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail::c_objects {
-enum class Kind { kImages, kImports, kPlan, kSession, kRules, kRuleReport, kBindings, kCandidates };
+enum class Kind {
+  kImages,
+  kImports,
+  kPlan,
+  kSession,
+  kRules,
+  kRuleReport,
+  kBindings,
+  kCandidates,
+  kMapsCache
+};
 struct Object {
   explicit Object(Kind value) noexcept : kind(value) {}
   virtual ~Object() = default;
@@ -26,12 +36,22 @@ struct Object {
 Result<uint64_t> publish(std::shared_ptr<Object> object);
 std::shared_ptr<Object> acquire(uint64_t token, Kind kind);
 Error destroy(uint64_t& token, Kind kind);
+struct CacheObject final : Object {
+  CacheObject() : Object(Kind::kMapsCache) {}
+  MapsCache value;
+  bool can_destroy() const noexcept override { return !value.has_bindings(); }
+};
+inline std::shared_ptr<CacheObject> get_cache(const yukiplt_c_maps_cache* cache) {
+  return cache ? std::static_pointer_cast<CacheObject>(acquire(cache->token, Kind::kMapsCache))
+               : nullptr;
+}
 inline yukiplt_c_error converted(Error e) noexcept {
   return {static_cast<uint32_t>(e.code), e.sys_errno};
 }
 inline Error invalid() noexcept { return Error::Make(ErrorCode::kInvalidArgument); }
 template <typename F>
 yukiplt_c_error boundary(F&& call, CauseContext* cause = nullptr) noexcept {
+  if (Error e = process_entry()) return converted(e);
   try {
     return converted(call());
   } catch (...) {

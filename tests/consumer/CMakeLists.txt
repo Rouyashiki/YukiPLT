@@ -11,7 +11,7 @@ target_link_libraries(c_consumer PRIVATE YukiPLT::yukiplt ${CMAKE_DL_LIBS})
 add_executable(cpp_consumer cpp_main.cpp)
 set_target_properties(cpp_consumer PROPERTIES
     CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
-target_link_libraries(cpp_consumer PRIVATE YukiPLT::yukiplt)
+target_link_libraries(cpp_consumer PRIVATE YukiPLT::yukiplt ${CMAKE_DL_LIBS})
 
 add_library(sample_provider SHARED provider.c)
 add_library(hook_target SHARED target.c)
@@ -21,6 +21,7 @@ foreach(fixture IN ITEMS sample_provider hook_target)
         -Wl,-z,relro -Wl,-z,now -Wl,--hash-style=gnu)
 endforeach()
 add_dependencies(c_consumer hook_target)
+add_dependencies(cpp_consumer hook_target)
 
 enable_testing()
 add_test(NAME c_consumer COMMAND c_consumer)

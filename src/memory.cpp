@@ -5,6 +5,9 @@
 
 #include <cerrno>
 
+#include "maps_cache.hpp"
+#include "registry.hpp"
+
 #if defined(__linux__) || defined(__ANDROID__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -44,7 +47,7 @@ bool parse_hex(const char* s, size_t len, size_t& i, uintptr_t& out) noexcept {
       break;
     }
     // value = value * 16 + d, with overflow check.
-    if (value > (~uintptr_t(0) >> 4)) return false;
+    if (digits == sizeof(uintptr_t) * 2 || value > (~uintptr_t(0) >> 4)) return false;
     value <<= 4;
     value |= d;
     ++digits;
@@ -391,8 +394,29 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
   vmas.reserve(unique);
   for (size_t i = 0; i < unique; ++i) vmas.push_back(VmaInfo{});
   MapsCoverage coverage(bases.begin(), unique, page_size_, vmas.begin(), cause);
-  Error maps = ops_.read_maps(ops_.ctx, coverage);
-  if (maps) return maps;
+  if (cache_) {
+    for (size_t i = 0; i < unique; ++i) {
+      Error e = cache_->lookup(bases[i], vmas[i], false,
+                               recovering_ && extra_pages &&
+                                   std::find(extra_pages, extra_pages + extra_count, bases[i]) !=
+                                       extra_pages + extra_count);
+      if (e)
+        return with_cause(e,
+                          e.code == ErrorCode::kOutOfBounds ? ErrorCause::kMapsCoverage
+                                                            : ErrorCause::kCacheInvalid,
+                          cause);
+    }
+  } else {
+    Error maps = ops_.read_maps(ops_.ctx, coverage);
+    if (maps) return maps;
+    for (size_t i = 0; i < unique; ++i) {
+      if (auto* tracked = Registry::instance().cached_page(bases[i])) {
+        if (prot_of(tracked->vma) != prot_of(vmas[i]) || vmas[i].shared) tracked->invalid = true;
+        tracked->vma = vmas[i];
+        tracked->unknown = false;
+      }
+    }
+  }
 
   // VMA policy: only private, non-executable, readable mappings.
   // r--p is raised to rw-p for the write and restored; rw-p is written as is.
@@ -454,11 +478,35 @@ bool Txn::page_vma(uintptr_t page, VmaInfo& out) const noexcept {
   return true;
 }
 
+int Txn::protect(uintptr_t page, int prot) noexcept {
+  const int error = ops_.protect(ops_.ctx, page, page_size_, prot);
+  if (auto* tracked = Registry::instance().cached_page(page)) {
+    tracked->unknown = error != 0;
+    if (!error) {
+      tracked->vma.readable = (prot & kProtRead) != 0;
+      tracked->vma.writable = (prot & kProtWrite) != 0;
+      tracked->vma.executable = (prot & kProtExec) != 0;
+    }
+  }
+  return error;
+}
+
 int Txn::protect_page(uintptr_t page, int prot) noexcept {
   if (!prepared_) return EINVAL;
   size_t i = find_page(page);
   if (i == pages_.size() || pages_[i].base != page) return EINVAL;
-  return ops_.protect(ops_.ctx, page, page_size_, prot);
+  return protect(page, prot);
+}
+
+int Txn::repair_page(uintptr_t page, int prot) noexcept {
+  int error = protect_page(page, prot);
+  if (!error) {
+    auto& vma = pages_[find_page(page)].vma;
+    vma.readable = (prot & kProtRead) != 0;
+    vma.writable = (prot & kProtWrite) != 0;
+    vma.executable = (prot & kProtExec) != 0;
+  }
+  return error;
 }
 
 void Txn::restore_pages(CommitResult& result) noexcept {
@@ -469,7 +517,7 @@ void Txn::restore_pages(CommitResult& result) noexcept {
   for (size_t k = pages_.size(); k-- > 0;) {
     Page& p = pages_[k];
     if (!p.raised || p.restore_failed) continue;
-    int err = ops_.protect(ops_.ctx, p.base, page_size_, prot_of(p.vma));
+    int err = protect(p.base, prot_of(p.vma));
     if (err == 0) {
       p.raised = false;
     } else {
@@ -511,8 +559,9 @@ CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode, void (*befo
   for (size_t k = 0; k < pages_.size(); ++k) {
     Page& p = pages_[k];
     if (!p.used || p.vma.writable) continue;
-    int err = ops_.protect(ops_.ctx, p.base, page_size_, prot_of(p.vma) | kProtWrite);
+    int err = protect(p.base, prot_of(p.vma) | kProtWrite);
     if (err != 0) {
+      if (cache_ || Registry::instance().cached_page(p.base)) p.raised = true;
       result.raise_errno = err;
       restore_pages(result);
       return result;

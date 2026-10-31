@@ -12,8 +12,9 @@ not implicitly perform fallible restoration in their destructors.
 Retain the handle and inspect its recovery diagnostic, slot states and residual
 pages. These records describe the last operation, not current memory mappings.
 Resolve the underlying mapping, permission or ownership conflict, then retry
-unhook. Retry reads current maps and restores only values/protections still
-owned by the operation. A third party's slot value is never overwritten.
+unhook. Live retry reads current maps. Explicit cached retry uses the supplied
+snapshot and tracked protection state. Both restore only values/protections
+still owned by the operation and preserve third-party slot values.
 
 Successful unhook and confirmed `ImageInvalidated` consume the handle.
 Preflight conflicts, maps errors, permission failures, allocation failures and
@@ -62,12 +63,14 @@ binding references and indices. Allocation failure preserves the object.
 Free functions support concurrent calls. Serialize operations and result reads
 on each handle, session or RuleSet. The lock order is linker then operation;
 host callbacks run outside both. Avoid synchronous reentry through hooks on
-allocators or other functions used inside YukiPLT operations. Calls from signal
-handlers, cancellation/longjmp across library frames and calls in the child of
-a multithreaded fork before exec are unsupported.
+allocators or other functions used inside YukiPLT operations. Keep calls outside
+signal handlers and cancellation/longjmp boundaries. Child calls after a
+multithreaded fork before exec require the explicit host coordination described
+in [Cached maps and controlled fork](cached-maps.md).
 
-Serialize other writers of page permissions against YukiPLT. An operation
-reads maps once and cannot atomically exclude external `mprotect` or remapping.
+Serialize other writers of page permissions against YukiPLT. Live transactions
+read maps once, while cached transactions use their explicit snapshot and tracked
+state. The host must exclude external `mprotect` and remapping during each operation.
 CAS does not prove ownership history or prevent address/value ABA.
 
 Each loaded copy owns a separate registry and operation lock. Do not let copies

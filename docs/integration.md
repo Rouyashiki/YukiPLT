@@ -136,3 +136,6 @@ error. Failure returns no candidate list; callback side effects are not undone.
 C adaptation and the core scanner share the same operation-wide materialization
 budget. Copy selected metadata into caller buffers before building an explicit
 function plan; a candidate address alone never authorizes a patch.
+
+For explicit parent-snapshot reuse, cached restoration and fork coordination,
+see [Cached maps and controlled fork](cached-maps.md).

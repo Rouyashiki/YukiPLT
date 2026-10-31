@@ -12,6 +12,7 @@ set(YUKIPLT_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/../src/elf.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/session.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/memory.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/../src/maps_cache.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/registry.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/../src/rules.cpp"
 )

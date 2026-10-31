@@ -16,6 +16,7 @@
 #include "yukiplt.hpp"
 
 namespace yukiplt::detail {
+Error process_entry() noexcept;
 
 /// Unsigned addition with overflow detection.
 /// Returns false on overflow; result is undefined on overflow.

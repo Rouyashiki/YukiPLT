@@ -172,9 +172,12 @@ struct CommitResult {
   size_t conflicts = 0;          ///< Number of ops that ended kConflict.
 };
 
+struct MapsCacheState;
 class Txn {
  public:
-  Txn(const PlatformOps& ops, size_t page_size) noexcept : ops_(ops), page_size_(page_size) {}
+  Txn(const PlatformOps& ops, size_t page_size, MapsCacheState* cache = nullptr,
+      bool recovering = false) noexcept
+      : ops_(ops), cache_(cache), recovering_(recovering), page_size_(page_size) {}
 
   Txn(const Txn&) = delete;
   Txn& operator=(const Txn&) = delete;
@@ -205,6 +208,7 @@ class Txn {
   /// raised by an earlier commit.  Returns 0, an errno value, or EINVAL if the
   /// page was not prepared.
   int protect_page(uintptr_t page, int prot) noexcept;
+  int repair_page(uintptr_t page, int prot) noexcept;
 
   /// Apply `ops`.  Every op's slot must have been passed to prepare(), each at
   /// most once.  A Txn commits at most once; a second call is `invalid`.
@@ -248,7 +252,10 @@ class Txn {
   /// Restore every raised page, highest address first.
   void restore_pages(CommitResult& result) noexcept;
 
+  int protect(uintptr_t page, int prot) noexcept;
   const PlatformOps& ops_;
+  MapsCacheState* cache_;
+  bool recovering_;
   size_t page_size_;
   SmallVec<Page, 4> pages_;
   SmallVec<uintptr_t, 8> slots_;    ///< Prepared slots, sorted.

@@ -6,12 +6,12 @@
 #include <cstdlib>
 #include <new>
 
-#include "registry.hpp"
 #include "aps2_encoder.hpp"
 #include "elf_builder.hpp"
 #include "imports.hpp"
-#include "overrides.hpp"
 #include "memory.hpp"
+#include "overrides.hpp"
+#include "registry.hpp"
 #include "system_images.hpp"
 #include "versioned_elf.hpp"
 #include "yukiplt.h"
@@ -267,4 +267,32 @@ TEST(ImportAllocation, CPlanAndSessionPreparationPreserveOutputsAndOwnership) {
   }
   EXPECT_TRUE(completed);
   EXPECT_GT(failures, 4u);
+}
+
+TEST(ImportAllocation, CachedInstallAndSnapshotReplacementAreFailureAtomic) {
+  AllocationFixture fixture;
+  MapsCache cache;
+  ASSERT_TRUE(cache.import_text(fixture.maps, std::strlen(fixture.maps)).ok());
+  size_t baseline = live_groups();
+  bool success = false;
+  for (int allocation = 0; allocation < 256; ++allocation) {
+    fail_after = allocation;
+    auto result = hook_batch_cached(cache, fixture.view(), fixture.legacy, fixture.count);
+    fail_after = -1;
+    if (result.ok()) {
+      ASSERT_TRUE(unhook_cached(cache, result.handle).ok());
+      success = true;
+      break;
+    }
+    ASSERT_EQ(result.error.code, ErrorCode::kOutOfMemory);
+    EXPECT_FALSE(result.handle.valid());
+    EXPECT_EQ(live_groups(), baseline);
+    EXPECT_EQ(fixture.writes, 0u);
+  }
+  EXPECT_TRUE(success);
+  fail_after = 0;
+  auto error = cache.import_text(fixture.maps, std::strlen(fixture.maps));
+  fail_after = -1;
+  EXPECT_EQ(error.code, ErrorCode::kOutOfMemory);
+  EXPECT_EQ(live_groups(), baseline);
 }

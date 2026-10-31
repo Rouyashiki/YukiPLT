@@ -8,4 +8,6 @@
 namespace yukiplt::detail {
 void set_active_ops(const PlatformOps* ops) noexcept;
 void set_active_image_enumerator(ImageEnumerator enumerator) noexcept;
+using SystemIterator = int (*)(int (*)(dl_phdr_info*, size_t, void*), void*);
+void set_system_iterator(SystemIterator iterator) noexcept;
 }  // namespace yukiplt::detail

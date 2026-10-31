@@ -7,6 +7,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <new>
 #include <string>
 #include <string_view>
@@ -701,8 +702,9 @@ YUKIPLT_API void* load_original(void* const* storage) noexcept;
 // tokens and forget_image. Named APIs also bind the path; callers handle reload ABA.
 // Serialize each handle/session/RuleSet and its result reads. Synchronous reentry
 // from functions called under internal locks is forbidden; lock-free host callbacks
-// may reenter. No signals, cancellation/longjmp across API frames, or calls after
-// multithreaded fork before exec. Never fork during an operation or callback.
+// may reenter. No signals or cancellation/longjmp across API frames. Calls after
+// multithreaded fork before exec require the controlled fork protocol and host
+// runtime coordination. Never fork during an operation or callback.
 // Destructors do not unhook. Each copy owns separate locks/handles; coordinate
 // shared pages across copies. Self-image installs are rejected. Salted ids detect
 // misuse, not attacks; entropy failure rejects installation.
@@ -710,6 +712,32 @@ YUKIPLT_API void* load_original(void* const* storage) noexcept;
 
 struct NamedImage;
 struct RecoveryDiagnostic;
+namespace detail {
+struct MapsCacheState;
+struct MapsCacheAccess;
+}  // namespace detail
+
+// Owning permission snapshot. Serialize access, including moves and destruction.
+// The host keeps relevant mappings stable from capture through their last use.
+class MapsCache {
+ public:
+  MapsCache() = default;
+  MapsCache(const MapsCache&) = delete;
+  MapsCache& operator=(const MapsCache&) = delete;
+  MapsCache(MapsCache&&) noexcept = default;
+  MapsCache& operator=(MapsCache&&) noexcept = default;
+  YUKIPLT_API Error capture();
+  YUKIPLT_API Error import_text(const char* text, size_t length);
+  YUKIPLT_API Error invalidate();
+  YUKIPLT_API bool has_bindings() const noexcept;
+
+ private:
+  friend struct detail::MapsCacheAccess;
+  std::shared_ptr<detail::MapsCacheState> state_;
+};
+YUKIPLT_API Error prepare_fork() noexcept;
+YUKIPLT_API Error after_fork_parent() noexcept;
+YUKIPLT_API Error after_fork_child() noexcept;
 
 /// Result is the public-facing result type for YukiPLT operations.
 template <typename T>
@@ -1177,6 +1205,9 @@ enum class ErrorCause : uint32_t {
   kIdentityMismatch = 20,
   /// A slot this library installed no longer holds its replacement.
   kSlotDrift = 21,
+  kCacheInvalid = 22,
+  kCacheConflict = 23,
+  kForkProtocol = 24,
 };
 
 /// Output identifier for this frozen OperationDiagnostic layout. It is not a
@@ -1204,6 +1235,12 @@ struct OperationDiagnostic {
 /// Stable, allocation-free name; unknown values return "Unknown".
 [[nodiscard]] inline const char* error_cause_name(ErrorCause cause) noexcept {
   switch (cause) {
+    case ErrorCause::kCacheInvalid:
+      return "CacheInvalid";
+    case ErrorCause::kCacheConflict:
+      return "CacheConflict";
+    case ErrorCause::kForkProtocol:
+      return "ForkProtocol";
     case ErrorCause::kNone:
       return "None";
     case ErrorCause::kInvalidRequest:
@@ -1384,7 +1421,12 @@ class HookSession {
   /// Drop all remaining ownership without touching slots or page protections.
   YUKIPLT_API SessionSummary abandon();
 
+  YUKIPLT_API SessionSummary install_cached(MapsCache&);
+  YUKIPLT_API SessionSummary unhook_cached(MapsCache&);
+
  private:
+  SessionSummary install_impl(MapsCache*);
+  SessionSummary unhook_impl(MapsCache*);
   friend Result<HookSession> prepare_session(const HookPlan&);
   std::vector<SessionTargetResult> targets_;
   std::vector<SessionImageResult> images_;
@@ -1483,7 +1525,12 @@ class FunctionHookSession {
   /// snapshot. A snapshot failure retains that group's handle for a retry.
   YUKIPLT_API SessionSummary abandon();
 
+  YUKIPLT_API SessionSummary install_cached(MapsCache&);
+  YUKIPLT_API SessionSummary unhook_cached(MapsCache&);
+
  private:
+  SessionSummary install_impl(MapsCache*);
+  SessionSummary unhook_impl(MapsCache*);
   friend Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
   std::vector<FunctionSessionTargetResult> targets_;
   std::vector<FunctionSessionImageResult> images_;
@@ -1692,7 +1739,40 @@ class RuleSet {
   /// Per-(rule, image instance) results.  Valid until the next mutation.
   [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
 
+  YUKIPLT_API RuleSummary unhook_cached(MapsCache&, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary remove_rule_cached(MapsCache&, uint64_t rule_id,
+                                             RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache&, const ImageView& image,
+                                                  RuleOperationReport& report);
+  YUKIPLT_API RuleSummary release_image_cached(MapsCache&, const ImageView& image,
+                                               RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache&, const ImageView& image, const char* path,
+                                               RuleOperationReport& report);
+  YUKIPLT_API RuleSummary refresh_cached(MapsCache&, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary unhook_cached(MapsCache&);
+  YUKIPLT_API RuleSummary remove_rule_cached(MapsCache&, uint64_t rule_id);
+  YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache&, const ImageView& image);
+  YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache&, const ImageView& image,
+                                               const char* path);
+  YUKIPLT_API RuleSummary release_image_cached(MapsCache&, const ImageView& image);
+  YUKIPLT_API RuleSummary refresh_cached(MapsCache&);
+
  private:
+  RuleSummary unhook_impl(RuleOperationReport& report, MapsCache* cache);
+  RuleSummary remove_rule_impl(uint64_t rule_id, RuleOperationReport& report, MapsCache* cache);
+  RuleSummary notify_unloading_impl(const ImageView& image, RuleOperationReport& report,
+                                    MapsCache* cache);
+  RuleSummary release_image_impl(const ImageView& image, RuleOperationReport& report,
+                                 MapsCache* cache);
+  RuleSummary notify_loaded_impl(const ImageView& image, const char* path,
+                                 RuleOperationReport& report, MapsCache* cache);
+  RuleSummary refresh_impl(RuleOperationReport& report, MapsCache* cache);
+  RuleSummary unhook_impl(MapsCache* cache);
+  RuleSummary remove_rule_impl(uint64_t rule_id, MapsCache* cache);
+  RuleSummary notify_unloading_impl(const ImageView& image, MapsCache* cache);
+  RuleSummary notify_loaded_impl(const ImageView& image, const char* path, MapsCache* cache);
+  RuleSummary release_image_impl(const ImageView& image, MapsCache* cache);
+  RuleSummary refresh_impl(MapsCache* cache);
   struct Rule {
     uint64_t id = 0;
     ImageSelector filter{};
@@ -1717,7 +1797,7 @@ class RuleSet {
   // Apply one rule to one already-matched image instance, updating bindings.
   void apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
                            const char* expected_path, RuleSummary& summary,
-                           RuleOperationEvent* event = nullptr);
+                           RuleOperationEvent* event = nullptr, MapsCache* cache = nullptr);
   // Re-verify an installed system-image binding found again by refresh().
   void record_verification(size_t index, Error error, RuleSummary& summary,
                            RuleOperationEvent& event);
@@ -1842,4 +1922,33 @@ class OriginalSlot {
 };
 }  // namespace yukiplt
 
+namespace yukiplt {
+YUKIPLT_API HookResult hook_batch_cached(MapsCache&, const ImageView&, const HookRequest*, size_t,
+                                         SlotReport* = nullptr, OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_batch_named_cached(MapsCache&, const NamedImage&, const HookRequest*,
+                                               size_t, SlotReport* = nullptr,
+                                               OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_imports_cached(MapsCache&, const ImageView&, const SelectedHookRequest*,
+                                           size_t, SlotReport* = nullptr,
+                                           OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_imports_named_cached(MapsCache&, const NamedImage&,
+                                                 const SelectedHookRequest*, size_t,
+                                                 SlotReport* = nullptr,
+                                                 OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_function_imports_cached(MapsCache&, const ImageView&,
+                                                    const FunctionHookRequestEx*, size_t,
+                                                    SlotReport* = nullptr,
+                                                    OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_function_imports_named_cached(MapsCache&, const NamedImage&,
+                                                          const FunctionHookRequestEx*, size_t,
+                                                          SlotReport* = nullptr,
+                                                          OperationDiagnostic* = nullptr);
+YUKIPLT_API HookResult hook_batch_nonnull_named_cached(MapsCache&, const NamedImage&,
+                                                       const HookRequest*, size_t,
+                                                       SlotReport* = nullptr,
+                                                       OperationDiagnostic* = nullptr);
+YUKIPLT_API Error unhook_cached(MapsCache&, HookHandle&, SlotReport* = nullptr, size_t = 0,
+                                OperationDiagnostic* = nullptr);
+YUKIPLT_API Error query_cached(MapsCache&, const HookHandle&, SlotReport*, size_t, size_t*);
+}  // namespace yukiplt
 #endif  // YUKIPLT_HPP_

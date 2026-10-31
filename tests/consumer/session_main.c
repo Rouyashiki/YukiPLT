@@ -56,13 +56,20 @@ static int exercise(int functions) {
   if (error.code || failed != SIZE_MAX) return 3;
   if (yukiplt_c_prepare_session(&plan, &session).code || yukiplt_c_plan_destroy(&plan).code)
     return 4;
+  yukiplt_c_maps_cache cache = {0};
+  if (yukiplt_c_maps_cache_create(&cache).code || yukiplt_c_maps_cache_capture(&cache).code)
+    return 39;
   yukiplt_c_summary summary;
-  if (yukiplt_c_session_install(&session, &summary).code || summary.succeeded != 1) return 5;
-  if (call(1) != 111 || yukiplt_c_session_destroy(&session).code != YUKIPLT_C_INVALID_ARGUMENT)
+  if (yukiplt_c_session_install_cached(&cache, &session, &summary).code || summary.succeeded != 1)
+    return 5;
+  if (call(1) != 111 || yukiplt_c_session_destroy(&session).code != YUKIPLT_C_INVALID_ARGUMENT ||
+      yukiplt_c_maps_cache_destroy(&cache).code != YUKIPLT_C_INVALID_ARGUMENT)
     return 6;
-  if (yukiplt_c_session_unhook(&session, &summary).code || summary.retained || call(1) != 11)
+  if (yukiplt_c_session_unhook_cached(&cache, &session, &summary).code || summary.retained ||
+      call(1) != 11)
     return 7;
   if (yukiplt_c_session_destroy(&session).code) return 8;
+  if (yukiplt_c_maps_cache_destroy(&cache).code) return 40;
   // Keep provider/target loaded until both original snapshots are no longer used.
   if (!functions) {
     retained_library = library;
@@ -95,9 +102,13 @@ static int invalidation(void) {
 }
 
 static void* candidate_original;
+static void* nonnull_original;
 static void* rule_originals[1];
 static int candidate_replacement(int x) {
   return ((function)yukiplt_c_load_original(&candidate_original))(x) + 100;
+}
+static int nonnull_replacement(int x) {
+  return ((function)yukiplt_c_load_original(&nonnull_original))(x) + 100;
 }
 static int rule_replacement(int x) {
   return ((function)yukiplt_c_load_original(&rule_originals[0]))(x) + 100;
@@ -192,15 +203,33 @@ static int rules_and_candidates(void) {
           .code)
     return 31;
   free(text);
-  free(path_text);
+  yukiplt_c_maps_cache cache = {0};
+  if (yukiplt_c_maps_cache_create(&cache).code || yukiplt_c_maps_cache_capture(&cache).code)
+    return 41;
   yukiplt_c_rule_report installed = {0}, restored = {0};
-  if (yukiplt_c_rules_refresh(&rules, &installed).code || call(1) != 111) return 32;
+  if (yukiplt_c_rules_refresh_cached(&cache, &rules, &installed).code || call(1) != 111) return 32;
+  yukiplt_c_rule_report retained = {0};
+  if (yukiplt_c_rules_refresh_cached(&cache, &rules, &retained).code ||
+      yukiplt_c_rule_report_destroy(&retained).code)
+    return 42;
   if (yukiplt_c_rules_destroy(&rules).code != YUKIPLT_C_INVALID_ARGUMENT) return 33;
-  if (yukiplt_c_rules_remove(&rules, rule_id, &restored).code || call(1) != 11) return 34;
+  if (yukiplt_c_rules_remove_cached(&cache, &rules, rule_id, &restored).code || call(1) != 11)
+    return 34;
   size_t removed = 0;
   if (yukiplt_c_rules_prune_history(&rules, &removed).code || removed != 1 ||
       yukiplt_c_rules_destroy(&rules).code)
     return 35;
+  yukiplt_c_named_image named = {sizeof(named), image_record.image, path};
+  yukiplt_c_request request = {YUKIPLT_C_SELECTOR("sample_add"), (void*)nonnull_replacement,
+                               &nonnull_original};
+  yukiplt_c_handle handle = {0};
+  if (yukiplt_c_hook_batch_nonnull_named_cached(&cache, &named, &request, 1, &handle, NULL, NULL)
+          .code ||
+      call(1) != 111 || yukiplt_c_unhook_diagnosed_cached(&cache, &handle, NULL, 0, NULL).code ||
+      call(1) != 11)
+    return 44;
+  free(path_text);
+  if (yukiplt_c_maps_cache_destroy(&cache).code) return 43;
   if (dlclose(library)) return 36;
   yukiplt_c_rule_report_info info;
   if (yukiplt_c_rule_report_get_info(&installed, &info).code || info.summary.retained != 1 ||

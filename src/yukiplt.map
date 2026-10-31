@@ -17,6 +17,9 @@
       yukiplt::find_function_import*;
       yukiplt::find_images*;
       yukiplt::find_image_containing*;
+      yukiplt::MapsCache::*;
+      yukiplt::prepare_fork*;
+      yukiplt::after_fork*;
       yukiplt::hook*;
       yukiplt::unhook*;
       yukiplt::abandon*;

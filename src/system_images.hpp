@@ -40,15 +40,17 @@ ImageEnumerator active_image_enumerator() noexcept;
 // hook_function_imports contract.
 HookResult hook_function_imports_at(const ImageView& image, const char* expected_path,
                                     const FunctionHookRequest* reqs, size_t count,
-                                    SlotReport* reports);
+                                    SlotReport* reports, MapsCache* cache = nullptr);
 
 /// hook_imports() / hook_function_imports_ex() for a planned system image whose
 /// discovery path is known; same expected_path rule as above.
 HookResult hook_imports_at(const ImageView& image, const char* expected_path,
-                           const SelectedHookRequest* reqs, size_t count, SlotReport* reports);
+                           const SelectedHookRequest* reqs, size_t count, SlotReport* reports,
+                           MapsCache* cache = nullptr);
 HookResult hook_function_imports_ex_at(const ImageView& image, const char* expected_path,
                                        const FunctionHookRequestEx* reqs, size_t count,
-                                       SlotReport* reports, RecoveryDiagnostic* diagnostic);
+                                       SlotReport* reports, RecoveryDiagnostic* diagnostic,
+                                       MapsCache* cache = nullptr);
 
 /// The live path (dlpi_name, "" when absent) of the system image with exactly
 /// this bias/phdr/phnum, read under the linker lock.  kImageInvalidated when no
@@ -78,7 +80,8 @@ struct BindingVerificationStatistics {
 // op_mutex and read maps once. Paths must agree. Errors preserve ownership;
 // preparation failure forbids installs. Matching addresses/paths cannot exclude ABA.
 Error verify_installed_bindings(InstalledBindingVerification* entries, size_t count,
-                                BindingVerificationStatistics* statistics = nullptr);
+                                BindingVerificationStatistics* statistics = nullptr,
+                                MapsCache* cache = nullptr);
 
 }  // namespace yukiplt::detail
 

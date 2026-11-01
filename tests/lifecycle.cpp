@@ -1129,6 +1129,36 @@ TEST(MultithreadFork, DrainsCStoreBeforePublishingObjectToken) {
 }  // namespace
 
 namespace contracts_checks {
+TEST_F(ContractFixture, ForkDrainsCRecoveryDiagnosticWriteback) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  auto image_view = view();
+  yukiplt_c_image image{image_view.load_bias, image_view.phdr_table, image_view.phdr_count,
+                        image_view.instance_token};
+  yukiplt_c_request request{YUKIPLT_C_SELECTOR("alpha"), kReplA, nullptr};
+  yukiplt_c_handle handle{};
+  ASSERT_EQ(yukiplt_c_hook_batch(&image, &request, 1, &handle, nullptr).code, 0u);
+  yukiplt_c_recovery_diagnostic diagnostic{};
+  diagnostic.stage = UINT32_MAX;
+  yukiplt_c_error result{};
+  checkpoint_entered.store(false);
+  std::thread worker([&] {
+    detail::set_mutex_unlock_callback(detail::op_mutex().native_handle(), true, await_fork_drain);
+    result = yukiplt_c_query_recovery(&handle, &diagnostic, nullptr, 0);
+  });
+  while (!checkpoint_entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) {
+    if (diagnostic.stage == UINT32_MAX || diagnostic.error.code) _exit(1);
+    _exit(yukiplt_c_unhook(&handle, nullptr, 0).code);
+  }
+  worker.join();
+  wait_child(child);
+  EXPECT_EQ(result.code, 0u);
+  EXPECT_NE(diagnostic.stage, UINT32_MAX);
+  EXPECT_EQ(yukiplt_c_unhook(&handle, nullptr, 0).code, 0u);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+
 TEST_F(ContractFixture, ForkDrainsHandleDiagnostics) {
   static std::atomic<bool> release{false};
   for (bool timeout : {true, false}) {

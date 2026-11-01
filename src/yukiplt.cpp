@@ -2233,10 +2233,15 @@ Error forget_image(const ImageView& custom_image) {
 
 Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, ResidualPage* pages,
                      size_t capacity) {
-  yukiplt::detail::OperationGuard admission;
+  detail::OperationGuard admission;
   if (admission.error()) return admission.error();
-
-  if (Error e = detail::process_entry()) return e;
+  return detail::query_recovery_admitted(admission.context(), handle, diagnostic, pages, capacity);
+}
+namespace detail {
+Error query_recovery_admitted(const AdmittedOperation& admission, const HookHandle& handle,
+                              RecoveryDiagnostic* diagnostic, ResidualPage* pages,
+                              size_t capacity) {
+  if (admission.error()) return admission.error();
   if (diagnostic == nullptr || (pages == nullptr && capacity != 0))
     return Error::Make(ErrorCode::kNullPointer);
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
@@ -2248,6 +2253,7 @@ Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, R
     return detail::current_exception_error();
   }
 }
+}  // namespace detail
 
 }  // namespace yukiplt
 

@@ -155,7 +155,7 @@ typedef struct yukiplt_c_selector {
   size_t relocation_index;  // YUKIPLT_C_ANY_RELOCATION for no index filter.
 } yukiplt_c_selector;
 #define YUKIPLT_C_SELECTOR(name) \
-  { (name), YUKIPLT_C_VERSION_ANY, NULL, NULL, YUKIPLT_C_HIDDEN_ANY, YUKIPLT_C_ANY_RELOCATION }
+  {(name), YUKIPLT_C_VERSION_ANY, NULL, NULL, YUKIPLT_C_HIDDEN_ANY, YUKIPLT_C_ANY_RELOCATION}
 typedef struct yukiplt_c_request {
   yukiplt_c_selector target;
   void* replacement;
@@ -267,14 +267,12 @@ typedef struct yukiplt_c_function_selector {
   uint32_t index_source;  // YUKIPLT_C_RELOC_SOURCE_*; scopes base.relocation_index.
   yukiplt_c_selector base;
 } yukiplt_c_function_selector;
-#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                                  \
-  {                                                                                        \
-    (uint32_t)sizeof(yukiplt_c_function_selector),                                         \
-        YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
-            YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
-        YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
-        YUKIPLT_C_SELECTOR(name)                                                           \
-  }
+#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                             \
+  {(uint32_t)sizeof(yukiplt_c_function_selector),                                     \
+   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
+       YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
+   YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
+   YUKIPLT_C_SELECTOR(name)}
 typedef struct yukiplt_c_function_request {
   yukiplt_c_function_selector target;
   void* replacement;

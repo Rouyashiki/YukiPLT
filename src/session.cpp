@@ -105,6 +105,9 @@ Result<bool> system_contains_address(const ImageView& view, uintptr_t address) {
 }  // namespace
 
 Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (Error invalid = detail::validate_image_selector(selector)) return invalid;
 #if defined(__linux__) || defined(__ANDROID__)
@@ -161,6 +164,9 @@ Result<std::vector<NamedImage>> find_images(const ImageSelector& selector) {
 }
 
 Result<NamedImage> find_image_containing(const void* address) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   uintptr_t query_address = reinterpret_cast<uintptr_t>(address);
 #if defined(__ANDROID__) && defined(__aarch64__)
@@ -248,6 +254,9 @@ Error validate_image_selector(const ImageSelector& selector) noexcept {
 namespace yukiplt {
 
 Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t* failed_target) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (failed_target) *failed_target = ~size_t{0};
   if (targets == nullptr || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
@@ -330,6 +339,9 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
 }
 
 Result<HookSession> prepare_session(const HookPlan& plan) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (plan.targets().empty()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -400,8 +412,16 @@ SessionSummary HookSession::install_impl(MapsCache* cache) {
   }
   return summary;
 }
-SessionSummary HookSession::install() { return install_impl(nullptr); }
-SessionSummary HookSession::install_cached(MapsCache& cache) { return install_impl(&cache); }
+SessionSummary HookSession::install() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return install_impl(nullptr);
+}
+SessionSummary HookSession::install_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return install_impl(&cache);
+}
 
 SessionSummary HookSession::unhook_impl(MapsCache* cache) {
   if (detail::process_entry()) return {0, 0, 1, 0};
@@ -429,10 +449,21 @@ SessionSummary HookSession::unhook_impl(MapsCache* cache) {
   }
   return summary;
 }
-SessionSummary HookSession::unhook() { return unhook_impl(nullptr); }
-SessionSummary HookSession::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
+SessionSummary HookSession::unhook() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(nullptr);
+}
+SessionSummary HookSession::unhook_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(&cache);
+}
 
 SessionSummary HookSession::abandon() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto& group : images_) {
@@ -484,6 +515,9 @@ FunctionImportSelector exact_function_selector(const FunctionImport& chosen) noe
 }
 Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targets, size_t count,
                                                   size_t* failed_target) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (failed_target) *failed_target = ~size_t{0};
   if (!targets || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
@@ -568,6 +602,9 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
   }
 }
 Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& plan) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (plan.targets().empty()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -640,8 +677,15 @@ SessionSummary FunctionHookSession::install_impl(MapsCache* cache) {
   }
   return summary;
 }
-SessionSummary FunctionHookSession::install() { return install_impl(nullptr); }
+SessionSummary FunctionHookSession::install() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return install_impl(nullptr);
+}
 SessionSummary FunctionHookSession::install_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return install_impl(&cache);
 }
 
@@ -679,10 +723,21 @@ SessionSummary FunctionHookSession::unhook_impl(MapsCache* cache) {
   }
   return summary;
 }
-SessionSummary FunctionHookSession::unhook() { return unhook_impl(nullptr); }
-SessionSummary FunctionHookSession::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
+SessionSummary FunctionHookSession::unhook() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(nullptr);
+}
+SessionSummary FunctionHookSession::unhook_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(&cache);
+}
 
 SessionSummary FunctionHookSession::abandon() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   if (detail::process_entry()) return {0, 0, 1, 0};
   SessionSummary summary;
   for (auto& group : images_) {
@@ -712,3 +767,66 @@ SessionSummary FunctionHookSession::abandon() {
 namespace yukiplt::detail {
 ImageEnumerator active_image_enumerator() noexcept { return &find_images; }
 }  // namespace yukiplt::detail
+
+namespace yukiplt {
+SessionSummary HookSession::unhook_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook_cached(cache);
+}
+SessionSummary HookSession::install_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return install_cached(cache);
+}
+SessionSummary HookSession::abandon(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return abandon();
+}
+SessionSummary HookSession::unhook(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook();
+}
+SessionSummary HookSession::install(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return install();
+}
+SessionSummary FunctionHookSession::unhook_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook_cached(cache);
+}
+SessionSummary FunctionHookSession::install_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return install_cached(cache);
+}
+SessionSummary FunctionHookSession::abandon(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return abandon();
+}
+SessionSummary FunctionHookSession::unhook(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook();
+}
+SessionSummary FunctionHookSession::install(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return install();
+}
+}  // namespace yukiplt

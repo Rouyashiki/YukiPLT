@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "../c_abi_layout_checks.h"
-#if defined(__ANDROID__)
-#include <unistd.h>
-#endif
 
 #include "yukiplt.h"
 int run_c_scenarios(void);
@@ -42,6 +43,33 @@ done:
   if (yukiplt_c_image_list_destroy(&images).code) result = 1;
   return result;
 }
+static unsigned worker_ready, worker_stop;
+static void* fork_worker(void* unused) {
+  (void)unused;
+  __atomic_store_n(&worker_ready, 1, __ATOMIC_RELEASE);
+  while (!__atomic_load_n(&worker_stop, __ATOMIC_ACQUIRE)) sched_yield();
+  return NULL;
+}
+static int check_multithread_fork(void) {
+  yukiplt_c_fork_config config = {sizeof(config), YUKIPLT_C_FORK_NATIVE, 5000, NULL, NULL, NULL};
+  if (yukiplt_c_enable_atfork(&config).code) return 70;
+  pthread_t worker;
+  if (pthread_create(&worker, NULL, fork_worker, NULL)) return 71;
+  while (!__atomic_load_n(&worker_ready, __ATOMIC_ACQUIRE)) sched_yield();
+  pid_t child = fork();
+  if (child == 0) {
+    yukiplt_c_fork_status status = {0};
+    status.struct_size = sizeof(status);
+    if (yukiplt_c_get_fork_status(&status).code || status.phase != YUKIPLT_C_FORK_READY) _exit(72);
+    _exit(run_c_scenarios());
+  }
+  __atomic_store_n(&worker_stop, 1, __ATOMIC_RELEASE);
+  pthread_join(worker, NULL);
+  if (yukiplt_c_disable_atfork().code || child < 0) return 73;
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status)) return 74;
+  return 0;
+}
 int main(void) {
   void* original = NULL;
   if (yukiplt_c_abi_version() != 1 || !yukiplt_c_has_feature(YUKIPLT_C_FEATURE_ORIGINAL_LOAD) ||
@@ -63,6 +91,7 @@ int main(void) {
   }
 #endif
   if (owned_metadata()) return 3;
+  if (check_multithread_fork()) return 75;
   const int scenarios = run_c_scenarios();
   if (scenarios) return scenarios;
   puts("c_consumer: passed");

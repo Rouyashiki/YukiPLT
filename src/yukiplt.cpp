@@ -529,6 +529,12 @@ HookResult install(const ImageView& view, const InspectedImage& img, const HookR
                    RecoveryDiagnostic* diagnostic = nullptr, const char* system_path = nullptr,
                    detail::CauseContext* cause = nullptr, bool require_nonnull = false,
                    MapsCache* cache = nullptr) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
@@ -546,6 +552,12 @@ HookResult install(const ImageView& view, const InspectedImage& img,
                    size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
                    const char* system_path = nullptr, detail::CauseContext* cause = nullptr,
                    MapsCache* cache = nullptr) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
@@ -560,6 +572,12 @@ HookResult install(const ImageView& view, const InspectedImage& img,
                    size_t report_cap, RecoveryDiagnostic* diagnostic = nullptr,
                    const char* system_path = nullptr, detail::CauseContext* cause = nullptr,
                    MapsCache* cache = nullptr) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return install_planned(
       view, reports, report_cap,
       [&](detail::SmallVec<PlannedSlot, 4>& planned) {
@@ -612,6 +630,9 @@ void HookHandle::warn_if_installed() const noexcept {
 // image_from_soname
 
 Result<ImageView> image_from_soname(const char* soname) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
 #if defined(__linux__) || defined(__ANDROID__)
   struct CallbackData {
@@ -672,6 +693,9 @@ Result<ImageView> image_from_soname(const char* soname) {
 
 HookResult hook(const ImageView& image, const char* symbol_name, void* replacement,
                 void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   HookRequest req;
   req.symbol = symbol_name;
   req.replacement = replacement;
@@ -736,12 +760,18 @@ HookResult hook_batch_impl(const ImageView& image, const HookRequest* reqs, size
 
 HookResult hook_batch(const ImageView& image, const HookRequest* reqs, size_t count,
                       SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   return hook_batch_impl(image, reqs, count, reports, nullptr);
 }
 // Precisely selected imports
 
 HookResult hook_import(const ImageView& image, const ImportSelector& selector, void* replacement,
                        void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   SelectedHookRequest request{selector, replacement, out_original};
   return hook_imports(image, &request, 1, report);
 }
@@ -797,6 +827,9 @@ HookResult hook_imports_impl(const ImageView& image, const char* expected_path,
 
 HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs, size_t count,
                         SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   return hook_imports_impl(image, nullptr, reqs, count, reports, nullptr);
 }
 // Function GLOB_DAT / APS2 imports (opt-in)
@@ -808,12 +841,18 @@ HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
 
 HookResult hook_function_import(const ImageView& image, const FunctionImportSelector& selector,
                                 void* replacement, void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   FunctionHookRequest request{selector, replacement, out_original};
   return hook_function_imports(image, &request, 1, report);
 }
 
 HookResult hook_function_imports(const ImageView& image, const FunctionHookRequest* reqs,
                                  size_t count, SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   return detail::hook_function_imports_at(image, nullptr, reqs, count, reports);
 }
 
@@ -894,6 +933,12 @@ namespace yukiplt {
 HookResult hook_function_imports_ex(const ImageView& image, const FunctionHookRequestEx* reqs,
                                     size_t count, SlotReport* reports,
                                     RecoveryDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return detail::hook_function_imports_ex_at(image, nullptr, reqs, count, reports, diagnostic);
 }
 
@@ -1307,11 +1352,20 @@ HookResult diagnosed_install(OperationDiagnostic* diagnostic, Call&& call) {
 }  // namespace
 
 Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   return unhook_impl(handle, reports, cap, nullptr);
 }
 
 Error unhook_diagnosed(HookHandle& handle, SlotReport* reports, size_t cap,
                        OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return admission.error();
+  }
+
   detail::CauseContext context;
   const bool held = handle.valid();
   RecoveryDiagnostic recorded;
@@ -1323,6 +1377,12 @@ Error unhook_diagnosed(HookHandle& handle, SlotReport* reports, size_t cap,
 
 HookResult hook_batch_diagnosed(const ImageView& image, const HookRequest* reqs, size_t count,
                                 SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(
       diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
         return hook_batch_impl(image, reqs, count, reports, recorded, nullptr, cause);
@@ -1332,6 +1392,12 @@ HookResult hook_batch_diagnosed(const ImageView& image, const HookRequest* reqs,
 HookResult hook_imports_diagnosed(const ImageView& image, const SelectedHookRequest* reqs,
                                   size_t count, SlotReport* reports,
                                   OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(
       diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
         return hook_imports_impl(image, nullptr, reqs, count, reports, recorded, cause);
@@ -1341,6 +1407,12 @@ HookResult hook_imports_diagnosed(const ImageView& image, const SelectedHookRequ
 HookResult hook_function_imports_diagnosed(const ImageView& image,
                                            const FunctionHookRequestEx* reqs, size_t count,
                                            SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(
       diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
         return hook_functions_impl(image, nullptr, reqs, count, reports, recorded, cause);
@@ -1387,14 +1459,23 @@ Result<Snapshot> inspect_metadata(const ImageView& image, Collect collect_metada
 }  // namespace
 
 Result<ImportSnapshot> inspect_imports(const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   return inspect_metadata<ImportSnapshot>(image, detail::snapshot_imports);
 }
 
 Result<VersionedImportSnapshot> inspect_versioned_imports(const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   return inspect_metadata<VersionedImportSnapshot>(image, detail::snapshot_versioned_imports);
 }
 
 Result<VersionedImport> find_import(const ImageView& image, const ImportSelector& selector) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   auto invalid = detail::validate_selector(selector);
   if (invalid) return invalid;
   return inspect_metadata<VersionedImport>(
@@ -1408,6 +1489,9 @@ Result<VersionedImport> find_import(const ImageView& image, const ImportSelector
 }
 
 Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, uint32_t sources) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   // Validate the source mask before any image access: a zero or out-of-range
   // mask is a programming error, not an image problem.
   if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela | kSourceRel |
@@ -1423,6 +1507,9 @@ Result<FunctionImportSnapshot> inspect_function_imports(const ImageView& image, 
 
 Result<FunctionImport> find_function_import(const ImageView& image,
                                             const FunctionImportSelector& selector) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   auto invalid = detail::validate_function_selector(selector);
   if (invalid) return invalid;
   return inspect_metadata<FunctionImport>(
@@ -1448,18 +1535,27 @@ Error validate_named_image(const NamedImage& image,
 }  // namespace
 
 Result<ImportSnapshot> inspect_imports_named(const NamedImage& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error error = validate_named_image(image)) return error;
   return inspect_metadata<ImportSnapshot>(image.image, detail::snapshot_imports,
                                           image.path.c_str());
 }
 
 Result<VersionedImportSnapshot> inspect_versioned_imports_named(const NamedImage& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error error = validate_named_image(image)) return error;
   return inspect_metadata<VersionedImportSnapshot>(image.image, detail::snapshot_versioned_imports,
                                                    image.path.c_str());
 }
 
 Result<VersionedImport> find_import_named(const NamedImage& image, const ImportSelector& selector) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error error = validate_named_image(image)) return error;
   if (Error error = detail::validate_selector(selector)) return error;
   return inspect_metadata<VersionedImport>(
@@ -1476,6 +1572,9 @@ Result<VersionedImport> find_import_named(const NamedImage& image, const ImportS
 
 Result<FunctionImportSnapshot> inspect_function_imports_named(const NamedImage& image,
                                                               uint32_t sources) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error error = validate_named_image(image)) return error;
   if (sources == 0 || (sources & ~(kSourceJmprel | kSourceRela | kSourceAndroidRela | kSourceRel |
                                    kSourceAndroidRel)) != 0)
@@ -1492,6 +1591,9 @@ Result<FunctionImportSnapshot> inspect_function_imports_named(const NamedImage& 
 
 Result<FunctionImport> find_function_import_named(const NamedImage& image,
                                                   const FunctionImportSelector& selector) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error error = validate_named_image(image)) return error;
   if (Error error = detail::validate_function_selector(selector)) return error;
   return inspect_metadata<FunctionImport>(
@@ -1508,24 +1610,36 @@ Result<FunctionImport> find_function_import_named(const NamedImage& image,
 
 HookResult hook_named(const NamedImage& image, const char* symbol_name, void* replacement,
                       void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   const HookRequest request{symbol_name, replacement, out_original};
   return hook_batch_named(image, &request, 1, report);
 }
 
 HookResult hook_batch_named(const NamedImage& image, const HookRequest* reqs, size_t count,
                             SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   if (Error error = validate_named_image(image)) return {error, HookHandle{}};
   return hook_batch_impl(image.image, reqs, count, reports, nullptr, image.path.c_str());
 }
 
 HookResult hook_import_named(const NamedImage& image, const ImportSelector& selector,
                              void* replacement, void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   const SelectedHookRequest request{selector, replacement, out_original};
   return hook_imports_named(image, &request, 1, report);
 }
 
 HookResult hook_imports_named(const NamedImage& image, const SelectedHookRequest* reqs,
                               size_t count, SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   if (Error error = validate_named_image(image)) return {error, HookHandle{}};
   return hook_imports_impl(image.image, image.path.c_str(), reqs, count, reports, nullptr);
 }
@@ -1533,12 +1647,18 @@ HookResult hook_imports_named(const NamedImage& image, const SelectedHookRequest
 HookResult hook_function_import_named(const NamedImage& image,
                                       const FunctionImportSelector& selector, void* replacement,
                                       void** out_original, SlotReport* report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   const FunctionHookRequest request{selector, replacement, out_original};
   return hook_function_imports_named(image, &request, 1, report);
 }
 
 HookResult hook_function_imports_named(const NamedImage& image, const FunctionHookRequest* reqs,
                                        size_t count, SlotReport* reports) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {admission.error(), HookHandle{}};
+
   if (Error error = validate_named_image(image)) return {error, HookHandle{}};
   return hook_functions_impl(image.image, image.path.c_str(), reqs, count, reports);
 }
@@ -1546,6 +1666,12 @@ HookResult hook_function_imports_named(const NamedImage& image, const FunctionHo
 HookResult hook_function_imports_ex_named(const NamedImage& image,
                                           const FunctionHookRequestEx* reqs, size_t count,
                                           SlotReport* reports, RecoveryDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   RecoveryDiagnostic value;
   value.stage = OperationStage::kPrepare;
   const Error invalid = validate_named_image(image);
@@ -1561,6 +1687,12 @@ HookResult hook_function_imports_ex_named(const NamedImage& image,
 HookResult hook_batch_diagnosed_named(const NamedImage& image, const HookRequest* reqs,
                                       size_t count, SlotReport* reports,
                                       OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded,
                                            detail::CauseContext* cause) {
     if (Error error = validate_named_image(image, cause)) return HookResult{error, HookHandle{}};
@@ -1571,6 +1703,12 @@ HookResult hook_batch_diagnosed_named(const NamedImage& image, const HookRequest
 HookResult hook_batch_nonnull_diagnosed_named(const NamedImage& image, const HookRequest* reqs,
                                               size_t count, SlotReport* reports,
                                               OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(diagnostic,
                            [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
                              if (Error error = validate_named_image(image, cause))
@@ -1583,6 +1721,12 @@ HookResult hook_batch_nonnull_diagnosed_named(const NamedImage& image, const Hoo
 HookResult hook_imports_diagnosed_named(const NamedImage& image, const SelectedHookRequest* reqs,
                                         size_t count, SlotReport* reports,
                                         OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(diagnostic,
                            [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
                              if (Error error = validate_named_image(image, cause))
@@ -1596,6 +1740,12 @@ HookResult hook_function_imports_diagnosed_named(const NamedImage& image,
                                                  const FunctionHookRequestEx* reqs, size_t count,
                                                  SlotReport* reports,
                                                  OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(diagnostic,
                            [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
                              if (Error error = validate_named_image(image, cause))
@@ -1807,6 +1957,9 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
 }
 
 Error abandon(HookHandle& handle) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -1939,14 +2092,23 @@ static Error query_impl(const HookHandle& handle, SlotReport* out, size_t cap, s
 }
 
 Error query(const HookHandle& h, SlotReport* out, size_t cap, size_t* count) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   return query_impl(h, out, cap, count);
 }
 Error query_cached(MapsCache& cache, const HookHandle& h, SlotReport* out, size_t cap,
                    size_t* count) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   return query_impl(h, out, cap, count, &cache);
 }
 
 Error forget_image(const ImageView& custom_image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (custom_image.instance_token == 0) return Error::Make(ErrorCode::kInvalidArgument);
   try {
@@ -1960,6 +2122,9 @@ Error forget_image(const ImageView& custom_image) {
 
 Error query_recovery(const HookHandle& handle, RecoveryDiagnostic* diagnostic, ResidualPage* pages,
                      size_t capacity) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (diagnostic == nullptr || (pages == nullptr && capacity != 0))
     return Error::Make(ErrorCode::kNullPointer);
@@ -1995,6 +2160,9 @@ struct CausePolicy {
 constexpr CausePolicy policy(ErrorCode code) noexcept {
   using C = ErrorCause;
   switch (code) {
+    case ErrorCode::kForkInProgress:
+    case ErrorCode::kForkChildUnavailable:
+      return {C::kForkProtocol, bit(C::kForkProtocol)};
     case ErrorCode::kOutOfBounds:
       return {C::kMetadataBounds,
               bit(C::kMetadataBounds) | bit(C::kScanBudget) | bit(C::kMapsCoverage)};
@@ -2068,6 +2236,12 @@ extern "C" YUKIPLT_API void* yukiplt_c_load_original(void* const* storage) noexc
 namespace yukiplt {
 HookResult hook_batch_cached(MapsCache& cache, const ImageView& image, const HookRequest* reqs,
                              size_t count, SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(diagnostic, [&](RecoveryDiagnostic* recorded,
                                            detail::CauseContext* cause) {
     return hook_batch_impl(image, reqs, count, reports, recorded, nullptr, cause, false, &cache);
@@ -2076,6 +2250,12 @@ HookResult hook_batch_cached(MapsCache& cache, const ImageView& image, const Hoo
 HookResult hook_batch_named_cached(MapsCache& cache, const NamedImage& image,
                                    const HookRequest* reqs, size_t count, SlotReport* reports,
                                    OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
     Error error = Error::Make(ErrorCode::kInvalidArgument);
     finish_diagnostic(diagnostic, {}, error);
@@ -2090,6 +2270,12 @@ HookResult hook_batch_named_cached(MapsCache& cache, const NamedImage& image,
 HookResult hook_imports_cached(MapsCache& cache, const ImageView& image,
                                const SelectedHookRequest* reqs, size_t count, SlotReport* reports,
                                OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(
       diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
         return hook_imports_impl(image, nullptr, reqs, count, reports, recorded, cause, &cache);
@@ -2098,6 +2284,12 @@ HookResult hook_imports_cached(MapsCache& cache, const ImageView& image,
 HookResult hook_imports_named_cached(MapsCache& cache, const NamedImage& image,
                                      const SelectedHookRequest* reqs, size_t count,
                                      SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
     Error error = Error::Make(ErrorCode::kInvalidArgument);
     finish_diagnostic(diagnostic, {}, error);
@@ -2112,6 +2304,12 @@ HookResult hook_imports_named_cached(MapsCache& cache, const NamedImage& image,
 HookResult hook_function_imports_cached(MapsCache& cache, const ImageView& image,
                                         const FunctionHookRequestEx* reqs, size_t count,
                                         SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   return diagnosed_install(
       diagnostic, [&](RecoveryDiagnostic* recorded, detail::CauseContext* cause) {
         return hook_functions_impl(image, nullptr, reqs, count, reports, recorded, cause, &cache);
@@ -2121,6 +2319,12 @@ HookResult hook_function_imports_named_cached(MapsCache& cache, const NamedImage
                                               const FunctionHookRequestEx* reqs, size_t count,
                                               SlotReport* reports,
                                               OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
     Error error = Error::Make(ErrorCode::kInvalidArgument);
     finish_diagnostic(diagnostic, {}, error);
@@ -2135,6 +2339,12 @@ HookResult hook_function_imports_named_cached(MapsCache& cache, const NamedImage
 HookResult hook_batch_nonnull_named_cached(MapsCache& cache, const NamedImage& image,
                                            const HookRequest* reqs, size_t count,
                                            SlotReport* reports, OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {admission.error(), HookHandle{}};
+  }
+
   if (image.image.instance_token || image.path.find('\0') != std::string::npos) {
     Error error = Error::Make(ErrorCode::kInvalidArgument);
     finish_diagnostic(diagnostic, {}, error);
@@ -2148,6 +2358,12 @@ HookResult hook_batch_nonnull_named_cached(MapsCache& cache, const NamedImage& i
 }
 Error unhook_cached(MapsCache& cache, HookHandle& handle, SlotReport* reports, size_t cap,
                     OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return admission.error();
+  }
+
   detail::CauseContext cause;
   RecoveryDiagnostic recorded;
   bool held = handle.valid();

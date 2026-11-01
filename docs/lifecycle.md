@@ -65,7 +65,8 @@ on each handle, session or RuleSet. The lock order is linker then operation;
 host callbacks run outside both. Avoid synchronous reentry through hooks on
 allocators or other functions used inside YukiPLT operations. Keep calls outside
 signal handlers and cancellation/longjmp boundaries. Child calls after a
-multithreaded fork before exec require the explicit host coordination described
+multithreaded fork before exec use explicit automatic atfork activation together
+with the host runtime coordination described
 in [Cached maps and controlled fork](cached-maps.md).
 
 Serialize other writers of page permissions against YukiPLT. Live transactions

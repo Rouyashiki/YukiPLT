@@ -26,3 +26,13 @@ add_dependencies(cpp_consumer hook_target)
 enable_testing()
 add_test(NAME c_consumer COMMAND c_consumer)
 add_test(NAME cpp_consumer COMMAND cpp_consumer)
+
+get_target_property(_yukiplt_type YukiPLT::yukiplt TYPE)
+if(_yukiplt_type STREQUAL "STATIC_LIBRARY")
+    add_library(fork_host SHARED fork_host.cpp)
+    target_link_libraries(fork_host PRIVATE YukiPLT::yukiplt)
+    target_link_options(fork_host PRIVATE -Wl,-z,max-page-size=16384
+        -Wl,-Bsymbolic-functions -Wl,--exclude-libs,ALL)
+    target_compile_definitions(cpp_consumer PRIVATE YUKIPLT_TEST_UNLOAD=1)
+    add_dependencies(cpp_consumer fork_host)
+endif()

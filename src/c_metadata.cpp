@@ -75,6 +75,10 @@ Error inspect_snapshot(const ImageView& view, const NamedImage* named, uint32_t 
 extern "C" {
 yukiplt_c_error yukiplt_c_find_images(const yukiplt_c_image_selector* selected,
                                       yukiplt_c_image_list* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!selected || !out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token || selected->struct_size != sizeof(*selected) ||
@@ -90,6 +94,10 @@ yukiplt_c_error yukiplt_c_find_images(const yukiplt_c_image_selector* selected,
 }
 yukiplt_c_error yukiplt_c_find_image_containing(const void* address,
                                                 yukiplt_c_image_list* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token) return invalid();
@@ -101,6 +109,10 @@ yukiplt_c_error yukiplt_c_find_image_containing(const void* address,
   });
 }
 yukiplt_c_error yukiplt_c_image_list_destroy(yukiplt_c_image_list* value) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return value ? destroy(value->token, Kind::kImages) : Error::Make(ErrorCode::kNullPointer);
   });
@@ -109,6 +121,10 @@ yukiplt_c_error yukiplt_c_image_list_copy(const yukiplt_c_image_list* handle,
                                           yukiplt_c_image_record* rows, size_t capacity, char* text,
                                           size_t text_capacity, size_t* required_count,
                                           size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!handle) return Error::Make(ErrorCode::kNullPointer);
     auto owned = acquire(handle->token, Kind::kImages);
@@ -131,6 +147,10 @@ yukiplt_c_error yukiplt_c_image_list_copy(const yukiplt_c_image_list* handle,
 yukiplt_c_error yukiplt_c_inspect_imports(const yukiplt_c_image* view, uint32_t kind,
                                           uint32_t sources,
                                           yukiplt_c_import_snapshot* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return view ? inspect_snapshot(image(*view), nullptr, kind, sources, out)
                 : Error::Make(ErrorCode::kNullPointer);
@@ -139,6 +159,10 @@ yukiplt_c_error yukiplt_c_inspect_imports(const yukiplt_c_image* view, uint32_t 
 yukiplt_c_error yukiplt_c_inspect_imports_named(const yukiplt_c_named_image* view, uint32_t kind,
                                                 uint32_t sources,
                                                 yukiplt_c_import_snapshot* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!view || !out || !view->path) return Error::Make(ErrorCode::kNullPointer);
     if (out->token || view->struct_size != sizeof(*view) || view->image.instance_token != 0)
@@ -150,6 +174,10 @@ yukiplt_c_error yukiplt_c_inspect_imports_named(const yukiplt_c_named_image* vie
 yukiplt_c_error yukiplt_c_select_import(const yukiplt_c_image* view,
                                         const yukiplt_c_selector* selected,
                                         yukiplt_c_import_snapshot* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!view || !selected || !out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token || !valid(*selected)) return invalid();
@@ -163,6 +191,10 @@ yukiplt_c_error yukiplt_c_select_import(const yukiplt_c_image* view,
 yukiplt_c_error yukiplt_c_select_function_import(const yukiplt_c_image* view,
                                                  const yukiplt_c_function_selector* selected,
                                                  yukiplt_c_import_snapshot* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!view || !selected || !out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token || !valid(*selected)) return invalid();
@@ -174,6 +206,10 @@ yukiplt_c_error yukiplt_c_select_function_import(const yukiplt_c_image* view,
   });
 }
 yukiplt_c_error yukiplt_c_import_snapshot_destroy(yukiplt_c_import_snapshot* value) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return value ? destroy(value->token, Kind::kImports) : Error::Make(ErrorCode::kNullPointer);
   });
@@ -183,6 +219,10 @@ yukiplt_c_error yukiplt_c_import_snapshot_copy(const yukiplt_c_import_snapshot* 
                                                char* text, size_t text_capacity,
                                                size_t* required_count, size_t* required_text,
                                                uint32_t* kind, size_t* skipped) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!handle || !kind || !skipped) return Error::Make(ErrorCode::kNullPointer);
     auto owned = acquire(handle->token, Kind::kImports);
@@ -276,7 +316,7 @@ Result<bool> predicate(const FunctionCandidate& candidate, void* context) {
   view.symbol_type = i.symbol_type;
   uint32_t accept = 2;
   const auto result = host.call(&view, host.context, &accept);
-  if (result.code > YUKIPLT_C_VMA_UNAVAILABLE || (!result.code && accept > 1)) {
+  if (result.code > YUKIPLT_C_FORK_CHILD_UNAVAILABLE || (!result.code && accept > 1)) {
     host.failure = invalid();
     return detail::with_cause(host.failure, ErrorCause::kHostCallback);
   }
@@ -293,6 +333,12 @@ yukiplt_c_error yukiplt_c_expand_candidates(const yukiplt_c_candidate_image* inp
                                             const yukiplt_c_candidate_selection* options,
                                             yukiplt_c_candidates* out,
                                             yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(*diagnostic)) return converted(invalid());
   detail::CauseContext context;
   OperationDiagnostic detail_result;
@@ -365,6 +411,10 @@ yukiplt_c_error yukiplt_c_expand_candidates(const yukiplt_c_candidate_image* inp
   return result;
 }
 yukiplt_c_error yukiplt_c_candidates_destroy(yukiplt_c_candidates* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return h ? destroy(h->token, Kind::kCandidates) : Error::Make(ErrorCode::kNullPointer);
   });
@@ -373,6 +423,10 @@ yukiplt_c_error yukiplt_c_candidates_copy(const yukiplt_c_candidates* h,
                                           yukiplt_c_candidate_record* rows, size_t capacity,
                                           char* text, size_t text_capacity, size_t* required_count,
                                           size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h) return Error::Make(ErrorCode::kNullPointer);
     auto base = acquire(h->token, Kind::kCandidates);

@@ -196,22 +196,38 @@ Error build(const Input* input, size_t count, yukiplt_c_plan* out, size_t* faile
 extern "C" {
 yukiplt_c_error yukiplt_c_build_plan(const yukiplt_c_hook_target* input, size_t count,
                                      yukiplt_c_plan* out, size_t* failed) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return build<yukiplt_c_hook_target, HookTarget>(input, count, out, failed, build_hook_plan);
   });
 }
 yukiplt_c_error yukiplt_c_build_function_plan(const yukiplt_c_function_target* input, size_t count,
                                               yukiplt_c_plan* out, size_t* failed) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return build<yukiplt_c_function_target, FunctionHookTarget>(input, count, out, failed,
                                                                 build_function_hook_plan);
   });
 }
 yukiplt_c_error yukiplt_c_plan_destroy(yukiplt_c_plan* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary(
       [&] { return h ? destroy(h->token, Kind::kPlan) : Error::Make(ErrorCode::kNullPointer); });
 }
 yukiplt_c_error yukiplt_c_plan_size(const yukiplt_c_plan* h, size_t* size) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !size) return Error::Make(ErrorCode::kNullPointer);
     auto p = get<Plan>(h, Kind::kPlan);
@@ -223,6 +239,10 @@ yukiplt_c_error yukiplt_c_plan_size(const yukiplt_c_plan* h, size_t* size) noexc
 yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan* h, size_t index,
                                       yukiplt_c_target_record* out, char* text, size_t capacity,
                                       size_t* required) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h) return Error::Make(ErrorCode::kNullPointer);
     auto p = get<Plan>(h, Kind::kPlan);
@@ -237,6 +257,10 @@ yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan* h, size_t index,
 }
 yukiplt_c_error yukiplt_c_prepare_session(const yukiplt_c_plan* h,
                                           yukiplt_c_session* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token) return invalid();
@@ -268,20 +292,40 @@ yukiplt_c_error yukiplt_c_prepare_session(const yukiplt_c_plan* h,
   });
 }
 yukiplt_c_error yukiplt_c_session_destroy(yukiplt_c_session* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary(
       [&] { return h ? destroy(h->token, Kind::kSession) : Error::Make(ErrorCode::kNullPointer); });
 }
 yukiplt_c_error yukiplt_c_session_install(yukiplt_c_session* h, yukiplt_c_summary* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) { return operate(s, Action::kInstall, out); });
 }
 yukiplt_c_error yukiplt_c_session_unhook(yukiplt_c_session* h, yukiplt_c_summary* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) { return operate(s, Action::kUnhook, out); });
 }
 yukiplt_c_error yukiplt_c_session_abandon(yukiplt_c_session* h, yukiplt_c_summary* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) { return operate(s, Action::kAbandon, out); });
 }
 yukiplt_c_error yukiplt_c_session_size(const yukiplt_c_session* h, size_t* targets,
                                        size_t* groups) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) -> Error {
     if (!targets || !groups) return Error::Make(ErrorCode::kNullPointer);
     std::visit(
@@ -296,6 +340,10 @@ yukiplt_c_error yukiplt_c_session_size(const yukiplt_c_session* h, size_t* targe
 yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session* h, size_t index,
                                          yukiplt_c_target_record* out, char* text, size_t capacity,
                                          size_t* required) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) -> Error {
     return std::visit(
         [&](const auto& v) -> Error {
@@ -310,6 +358,10 @@ yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session* h, size_t inde
 yukiplt_c_error yukiplt_c_session_group_copy(const yukiplt_c_session* h, size_t index,
                                              yukiplt_c_session_group* out, size_t* indices,
                                              size_t capacity, size_t* required) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) -> Error {
     if (!out || !required) return Error::Make(ErrorCode::kNullPointer);
     if (!indices && capacity) return invalid();
@@ -331,6 +383,10 @@ yukiplt_c_error yukiplt_c_session_recovery(const yukiplt_c_session* h, size_t in
                                            yukiplt_c_recovery_diagnostic* out,
                                            yukiplt_c_residual_page* pages, size_t capacity,
                                            size_t* required) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& s) -> Error {
     if (!out || !required) return Error::Make(ErrorCode::kNullPointer);
     if (!pages && capacity) return invalid();
@@ -381,6 +437,10 @@ extern "C" {
 yukiplt_c_error yukiplt_c_session_install_cached(const yukiplt_c_maps_cache* cache,
                                                  yukiplt_c_session* h,
                                                  yukiplt_c_summary* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& session) {
     auto lease = get_cache(cache);
     if (!lease) return invalid();
@@ -390,6 +450,10 @@ yukiplt_c_error yukiplt_c_session_install_cached(const yukiplt_c_maps_cache* cac
 yukiplt_c_error yukiplt_c_session_unhook_cached(const yukiplt_c_maps_cache* cache,
                                                 yukiplt_c_session* h,
                                                 yukiplt_c_summary* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return with_session(h, [&](Session& session) {
     auto lease = get_cache(cache);
     if (!lease) return invalid();

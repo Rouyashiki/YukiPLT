@@ -263,6 +263,10 @@ const char* yukiplt_c_error_name(uint32_t code) noexcept {
 yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle* handle,
                                          yukiplt_c_recovery_diagnostic* diagnostic,
                                          yukiplt_c_residual_page* pages, size_t capacity) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!handle || !diagnostic || (!pages && capacity != 0))
       return Error::Make(ErrorCode::kNullPointer);
@@ -281,6 +285,10 @@ yukiplt_c_error yukiplt_c_query_recovery(const yukiplt_c_handle* handle,
 }
 uint32_t yukiplt_c_abi_version(void) noexcept { return YUKIPLT_C_ABI_VERSION; }
 yukiplt_c_error yukiplt_c_image_from_soname(const char* name, yukiplt_c_image* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!out) return Error::Make(ErrorCode::kNullPointer);
     auto result = image_from_soname(name);
@@ -293,6 +301,10 @@ yukiplt_c_error yukiplt_c_image_from_soname(const char* name, yukiplt_c_image* o
 yukiplt_c_error yukiplt_c_hook(const yukiplt_c_image* image, const yukiplt_c_selector* target,
                                void* replacement, void** original, yukiplt_c_handle* handle,
                                yukiplt_c_slot_report* report) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
   const yukiplt_c_request request{*target, replacement, original};
   return yukiplt_c_hook_batch(image, &request, 1, handle, report);
@@ -301,6 +313,10 @@ yukiplt_c_error yukiplt_c_hook_batch(const yukiplt_c_image* image,
                                      const yukiplt_c_request* requests, size_t count,
                                      yukiplt_c_handle* handle,
                                      yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
     if (handle->token != 0 || count == 0 || count > kLimit)
@@ -321,6 +337,10 @@ yukiplt_c_error yukiplt_c_hook_batch(const yukiplt_c_image* image,
 }
 yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
                                  size_t capacity) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!handle) return Error::Make(ErrorCode::kNullPointer);
     if (!handle->token) return Error::Make(ErrorCode::kInvalidArgument);
@@ -338,6 +358,10 @@ yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle* handle, yukiplt_c_slot_report
   });
 }
 yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle* handle) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!handle) return Error::Make(ErrorCode::kNullPointer);
     if (!handle->token) return Error::Make(ErrorCode::kInvalidArgument);
@@ -349,6 +373,10 @@ yukiplt_c_error yukiplt_c_abandon(yukiplt_c_handle* handle) noexcept {
 }
 yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
                                 size_t capacity, size_t* total) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!handle) return Error::Make(ErrorCode::kNullPointer);
     if (!handle->token) return Error::Make(ErrorCode::kInvalidArgument);
@@ -364,12 +392,20 @@ yukiplt_c_error yukiplt_c_query(const yukiplt_c_handle* handle, yukiplt_c_slot_r
   });
 }
 yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image* image) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!image) return Error::Make(ErrorCode::kNullPointer);
     return forget_image(view(*image));
   });
 }
 yukiplt_c_error yukiplt_c_trim_idle_storage(void) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (Error e = detail::process_entry()) return converted(e);
   static_assert(YUKIPLT_C_FEATURE_IDLE_STORAGE == 16);
   try {
@@ -383,6 +419,7 @@ yukiplt_c_error yukiplt_c_trim_idle_storage(void) noexcept {
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
   return feature_id == YUKIPLT_C_FEATURE_CACHED_MAPS ||
          feature_id == YUKIPLT_C_FEATURE_CONTROLLED_FORK ||
+         feature_id == YUKIPLT_C_FEATURE_MT_FORK ||
          feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||
          feature_id == YUKIPLT_C_FEATURE_RECOVERY_DIAGNOSTICS ||
          feature_id == YUKIPLT_C_FEATURE_ERROR_NAMES ||
@@ -403,6 +440,10 @@ yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         void* replacement, void** original,
                                         yukiplt_c_handle* handle,
                                         yukiplt_c_slot_report* report) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
   const yukiplt_c_function_request request{*target, replacement, original};
   return yukiplt_c_hook_functions(image, &request, 1, handle, report);
@@ -411,6 +452,10 @@ yukiplt_c_error yukiplt_c_hook_functions(const yukiplt_c_image* image,
                                          const yukiplt_c_function_request* requests, size_t count,
                                          yukiplt_c_handle* handle,
                                          yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
     if (handle->token != 0 || count == 0 || count > kLimit)
@@ -435,6 +480,12 @@ yukiplt_c_error yukiplt_c_hook_functions_ex(const yukiplt_c_image* image,
                                             size_t count, yukiplt_c_handle* handle,
                                             yukiplt_c_slot_report* output,
                                             yukiplt_c_recovery_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   RecoveryDiagnostic operation;
   operation.stage = OperationStage::kPrepare;
   const auto error = guarded([&] {
@@ -468,6 +519,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed(
     const yukiplt_c_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
     yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
     yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -503,6 +560,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed(
 yukiplt_c_error yukiplt_c_unhook_diagnosed(yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
                                            size_t capacity,
                                            yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -538,6 +601,10 @@ const char* yukiplt_c_error_cause_name(uint32_t cause) noexcept {
   return error_cause_name(static_cast<ErrorCause>(cause));
 }
 yukiplt_c_error yukiplt_c_image_containing(const void* address, yukiplt_c_image* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!output) return Error::Make(ErrorCode::kNullPointer);
     auto found = find_image_containing(address);
@@ -551,6 +618,10 @@ yukiplt_c_error yukiplt_c_hook_named(const yukiplt_c_named_image* image,
                                      const yukiplt_c_selector* target, void* replacement,
                                      void** original, yukiplt_c_handle* handle,
                                      yukiplt_c_slot_report* report) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
   const yukiplt_c_request request{*target, replacement, original};
   return yukiplt_c_hook_batch_named(image, &request, 1, handle, report);
@@ -560,6 +631,10 @@ yukiplt_c_error yukiplt_c_hook_batch_named(const yukiplt_c_named_image* image,
                                            const yukiplt_c_request* requests, size_t count,
                                            yukiplt_c_handle* handle,
                                            yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
     if (handle->token != 0 || count == 0 || count > kLimit)
@@ -586,6 +661,10 @@ yukiplt_c_error yukiplt_c_hook_function_named(const yukiplt_c_named_image* image
                                               void* replacement, void** original,
                                               yukiplt_c_handle* handle,
                                               yukiplt_c_slot_report* report) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!target) return converted(Error::Make(ErrorCode::kNullPointer));
   const yukiplt_c_function_request request{*target, replacement, original};
   return yukiplt_c_hook_functions_named(image, &request, 1, handle, report);
@@ -595,6 +674,10 @@ yukiplt_c_error yukiplt_c_hook_functions_named(const yukiplt_c_named_image* imag
                                                const yukiplt_c_function_request* requests,
                                                size_t count, yukiplt_c_handle* handle,
                                                yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     if (!image || !requests || !handle) return Error::Make(ErrorCode::kNullPointer);
     if (handle->token != 0 || count == 0 || count > kLimit)
@@ -621,6 +704,12 @@ yukiplt_c_error yukiplt_c_hook_functions_ex_named(
     const yukiplt_c_named_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
     yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
     yukiplt_c_recovery_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   RecoveryDiagnostic operation;
   operation.stage = OperationStage::kPrepare;
   const auto error = guarded([&] {
@@ -657,6 +746,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named(
     const yukiplt_c_named_image* image, const yukiplt_c_function_request_ex* requests, size_t count,
     yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
     yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -768,6 +863,10 @@ yukiplt_c_error yukiplt_c_hook_batch_cached(const yukiplt_c_maps_cache* cache,
                                             const yukiplt_c_request* requests, size_t count,
                                             yukiplt_c_handle* handle,
                                             yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return yukiplt_c_hook_batch_diagnosed_cached(cache, image, requests, count, handle, output,
                                                nullptr);
 }
@@ -775,6 +874,12 @@ yukiplt_c_error yukiplt_c_hook_batch_diagnosed_cached(
     const yukiplt_c_maps_cache* cache, const yukiplt_c_image* image,
     const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
     yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -812,6 +917,10 @@ yukiplt_c_error yukiplt_c_hook_batch_named_cached(const yukiplt_c_maps_cache* ca
                                                   const yukiplt_c_request* requests, size_t count,
                                                   yukiplt_c_handle* handle,
                                                   yukiplt_c_slot_report* output) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return yukiplt_c_hook_batch_diagnosed_named_cached(cache, image, requests, count, handle, output,
                                                      nullptr);
 }
@@ -819,6 +928,12 @@ yukiplt_c_error yukiplt_c_hook_batch_diagnosed_named_cached(
     const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
     const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
     yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -857,6 +972,12 @@ yukiplt_c_error yukiplt_c_hook_batch_nonnull_named_cached(
     const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
     const yukiplt_c_request* requests, size_t count, yukiplt_c_handle* handle,
     yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -899,6 +1020,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed_cached(
     const yukiplt_c_maps_cache* cache, const yukiplt_c_image* image,
     const yukiplt_c_function_request_ex* requests, size_t count, yukiplt_c_handle* handle,
     yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -940,6 +1067,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named_cached(
     const yukiplt_c_maps_cache* cache, const yukiplt_c_named_image* image,
     const yukiplt_c_function_request_ex* requests, size_t count, yukiplt_c_handle* handle,
     yukiplt_c_slot_report* output, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -982,6 +1115,12 @@ yukiplt_c_error yukiplt_c_hook_functions_diagnosed_named_cached(
 yukiplt_c_error yukiplt_c_unhook_diagnosed_cached(
     const yukiplt_c_maps_cache* cache, yukiplt_c_handle* handle, yukiplt_c_slot_report* output,
     size_t capacity, yukiplt_c_operation_diagnostic* diagnostic) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+  }
+
   if (diagnostic && diagnostic->struct_size != sizeof(yukiplt_c_operation_diagnostic))
     return converted(Error::Make(ErrorCode::kInvalidArgument));
   OperationDiagnostic operation;
@@ -1022,6 +1161,10 @@ yukiplt_c_error yukiplt_c_query_cached(const yukiplt_c_maps_cache* cache,
                                        const yukiplt_c_handle* handle,
                                        yukiplt_c_slot_report* output, size_t capacity,
                                        size_t* total) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     auto lease = detail::c_objects::get_cache(cache);
     if (!lease) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1040,6 +1183,10 @@ yukiplt_c_error yukiplt_c_query_cached(const yukiplt_c_maps_cache* cache,
   });
 }
 yukiplt_c_error yukiplt_c_maps_cache_create(yukiplt_c_maps_cache* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&]() -> Error {
     if (!out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1051,6 +1198,10 @@ yukiplt_c_error yukiplt_c_maps_cache_create(yukiplt_c_maps_cache* out) noexcept 
   });
 }
 yukiplt_c_error yukiplt_c_maps_cache_capture(yukiplt_c_maps_cache* cache) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&]() -> Error {
     auto lease = detail::c_objects::get_cache(cache);
     if (!lease) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1059,6 +1210,10 @@ yukiplt_c_error yukiplt_c_maps_cache_capture(yukiplt_c_maps_cache* cache) noexce
 }
 yukiplt_c_error yukiplt_c_maps_cache_import_text(yukiplt_c_maps_cache* cache, const char* text,
                                                  size_t length) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&]() -> Error {
     auto lease = detail::c_objects::get_cache(cache);
     if (!lease) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1066,6 +1221,10 @@ yukiplt_c_error yukiplt_c_maps_cache_import_text(yukiplt_c_maps_cache* cache, co
   });
 }
 yukiplt_c_error yukiplt_c_maps_cache_invalidate(yukiplt_c_maps_cache* cache) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&]() -> Error {
     auto lease = detail::c_objects::get_cache(cache);
     if (!lease) return Error::Make(ErrorCode::kInvalidArgument);
@@ -1073,6 +1232,10 @@ yukiplt_c_error yukiplt_c_maps_cache_invalidate(yukiplt_c_maps_cache* cache) noe
   });
 }
 yukiplt_c_error yukiplt_c_maps_cache_destroy(yukiplt_c_maps_cache* cache) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return guarded([&] {
     return cache ? detail::c_objects::destroy(cache->token, detail::c_objects::Kind::kMapsCache)
                  : Error::Make(ErrorCode::kNullPointer);

@@ -123,6 +123,9 @@ size_t RuleSet::retained_for(uint64_t rule_id, const ImageView* image,
 Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
                                    const FunctionImportSelector& selector, void* replacement,
                                    void** out_originals, size_t capacity) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   if (next_rule_id_ == 0) return Error::Make(ErrorCode::kIntegerOverflow);
   if (replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
@@ -160,6 +163,9 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
 
 Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter, const ImportSelector& selector,
                                    void* replacement, void** out_originals, size_t capacity) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   // Promote a plain name/version selector to a JUMP_SLOT-only function selector.
   FunctionImportSelector func;
@@ -371,8 +377,16 @@ RuleSummary RuleSet::refresh_impl(MapsCache* cache) {
   RuleOperationReport report;
   return refresh_impl(report, cache);
 }
-RuleSummary RuleSet::refresh() { return refresh_impl(nullptr); }
-RuleSummary RuleSet::refresh_cached(MapsCache& cache) { return refresh_impl(&cache); }
+RuleSummary RuleSet::refresh() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return refresh_impl(nullptr);
+}
+RuleSummary RuleSet::refresh_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return refresh_impl(&cache);
+}
 
 namespace {
 
@@ -418,9 +432,15 @@ RuleSummary RuleSet::release_image_impl(const ImageView& image, MapsCache* cache
   return summary;
 }
 RuleSummary RuleSet::release_image(const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return release_image_impl(image, nullptr);
 }
 RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return release_image_impl(image, &cache);
 }
 
@@ -449,10 +469,16 @@ RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path
   return summary;
 }
 RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_loaded_impl(image, path, nullptr);
 }
 RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
                                           const char* path) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_loaded_impl(image, path, &cache);
 }
 
@@ -465,9 +491,15 @@ RuleSummary RuleSet::notify_unloading_impl(const ImageView& image, MapsCache* ca
   return release_image_impl(image, cache);
 }
 RuleSummary RuleSet::notify_unloading(const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_unloading_impl(image, nullptr);
 }
 RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_unloading_impl(image, &cache);
 }
 
@@ -491,8 +523,15 @@ RuleSummary RuleSet::remove_rule_impl(uint64_t rule_id, MapsCache* cache) {
   summary.retained = retained_for(rule_id);
   return summary;
 }
-RuleSummary RuleSet::remove_rule(uint64_t rule_id) { return remove_rule_impl(rule_id, nullptr); }
+RuleSummary RuleSet::remove_rule(uint64_t rule_id) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return remove_rule_impl(rule_id, nullptr);
+}
 RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return remove_rule_impl(rule_id, &cache);
 }
 
@@ -505,10 +544,21 @@ RuleSummary RuleSet::unhook_impl(MapsCache* cache) {
   summary.retained = retained_for();
   return summary;
 }
-RuleSummary RuleSet::unhook() { return unhook_impl(nullptr); }
-RuleSummary RuleSet::unhook_cached(MapsCache& cache) { return unhook_impl(&cache); }
+RuleSummary RuleSet::unhook() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(nullptr);
+}
+RuleSummary RuleSet::unhook_cached(MapsCache& cache) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(&cache);
+}
 
 RuleSummary RuleSet::abandon() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   if (detail::process_entry()) return {0, 0, 1, 0};
   RuleSummary summary;
   for (size_t n = bindings_.size(); n-- > 0;) {
@@ -529,6 +579,9 @@ RuleSummary RuleSet::abandon() {
 }
 
 RuleSetStatistics RuleSet::statistics() const noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {};
+
   RuleSetStatistics result{rules_.size(), 0, bindings_.size(), retained_for()};
   for (const auto& rule : rules_)
     if (!rule.removed) ++result.active_rules;
@@ -536,6 +589,9 @@ RuleSetStatistics RuleSet::statistics() const noexcept {
 }
 
 Result<size_t> RuleSet::prune_history() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   const auto removable = [&](size_t i) {
     return !handles_[i].valid() && (bindings_[i].state == RuleState::kReleased ||
@@ -582,6 +638,9 @@ Result<size_t> RuleSet::prune_history() {
 }
 
 Result<RuleStatistics> RuleSet::statistics(uint64_t rule_id) const noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   const Rule* found = rule_by_id(rule_id);
   if (!found) return Error::Make(ErrorCode::kInvalidArgument);
   const Rule& rule = *found;
@@ -691,8 +750,15 @@ RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache)
       ++summary.retained;
   return summary;
 }
-RuleSummary RuleSet::refresh(RuleOperationReport& report) { return refresh_impl(report, nullptr); }
+RuleSummary RuleSet::refresh(RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return refresh_impl(report, nullptr);
+}
 RuleSummary RuleSet::refresh_cached(MapsCache& cache, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return refresh_impl(report, &cache);
 }
 
@@ -736,10 +802,16 @@ RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path
 }
 RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
                                    RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_loaded_impl(image, path, report, nullptr);
 }
 RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
                                           const char* path, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_loaded_impl(image, path, report, &cache);
 }
 
@@ -806,10 +878,16 @@ RuleSummary RuleSet::release_image_impl(const ImageView& image, RuleOperationRep
   return summary;
 }
 RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return release_image_impl(image, report, nullptr);
 }
 RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image,
                                           RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return release_image_impl(image, report, &cache);
 }
 
@@ -822,10 +900,16 @@ RuleSummary RuleSet::notify_unloading_impl(const ImageView& image, RuleOperation
   return release_image_impl(image, report, cache);
 }
 RuleSummary RuleSet::notify_unloading(const ImageView& image, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_unloading_impl(image, report, nullptr);
 }
 RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image,
                                              RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return notify_unloading_impl(image, report, &cache);
 }
 
@@ -843,10 +927,16 @@ RuleSummary RuleSet::remove_rule_impl(uint64_t rule_id, RuleOperationReport& rep
   return summary;
 }
 RuleSummary RuleSet::remove_rule(uint64_t rule_id, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return remove_rule_impl(rule_id, report, nullptr);
 }
 RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id,
                                         RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return remove_rule_impl(rule_id, report, &cache);
 }
 
@@ -859,12 +949,22 @@ RuleSummary RuleSet::unhook_impl(RuleOperationReport& report, MapsCache* cache) 
   finish_undo_report(report);
   return summary;
 }
-RuleSummary RuleSet::unhook(RuleOperationReport& report) { return unhook_impl(report, nullptr); }
+RuleSummary RuleSet::unhook(RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+  return unhook_impl(report, nullptr);
+}
 RuleSummary RuleSet::unhook_cached(MapsCache& cache, RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   return unhook_impl(report, &cache);
 }
 
 RuleSummary RuleSet::abandon(RuleOperationReport& report) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return {0, 0, 1, 0};
+
   if (detail::process_entry()) return {0, 0, 1, 0};
   if (Error e = prepare_undo_report(report, 0, nullptr, RuleOperationStage::kAbandon))
     return {0, 0, 1, retained_for()};
@@ -873,4 +973,185 @@ RuleSummary RuleSet::abandon(RuleOperationReport& report) {
   return summary;
 }
 
+}  // namespace yukiplt
+
+namespace yukiplt {
+RuleSummary RuleSet::refresh_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return refresh_cached(cache);
+}
+RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image,
+                                          Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return release_image_cached(cache, image);
+}
+RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                          const char* path, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_loaded_cached(cache, image, path);
+}
+RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image,
+                                             Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_unloading_cached(cache, image);
+}
+RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id,
+                                        Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return remove_rule_cached(cache, rule_id);
+}
+RuleSummary RuleSet::unhook_cached(MapsCache& cache, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook_cached(cache);
+}
+RuleSummary RuleSet::refresh_cached(MapsCache& cache, RuleOperationReport& report,
+                                    Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return refresh_cached(cache, report);
+}
+RuleSummary RuleSet::notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                          const char* path, RuleOperationReport& report,
+                                          Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_loaded_cached(cache, image, path, report);
+}
+RuleSummary RuleSet::release_image_cached(MapsCache& cache, const ImageView& image,
+                                          RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return release_image_cached(cache, image, report);
+}
+RuleSummary RuleSet::notify_unloading_cached(MapsCache& cache, const ImageView& image,
+                                             RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_unloading_cached(cache, image, report);
+}
+RuleSummary RuleSet::remove_rule_cached(MapsCache& cache, uint64_t rule_id,
+                                        RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return remove_rule_cached(cache, rule_id, report);
+}
+RuleSummary RuleSet::unhook_cached(MapsCache& cache, RuleOperationReport& report,
+                                   Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook_cached(cache, report);
+}
+RuleSetStatistics RuleSet::statistics(Error& admission_error) const noexcept {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {};
+  return statistics();
+}
+RuleSummary RuleSet::abandon(RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return abandon(report);
+}
+RuleSummary RuleSet::unhook(RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook(report);
+}
+RuleSummary RuleSet::remove_rule(uint64_t rule_id, RuleOperationReport& report,
+                                 Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return remove_rule(rule_id, report);
+}
+RuleSummary RuleSet::release_image(const ImageView& image, RuleOperationReport& report,
+                                   Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return release_image(image, report);
+}
+RuleSummary RuleSet::notify_unloading(const ImageView& image, RuleOperationReport& report,
+                                      Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_unloading(image, report);
+}
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
+                                   RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_loaded(image, path, report);
+}
+RuleSummary RuleSet::refresh(RuleOperationReport& report, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return refresh(report);
+}
+RuleSummary RuleSet::abandon(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return abandon();
+}
+RuleSummary RuleSet::unhook(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return unhook();
+}
+RuleSummary RuleSet::remove_rule(uint64_t rule_id, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return remove_rule(rule_id);
+}
+RuleSummary RuleSet::notify_unloading(const ImageView& image, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_unloading(image);
+}
+RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,
+                                   Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return notify_loaded(image, path);
+}
+RuleSummary RuleSet::release_image(const ImageView& image, Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return release_image(image);
+}
+RuleSummary RuleSet::refresh(Error& admission_error) {
+  detail::OperationGuard admission;
+  admission_error = admission.error();
+  if (admission_error) return {0, 0, 1, 0};
+  return refresh();
+}
 }  // namespace yukiplt

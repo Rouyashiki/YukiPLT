@@ -18,6 +18,9 @@
       yukiplt::find_images*;
       yukiplt::find_image_containing*;
       yukiplt::MapsCache::*;
+      yukiplt::enable_atfork*;
+      yukiplt::disable_atfork*;
+      yukiplt::fork_status*;
       yukiplt::prepare_fork*;
       yukiplt::after_fork*;
       yukiplt::hook*;

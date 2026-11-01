@@ -3,6 +3,12 @@
 
 #include <gtest/gtest.h>
 #include <link.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +23,11 @@
 #include <utility>
 #include <vector>
 
+static long dispatcher_test_syscall(long number, unsigned* address, int operation, int value,
+                                    void* timeout, void* second, int third);
+#define syscall dispatcher_test_syscall
+#include "consumer/fork_dispatcher.h"
+#undef syscall
 #include "elf_builder.hpp"
 #include "memory.hpp"
 #include "overrides.hpp"
@@ -24,6 +35,13 @@
 #include "system_images.hpp"
 #include "yukiplt.h"
 #include "yukiplt.hpp"
+
+static std::atomic<bool>* dispatcher_waiting = nullptr;
+static long dispatcher_test_syscall(long number, unsigned* address, int operation, int value,
+                                    void* timeout, void* second, int third) {
+  if (dispatcher_waiting && operation == FUTEX_WAIT_PRIVATE) dispatcher_waiting->store(true);
+  return syscall(number, address, operation, value, timeout, second, third);
+}
 
 namespace contracts_checks {
 using namespace yukiplt;
@@ -717,3 +735,429 @@ TEST(Diagnostics, CandidateCallbackCannotLeakItsNestedFailureCause) {
 }
 
 }  // namespace contracts_checks
+
+namespace {
+using namespace yukiplt;
+ForkConfig native_config(unsigned timeout = 5000) {
+  return {sizeof(ForkConfig), YUKIPLT_C_FORK_NATIVE, timeout, nullptr, nullptr, nullptr};
+}
+int fork_phase(unsigned expected, unsigned why = 0) {
+  ForkStatus status{};
+  status.struct_size = sizeof(status);
+  return fork_status(status) || status.phase != expected || status.reason != why;
+}
+void wait_for_fork_drain() {
+  ForkStatus status{};
+  status.struct_size = sizeof(status);
+  for (;;) {
+    ASSERT_TRUE(fork_status(status).ok());
+    if (status.phase == YUKIPLT_C_FORK_DRAINING) return;
+    std::this_thread::yield();
+  }
+}
+void wait_child(pid_t child) {
+  ASSERT_GT(child, 0);
+  int status = 0;
+  ASSERT_EQ(waitpid(child, &status, 0), child);
+  ASSERT_TRUE(WIFEXITED(status));
+  EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+TEST(MultithreadFork, DrainsOuterLeaseAndPreservesNestedOperation) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  std::atomic<bool> entered{false};
+  std::atomic<int> result{0};
+  std::thread worker([&] {
+    detail::OperationGuard outer;
+    entered.store(true);
+    wait_for_fork_drain();
+    detail::OperationGuard nested;
+    if (nested.error()) result.store(1);
+  });
+  while (!entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) {
+    yukiplt_c_maps_cache cache{};
+    int failed = fork_phase(YUKIPLT_C_FORK_READY) || yukiplt_c_maps_cache_create(&cache).code ||
+                 yukiplt_c_maps_cache_destroy(&cache).code;
+    _exit(failed);
+  }
+  worker.join();
+  wait_child(child);
+  EXPECT_EQ(result.load(), 0);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+TEST(MultithreadFork, TimeoutRefusesChildAndParentContinues) {
+  ASSERT_TRUE(enable_atfork(native_config(10)).ok());
+  std::atomic<bool> entered{false}, release{false};
+  std::thread worker([&] {
+    detail::OperationGuard operation;
+    entered.store(true);
+    while (!release.load()) std::this_thread::yield();
+  });
+  while (!entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) {
+    if (fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_TIMEOUT)) _exit(1);
+    if (enable_atfork(native_config()).code != ErrorCode::kForkChildUnavailable) _exit(2);
+    pid_t again = fork();
+    if (!again) _exit(fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_TIMEOUT));
+    int status = 0;
+    if (again < 0 || waitpid(again, &status, 0) != again || status) _exit(3);
+    _exit(fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_TIMEOUT));
+  }
+  release.store(true);
+  worker.join();
+  wait_child(child);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+TEST(MultithreadFork, ReentryRefusesChildWithoutWaitingForItself) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  {
+    detail::OperationGuard outer;
+    pid_t child = fork();
+    if (!child) _exit(fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_REENTRY));
+    wait_child(child);
+  }
+  EXPECT_TRUE(disable_atfork().ok());
+}
+TEST(MultithreadFork, BackendSwitchAndUnsubscribeUseOneCycle) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  ASSERT_TRUE(disable_atfork().ok());
+  ASSERT_EQ(dispatcher_init(), 0);
+  auto config = dispatcher_config();
+  ASSERT_TRUE(enable_atfork(config).ok());
+  ASSERT_TRUE(enable_atfork(config).ok());
+  EXPECT_EQ(prepare_fork().code, ErrorCode::kInvalidArgument);
+  ForkStatus before{};
+  before.struct_size = sizeof(before);
+  ASSERT_TRUE(fork_status(before).ok());
+  pid_t child = fork();
+  if (!child) {
+    ForkStatus after{};
+    after.struct_size = sizeof(after);
+    if (fork_status(after) || after.generation != before.generation + 1) _exit(1);
+    if (disable_atfork()) _exit(2);
+    _exit(0);
+  }
+  wait_child(child);
+  EXPECT_TRUE(disable_atfork().ok());
+  for (const auto& slot : dispatcher_slots) EXPECT_EQ(slot.token, 0u);
+}
+TEST(MultithreadFork, RefusalPreservesSessionAndCallerReports) {
+  ASSERT_EQ(dispatcher_init(), 0);
+  ASSERT_TRUE(enable_atfork(dispatcher_config()).ok());
+  dispatcher_prepare();
+  HookSession session;
+  Error error;
+  auto summary = session.install(error);
+  EXPECT_EQ(error.code, ErrorCode::kForkInProgress);
+  EXPECT_EQ(summary.attempted, 0u);
+  EXPECT_TRUE(session.images().empty());
+  yukiplt_c_maps_cache cache{123};
+  EXPECT_EQ(yukiplt_c_maps_cache_create(&cache).code, YUKIPLT_C_FORK_IN_PROGRESS);
+  EXPECT_EQ(cache.token, 123u);
+  dispatcher_parent();
+  EXPECT_TRUE(disable_atfork().ok());
+}
+TEST(MultithreadFork, ChildCanDetachSubscriptionPublishedDuringEnable) {
+  ASSERT_EQ(dispatcher_init(), 0);
+  struct Context {
+    std::atomic<bool> published{false}, release{false};
+  } context;
+  auto config = dispatcher_config();
+  config.context = &context;
+  config.subscribe = [](void* value, const yukiplt_c_fork_callbacks* callbacks,
+                        uint64_t* token) -> int {
+    int error = dispatcher_subscribe(nullptr, callbacks, token);
+    if (error) return error;
+    auto& state = *static_cast<Context*>(value);
+    state.published.store(true);
+    while (!state.release.load()) std::this_thread::yield();
+    return 0;
+  };
+  Error enabled;
+  std::thread worker([&] { enabled = enable_atfork(config); });
+  while (!context.published.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) {
+    if (fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_PROTOCOL)) _exit(1);
+    yukiplt_c_maps_cache cache{};
+    if (yukiplt_c_maps_cache_create(&cache).code != YUKIPLT_C_FORK_CHILD_UNAVAILABLE) _exit(2);
+    if (disable_atfork()) _exit(3);
+    for (const auto& slot : dispatcher_slots)
+      if (slot.token) _exit(4);
+    if (enable_atfork(config).code != ErrorCode::kForkChildUnavailable) _exit(5);
+    _exit(0);
+  }
+  context.release.store(true);
+  worker.join();
+  wait_child(child);
+  EXPECT_TRUE(enabled.ok());
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace
+
+namespace contracts_checks {
+TEST_F(ContractFixture, ForkRejectsInheritedRecoveryAndKeepsParentHandle) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  HookRequest request{"alpha", kReplA, &outputs[0]};
+  fail_restore = EPERM;
+  auto installed = hook_batch(view(), &request, 1);
+  ASSERT_EQ(installed.error.code, ErrorCode::kIndeterminate);
+  pid_t child = fork();
+  if (!child) {
+    if (fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_RECOVERY)) _exit(1);
+    OperationDiagnostic diagnostic;
+    if (unhook_diagnosed(installed.handle, nullptr, 0, &diagnostic).code !=
+        ErrorCode::kForkChildUnavailable)
+      _exit(2);
+    if (diagnostic.cause != ErrorCause::kForkProtocol || !installed.handle.valid()) _exit(3);
+    if (disable_atfork() || after_fork_child().ok()) _exit(4);
+    _exit(0);
+  }
+  wait_child(child);
+  fail_restore = 0;
+  EXPECT_TRUE(unhook(installed.handle).ok());
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace contracts_checks
+namespace {
+TEST(MultithreadFork, DispatcherFailurePreservesSubscription) {
+  ASSERT_EQ(dispatcher_init(), 0);
+  auto config = dispatcher_config();
+  config.subscribe = [](void*, const yukiplt_c_fork_callbacks*, uint64_t*) { return ENOMEM; };
+  EXPECT_EQ(enable_atfork(config).sys_errno, ENOMEM);
+  config.subscribe = [](void*, const yukiplt_c_fork_callbacks*, uint64_t*) -> int {
+    throw std::bad_alloc();
+  };
+  EXPECT_EQ(enable_atfork(config).code, ErrorCode::kOutOfMemory);
+  config = dispatcher_config();
+  bool fail = true;
+  config.context = &fail;
+  config.unsubscribe_and_drain = [](void* context, uint64_t token) -> int {
+    if (*static_cast<bool*>(context)) throw std::bad_alloc();
+    return dispatcher_unsubscribe(nullptr, token);
+  };
+  ASSERT_TRUE(enable_atfork(config).ok());
+  EXPECT_EQ(disable_atfork().code, ErrorCode::kOutOfMemory);
+  ForkStatus status{};
+  status.struct_size = sizeof(status);
+  ASSERT_TRUE(fork_status(status).ok());
+  EXPECT_EQ(status.mode, YUKIPLT_C_FORK_HOST_DISPATCHER);
+  fail = false;
+  EXPECT_TRUE(disable_atfork().ok());
+}
+TEST(MultithreadFork, DispatcherOrderingAndStaleToken) {
+  ASSERT_EQ(dispatcher_init(), 0);
+  unsigned value = 0;
+  yukiplt_c_fork_callbacks cb{
+      [](void* p) { *static_cast<unsigned*>(p) = *static_cast<unsigned*>(p) * 10 + 1; },
+      [](void*) {}, [](void*) {}, &value};
+  uint64_t old = 0, retained = 0, fresh = 0;
+  ASSERT_EQ(dispatcher_subscribe(nullptr, &cb, &old), 0);
+  ASSERT_EQ(dispatcher_subscribe(nullptr, &cb, &retained), 0);
+  ASSERT_EQ(dispatcher_unsubscribe(nullptr, old), 0);
+  cb.prepare = [](void* p) { *static_cast<unsigned*>(p) = *static_cast<unsigned*>(p) * 10 + 2; };
+  ASSERT_EQ(dispatcher_subscribe(nullptr, &cb, &fresh), 0);
+  EXPECT_NE(old, fresh);
+  EXPECT_EQ(dispatcher_unsubscribe(nullptr, old), EINVAL);
+  dispatcher_prepare();
+  EXPECT_EQ(value, 21u);
+  dispatcher_parent();
+  EXPECT_EQ(dispatcher_unsubscribe(nullptr, retained), 0);
+  EXPECT_EQ(dispatcher_unsubscribe(nullptr, fresh), 0);
+}
+}  // namespace
+
+namespace {
+std::atomic<bool> lookup_entered{false}, lookup_release{false};
+TEST(MultithreadFork, ChildDropsVanishedTokenReaderBeforeUnsubscribe) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  detail::set_thread_lookup_callback([] {
+    lookup_entered.store(true);
+    while (!lookup_release.load()) std::this_thread::yield();
+  });
+  std::thread worker([] { detail::OperationGuard operation; });
+  while (!lookup_entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) _exit(disable_atfork().ok() ? 0 : 1);
+  lookup_release.store(true);
+  worker.join();
+  wait_child(child);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace
+
+namespace {
+TEST(MultithreadFork, FailedForkCompletesParentAndPreservesErrno) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  pid_t child = fork();
+  if (!child) {
+    sock_filter filters[] = {BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
+                             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone, 0, 1),
+                             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EAGAIN),
+#ifdef SYS_clone3
+                             BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SYS_clone3, 0, 1),
+                             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EAGAIN),
+#endif
+                             BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW)};
+    sock_fprog filter{static_cast<unsigned short>(sizeof(filters) / sizeof(filters[0])), filters};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+        prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &filter))
+      _exit(1);
+    errno = 0;
+    if (fork() != -1 || errno != EAGAIN) _exit(2);
+    if (fork_phase(YUKIPLT_C_FORK_READY) || disable_atfork()) _exit(3);
+    _exit(0);
+  }
+  wait_child(child);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace
+
+namespace {
+std::atomic<bool> checkpoint_entered{false};
+void await_fork_drain() {
+  checkpoint_entered.store(true);
+  wait_for_fork_drain();
+}
+TEST(MultithreadFork, DrainsCStoreBeforePublishingObjectToken) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  checkpoint_entered.store(false);
+  yukiplt_c_maps_cache cache{};
+  yukiplt_c_error result{};
+  std::thread worker([&] {
+    // Creation's only mutex is the Store lock. Pause before its release.
+    detail::set_mutex_unlock_callback(nullptr, false, await_fork_drain);
+    result = yukiplt_c_maps_cache_create(&cache);
+  });
+  while (!checkpoint_entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) _exit(!cache.token || yukiplt_c_maps_cache_destroy(&cache).code);
+  worker.join();
+  wait_child(child);
+  EXPECT_EQ(result.code, YUKIPLT_C_SUCCESS);
+  EXPECT_NE(cache.token, 0u);
+  EXPECT_EQ(yukiplt_c_maps_cache_destroy(&cache).code, YUKIPLT_C_SUCCESS);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace
+
+namespace contracts_checks {
+TEST_F(ContractFixture, ForkDrainsTransactionAndSessionReportPublication) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  // Check both a held op mutex and the interval after commit unlocks it.
+  for (bool after_unlock : {false, true}) {
+    HookTarget target{view(), {"alpha"}, kReplA, &outputs[0]};
+    auto plan = build_hook_plan(&target, 1);
+    ASSERT_TRUE(plan);
+    auto prepared = prepare_session(plan.value());
+    ASSERT_TRUE(prepared);
+    auto& session = prepared.value();
+    checkpoint_entered.store(false);
+    SessionSummary result;
+    std::thread worker([&] {
+      detail::set_mutex_unlock_callback(detail::op_mutex().native_handle(), after_unlock,
+                                        await_fork_drain);
+      result = session.install();
+    });
+    while (!checkpoint_entered.load()) std::this_thread::yield();
+    EXPECT_EQ(slot(0), reinterpret_cast<uintptr_t>(kReplA));
+    EXPECT_EQ(session.images()[0].state, SessionState::kPrepared);
+    pid_t child = fork();
+    if (!child) {
+      if (session.images()[0].state != SessionState::kInstalled ||
+          session.targets()[0].install_report.status != SlotStatus::kInstalled)
+        _exit(1);
+      _exit(session.unhook().ok() && slot(0) == 0x1000 ? 0 : 2);
+    }
+    worker.join();
+    wait_child(child);
+    EXPECT_TRUE(result.ok());
+    EXPECT_TRUE(session.unhook().ok());
+  }
+  EXPECT_TRUE(disable_atfork().ok());
+}
+
+TEST_F(ContractFixture, ChildRecoversItsOwnPermissionFailureIndependently) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  pid_t child = fork();
+  if (!child) {
+    HookRequest request{"alpha", kReplA, &outputs[0]};
+    fail_restore = EPERM;
+    auto installed = hook_batch(view(), &request, 1);
+    if (installed.error.code != ErrorCode::kIndeterminate || !installed.handle.valid()) _exit(1);
+    fail_restore = 0;
+    if (unhook(installed.handle) || slot(0) != 0x1000) _exit(2);
+    _exit(disable_atfork().ok() ? 0 : 3);
+  }
+  wait_child(child);
+  EXPECT_EQ(slot(0), 0x1000u);
+  EXPECT_EQ(outputs[0], nullptr);
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace contracts_checks
+
+namespace rules_checks {
+TEST_F(RulesFixture, ForkDrainsRuleEnumerationAndBindingPublication) {
+  ASSERT_TRUE(enable_atfork(native_config()).ok());
+  add_image("libfork.so", 0x1000);
+  RuleSet rules;
+  void* originals[1]{};
+  ASSERT_TRUE(rules.add_rule(match_basename("libfork.so"), target_selector(), kRepl, originals, 1));
+  checkpoint_entered.store(false);
+  detail::set_active_image_enumerator([](const ImageSelector& selector) {
+    await_fork_drain();
+    return RulesFixture::enumerate(selector);
+  });
+  RuleSummary result;
+  std::thread worker([&] { result = rules.refresh(); });
+  while (!checkpoint_entered.load()) std::this_thread::yield();
+  pid_t child = fork();
+  if (!child) {
+    if (rules.bindings().size() != 1 || rules.bindings()[0].state != RuleState::kInstalled)
+      _exit(1);
+    _exit(rules.unhook().ok() ? 0 : 2);
+  }
+  worker.join();
+  detail::set_active_image_enumerator(&RulesFixture::enumerate);
+  wait_child(child);
+  EXPECT_EQ(result.succeeded, 1u);
+  EXPECT_TRUE(rules.unhook().ok());
+  EXPECT_TRUE(disable_atfork().ok());
+}
+}  // namespace rules_checks
+
+namespace {
+TEST(MultithreadFork, DispatcherUnsubscribeWaitsForSelectedCycle) {
+  ASSERT_EQ(dispatcher_init(), 0);
+  struct Context {
+    std::atomic<bool> entered{false}, waiting{false}, completed{false}, removed{false};
+  } context;
+  dispatcher_waiting = &context.waiting;
+  yukiplt_c_fork_callbacks callbacks{
+      [](void* value) {
+        auto& state = *static_cast<Context*>(value);
+        state.entered.store(true);
+        while (!state.waiting.load()) std::this_thread::yield();
+      },
+      [](void* value) { static_cast<Context*>(value)->completed.store(true); },
+      [](void* value) { static_cast<Context*>(value)->completed.store(true); }, &context};
+  uint64_t token = 0;
+  ASSERT_EQ(dispatcher_subscribe(nullptr, &callbacks, &token), 0);
+  int removal = -1;
+  std::thread worker([&] {
+    while (!context.entered.load()) std::this_thread::yield();
+    removal = dispatcher_unsubscribe(nullptr, token);
+    context.removed.store(context.completed.load());
+  });
+  pid_t child = fork();
+  if (!child) _exit(!context.completed.load() || dispatcher_unsubscribe(nullptr, token));
+  worker.join();
+  dispatcher_waiting = nullptr;
+  wait_child(child);
+  EXPECT_EQ(removal, 0);
+  EXPECT_TRUE(context.removed.load());
+  EXPECT_EQ(dispatcher_unsubscribe(nullptr, token), EINVAL);
+}
+}  // namespace

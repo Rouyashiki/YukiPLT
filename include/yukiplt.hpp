@@ -411,7 +411,9 @@ enum class ErrorCode : uint32_t {
   kAmbiguousImage,  ///< More than one loaded image matches the requested name.
 
   // --- Memory map ---
-  kVmaUnavailable,  ///< /proc/self/maps could not be read (errno set) or parsed.
+  kForkInProgress = 23,
+  kForkChildUnavailable = 24,
+  kVmaUnavailable = 22,  ///< /proc/self/maps could not be read (errno set) or parsed.
 };
 
 /// Describes an error with a code and optional system errno.
@@ -481,6 +483,10 @@ struct [[nodiscard]] Error {
       return "ImageNotFound";
     case ErrorCode::kAmbiguousImage:
       return "AmbiguousImage";
+    case ErrorCode::kForkInProgress:
+      return "ForkInProgress";
+    case ErrorCode::kForkChildUnavailable:
+      return "ForkChildUnavailable";
     case ErrorCode::kVmaUnavailable:
       return "VmaUnavailable";
   }
@@ -735,6 +741,11 @@ class MapsCache {
   friend struct detail::MapsCacheAccess;
   std::shared_ptr<detail::MapsCacheState> state_;
 };
+using ForkConfig = yukiplt_c_fork_config;
+using ForkStatus = yukiplt_c_fork_status;
+YUKIPLT_API Error enable_atfork(const ForkConfig&) noexcept;
+YUKIPLT_API Error disable_atfork() noexcept;
+YUKIPLT_API Error fork_status(ForkStatus&) noexcept;
 YUKIPLT_API Error prepare_fork() noexcept;
 YUKIPLT_API Error after_fork_parent() noexcept;
 YUKIPLT_API Error after_fork_child() noexcept;
@@ -1415,14 +1426,19 @@ class HookSession {
   /// A remaining Indeterminate/RestoreFailed group counts as failed and is
   /// never overwritten: explicitly unhook/abandon it first.
   YUKIPLT_API SessionSummary install();
+  YUKIPLT_API SessionSummary install(Error& admission_error);
   /// Reverse image order, attempt every valid handle despite earlier errors.
   /// Failed handles remain retryable; invalidated images consume their handle.
   YUKIPLT_API SessionSummary unhook();
+  YUKIPLT_API SessionSummary unhook(Error& admission_error);
   /// Drop all remaining ownership without touching slots or page protections.
   YUKIPLT_API SessionSummary abandon();
+  YUKIPLT_API SessionSummary abandon(Error& admission_error);
 
   YUKIPLT_API SessionSummary install_cached(MapsCache&);
+  YUKIPLT_API SessionSummary install_cached(MapsCache& cache, Error& admission_error);
   YUKIPLT_API SessionSummary unhook_cached(MapsCache&);
+  YUKIPLT_API SessionSummary unhook_cached(MapsCache& cache, Error& admission_error);
 
  private:
   SessionSummary install_impl(MapsCache*);
@@ -1520,13 +1536,18 @@ class FunctionHookSession {
   const std::vector<FunctionSessionTargetResult>& targets() const noexcept { return targets_; }
   const std::vector<FunctionSessionImageResult>& images() const noexcept { return images_; }
   YUKIPLT_API SessionSummary install();
+  YUKIPLT_API SessionSummary install(Error& admission_error);
   YUKIPLT_API SessionSummary unhook();
+  YUKIPLT_API SessionSummary unhook(Error& admission_error);
   /// Leave slots/protections unchanged, preserving each group's last recovery
   /// snapshot. A snapshot failure retains that group's handle for a retry.
   YUKIPLT_API SessionSummary abandon();
+  YUKIPLT_API SessionSummary abandon(Error& admission_error);
 
   YUKIPLT_API SessionSummary install_cached(MapsCache&);
+  YUKIPLT_API SessionSummary install_cached(MapsCache& cache, Error& admission_error);
   YUKIPLT_API SessionSummary unhook_cached(MapsCache&);
+  YUKIPLT_API SessionSummary unhook_cached(MapsCache& cache, Error& admission_error);
 
  private:
   SessionSummary install_impl(MapsCache*);
@@ -1681,19 +1702,24 @@ class RuleSet {
   // retained counts unique targets enumerated this call, including skipped live
   // bindings. statistics().active_handles counts the entire outstanding population.
   YUKIPLT_API RuleSummary refresh();
+  YUKIPLT_API RuleSummary refresh(Error& admission_error);
 
   /// Undo this RuleSet's hooks on one image instance before the caller unloads
   /// it.  Failure keeps the handle and ownership and is reported.  This does not
   /// disable the rules: a later refresh()/notify_loaded() that still finds the
   /// instance applies them again (see refresh()); remove_rule() stops a rule.
   YUKIPLT_API RuleSummary release_image(const ImageView& image);
+  YUKIPLT_API RuleSummary release_image(const ImageView& image, Error& admission_error);
 
   // Custom-loader notifications run synchronously after relocation/final
   // protections and before unmapping, respectively. Keep the instance stable,
   // serialize RuleSet access, and hold no loader lock or dl_iterate_phdr callback.
   // path supplies diagnostics and matching. Token-0 system images are rejected.
   YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path);
+  YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path,
+                                        Error& admission_error);
   YUKIPLT_API RuleSummary notify_unloading(const ImageView& image);
+  YUKIPLT_API RuleSummary notify_unloading(const ImageView& image, Error& admission_error);
 
   /// Remove a rule: undo all its bindings (reverse order), keep failures, and
   /// stop it participating in future refreshes.
@@ -1701,29 +1727,44 @@ class RuleSet {
   /// release_image()/unhook() after resolving the conflict, or explicitly
   /// abandon() the whole RuleSet; there is no single-binding abandon operation.
   YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id);
+  YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id, Error& admission_error);
 
   /// Undo all of this RuleSet's hooks (reverse order), keeping failures.  The
   /// rules stay registered; a later refresh() applies them again.
   YUKIPLT_API RuleSummary unhook();
+  YUKIPLT_API RuleSummary unhook(Error& admission_error);
 
   /// Relinquish all registrations without touching memory.  Abandoned bindings
   /// are never re-applied by refresh()/notify_loaded().
   YUKIPLT_API RuleSummary abandon();
+  YUKIPLT_API RuleSummary abandon(Error& admission_error);
 
   /// Detailed overloads reserve all report storage before any hook/unhook.
   /// A preparation failure returns failed=1, attempted=0 and preserves hooks.
   YUKIPLT_API RuleSummary refresh(RuleOperationReport& report);
+  YUKIPLT_API RuleSummary refresh(RuleOperationReport& report, Error& admission_error);
   YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path,
                                         RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_loaded(const ImageView& image, const char* path,
+                                        RuleOperationReport& report, Error& admission_error);
   YUKIPLT_API RuleSummary notify_unloading(const ImageView& image, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_unloading(const ImageView& image, RuleOperationReport& report,
+                                           Error& admission_error);
   YUKIPLT_API RuleSummary release_image(const ImageView& image, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary release_image(const ImageView& image, RuleOperationReport& report,
+                                        Error& admission_error);
   YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary remove_rule(uint64_t rule_id, RuleOperationReport& report,
+                                      Error& admission_error);
   YUKIPLT_API RuleSummary unhook(RuleOperationReport& report);
+  YUKIPLT_API RuleSummary unhook(RuleOperationReport& report, Error& admission_error);
   /// Prepare all report storage and recovery snapshots before relinquishing any
   /// ownership. Preparation failure leaves every handle intact. The events keep
   /// the last known recovery state even after successful abandonment.
   YUKIPLT_API RuleSummary abandon(RuleOperationReport& report);
+  YUKIPLT_API RuleSummary abandon(RuleOperationReport& report, Error& admission_error);
   [[nodiscard]] YUKIPLT_API RuleSetStatistics statistics() const noexcept;
+  YUKIPLT_API RuleSetStatistics statistics(Error& admission_error) const noexcept;
   [[nodiscard]] YUKIPLT_API Result<RuleStatistics> statistics(uint64_t rule_id) const noexcept;
 
   /// Explicitly discard released/invalidated bindings with no live handle and
@@ -1740,22 +1781,46 @@ class RuleSet {
   [[nodiscard]] const std::vector<RuleBinding>& bindings() const noexcept { return bindings_; }
 
   YUKIPLT_API RuleSummary unhook_cached(MapsCache&, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary unhook_cached(MapsCache& cache, RuleOperationReport& report,
+                                        Error& admission_error);
   YUKIPLT_API RuleSummary remove_rule_cached(MapsCache&, uint64_t rule_id,
                                              RuleOperationReport& report);
+  YUKIPLT_API RuleSummary remove_rule_cached(MapsCache& cache, uint64_t rule_id,
+                                             RuleOperationReport& report, Error& admission_error);
   YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache&, const ImageView& image,
                                                   RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache& cache, const ImageView& image,
+                                                  RuleOperationReport& report,
+                                                  Error& admission_error);
   YUKIPLT_API RuleSummary release_image_cached(MapsCache&, const ImageView& image,
                                                RuleOperationReport& report);
+  YUKIPLT_API RuleSummary release_image_cached(MapsCache& cache, const ImageView& image,
+                                               RuleOperationReport& report, Error& admission_error);
   YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache&, const ImageView& image, const char* path,
                                                RuleOperationReport& report);
+  YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                               const char* path, RuleOperationReport& report,
+                                               Error& admission_error);
   YUKIPLT_API RuleSummary refresh_cached(MapsCache&, RuleOperationReport& report);
+  YUKIPLT_API RuleSummary refresh_cached(MapsCache& cache, RuleOperationReport& report,
+                                         Error& admission_error);
   YUKIPLT_API RuleSummary unhook_cached(MapsCache&);
+  YUKIPLT_API RuleSummary unhook_cached(MapsCache& cache, Error& admission_error);
   YUKIPLT_API RuleSummary remove_rule_cached(MapsCache&, uint64_t rule_id);
+  YUKIPLT_API RuleSummary remove_rule_cached(MapsCache& cache, uint64_t rule_id,
+                                             Error& admission_error);
   YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache&, const ImageView& image);
+  YUKIPLT_API RuleSummary notify_unloading_cached(MapsCache& cache, const ImageView& image,
+                                                  Error& admission_error);
   YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache&, const ImageView& image,
                                                const char* path);
+  YUKIPLT_API RuleSummary notify_loaded_cached(MapsCache& cache, const ImageView& image,
+                                               const char* path, Error& admission_error);
   YUKIPLT_API RuleSummary release_image_cached(MapsCache&, const ImageView& image);
+  YUKIPLT_API RuleSummary release_image_cached(MapsCache& cache, const ImageView& image,
+                                               Error& admission_error);
   YUKIPLT_API RuleSummary refresh_cached(MapsCache&);
+  YUKIPLT_API RuleSummary refresh_cached(MapsCache& cache, Error& admission_error);
 
  private:
   RuleSummary unhook_impl(RuleOperationReport& report, MapsCache* cache);

@@ -1215,12 +1215,21 @@ Result<std::vector<FunctionCandidate>> detail::expand_candidates_budgeted(
 }
 Result<std::vector<FunctionCandidate>> expand_function_candidates(
     const NamedImage* images, size_t count, const CandidateSelection& selection) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   detail::ScanBudget budget;
   return expand_impl(images, count, selection, budget);
 }
 Result<std::vector<FunctionCandidate>> expand_function_candidates_diagnosed(
     const NamedImage* images, size_t count, const CandidateSelection& selection,
     OperationDiagnostic* diagnostic) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) {
+    yukiplt::detail::admission_diagnostic(diagnostic, admission.error());
+    return admission.error();
+  }
+
   detail::ScanBudget budget;
   return detail::expand_candidates_budgeted(images, count, selection, budget, diagnostic);
 }

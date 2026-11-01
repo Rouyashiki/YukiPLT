@@ -115,7 +115,9 @@ enum {
   YUKIPLT_C_OUT_OF_BOUNDS = 19,
   YUKIPLT_C_IMAGE_NOT_FOUND = 20,
   YUKIPLT_C_AMBIGUOUS_IMAGE = 21,
-  YUKIPLT_C_VMA_UNAVAILABLE = 22
+  YUKIPLT_C_VMA_UNAVAILABLE = 22,
+  YUKIPLT_C_FORK_IN_PROGRESS = 23,
+  YUKIPLT_C_FORK_CHILD_UNAVAILABLE = 24
 };
 enum { YUKIPLT_C_VERSION_ANY = 0, YUKIPLT_C_VERSION_UNVERSIONED = 1, YUKIPLT_C_VERSION_EXACT = 2 };
 enum { YUKIPLT_C_HIDDEN_ANY = 0, YUKIPLT_C_NON_HIDDEN = 1, YUKIPLT_C_HIDDEN = 2 };
@@ -214,7 +216,8 @@ enum {
   YUKIPLT_C_FEATURE_CANDIDATES = 15,
   YUKIPLT_C_FEATURE_IDLE_STORAGE = 16,
   YUKIPLT_C_FEATURE_CACHED_MAPS = 17,
-  YUKIPLT_C_FEATURE_CONTROLLED_FORK = 18
+  YUKIPLT_C_FEATURE_CONTROLLED_FORK = 18,
+  YUKIPLT_C_FEATURE_MT_FORK = 19
 };
 
 enum {
@@ -983,6 +986,44 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_invalidate(yukiplt_c_maps_cache
     YUKIPLT_C_NOEXCEPT;
 YUKIPLT_API yukiplt_c_error yukiplt_c_maps_cache_destroy(yukiplt_c_maps_cache* cache)
     YUKIPLT_C_NOEXCEPT;
+enum { YUKIPLT_C_FORK_NATIVE = 1, YUKIPLT_C_FORK_HOST_DISPATCHER = 2 };
+enum { YUKIPLT_C_FORK_READY = 0, YUKIPLT_C_FORK_DRAINING = 1, YUKIPLT_C_FORK_REJECTED = 2 };
+enum {
+  YUKIPLT_C_FORK_REASON_NONE = 0,
+  YUKIPLT_C_FORK_REASON_TIMEOUT = 1,
+  YUKIPLT_C_FORK_REASON_RECOVERY = 2,
+  YUKIPLT_C_FORK_REASON_REENTRY = 3,
+  YUKIPLT_C_FORK_REASON_PROTOCOL = 4
+};
+typedef struct yukiplt_c_fork_callbacks {
+  void (*prepare)(void*);
+  void (*parent)(void*);
+  void (*child)(void*);
+  void* context;
+} yukiplt_c_fork_callbacks;
+// Dispatcher calls return zero or an errno. Success copies the callback table.
+// Unsubscribe success excludes future callbacks and drains whole fork cycles.
+typedef struct yukiplt_c_fork_config {
+  uint32_t struct_size;
+  uint32_t mode;
+  uint32_t timeout_ms;  // Zero selects 5000 ms.
+  void* context;
+  int (*subscribe)(void*, const yukiplt_c_fork_callbacks*, uint64_t*);
+  int (*unsubscribe_and_drain)(void*, uint64_t);
+} yukiplt_c_fork_config;
+typedef struct yukiplt_c_fork_status {
+  uint32_t struct_size;
+  uint32_t mode;  // Zero when disabled.
+  uint32_t phase;
+  uint32_t reason;
+  uint32_t pid;
+  uint32_t generation;
+} yukiplt_c_fork_status;
+YUKIPLT_API yukiplt_c_error yukiplt_c_enable_atfork(const yukiplt_c_fork_config*)
+    YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_disable_atfork(void) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_get_fork_status(yukiplt_c_fork_status*) YUKIPLT_C_NOEXCEPT;
+
 YUKIPLT_API yukiplt_c_error yukiplt_c_prepare_fork(void) YUKIPLT_C_NOEXCEPT;
 YUKIPLT_API yukiplt_c_error yukiplt_c_after_fork_parent(void) YUKIPLT_C_NOEXCEPT;
 YUKIPLT_API yukiplt_c_error yukiplt_c_after_fork_child(void) YUKIPLT_C_NOEXCEPT;

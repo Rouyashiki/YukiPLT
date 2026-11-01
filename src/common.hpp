@@ -17,6 +17,50 @@
 
 namespace yukiplt::detail {
 Error process_entry() noexcept;
+// Stack-owned admission. A nested operation borrows the active thread's lease.
+class OperationGuard {
+ public:
+  OperationGuard() noexcept;
+  ~OperationGuard();
+  OperationGuard(const OperationGuard&) = delete;
+  OperationGuard& operator=(const OperationGuard&) = delete;
+  Error error() const noexcept { return error_; }
+  OperationGuard* next = nullptr;
+  unsigned thread = 0;
+
+ private:
+  Error error_;
+  bool owns_ = false;
+};
+
+// Admission failure diagnostics use only caller-owned scalar storage.
+inline void admission_diagnostic(OperationDiagnostic* out, Error error) noexcept {
+  if (!out) return;
+  *out = {};
+  out->stage = OperationStage::kPrepare;
+  out->cause = ErrorCause::kForkProtocol;
+  out->error = error;
+}
+inline void admission_diagnostic(RecoveryDiagnostic* out, Error error) noexcept {
+  if (!out) return;
+  *out = {};
+  out->stage = OperationStage::kPrepare;
+  out->error = error;
+}
+inline void admission_diagnostic(yukiplt_c_operation_diagnostic* out, Error error) noexcept {
+  if (!out || out->struct_size != sizeof(*out)) return;
+  *out = {};
+  out->struct_size = sizeof(*out);
+  out->stage = YUKIPLT_C_STAGE_PREPARE;
+  out->cause = YUKIPLT_C_CAUSE_FORK_PROTOCOL;
+  out->error = {static_cast<uint32_t>(error.code), error.sys_errno};
+}
+inline void admission_diagnostic(yukiplt_c_recovery_diagnostic* out, Error error) noexcept {
+  if (!out) return;
+  *out = {};
+  out->stage = YUKIPLT_C_STAGE_PREPARE;
+  out->error = {static_cast<uint32_t>(error.code), error.sys_errno};
+}
 
 /// Unsigned addition with overflow detection.
 /// Returns false on overflow; result is undefined on overflow.

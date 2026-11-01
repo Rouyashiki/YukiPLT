@@ -15,24 +15,6 @@
 #endif
 
 namespace yukiplt::detail {
-namespace {
-std::atomic<int> owner_pid{0};
-std::atomic<bool> fork_prepared{false};
-int current_pid() noexcept {
-#if defined(__linux__) || defined(__ANDROID__)
-  return static_cast<int>(getpid());
-#else
-  return 1;
-#endif
-}
-}  // namespace
-Error process_entry() noexcept {
-  const int pid = current_pid();
-  int empty = 0;
-  owner_pid.compare_exchange_strong(empty, pid);
-  return owner_pid.load() != pid || fork_prepared.load() ? Error::Make(ErrorCode::kInvalidArgument)
-                                                         : Error::Ok();
-}
 std::shared_ptr<MapsCacheState> MapsCacheAccess::get(const MapsCache& cache) noexcept {
   return cache.state_;
 }
@@ -153,6 +135,9 @@ static Error replace_snapshot(std::shared_ptr<detail::MapsCacheState>& state_, c
   }
 }
 Error MapsCache::import_text(const char* text, size_t length) {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -162,6 +147,9 @@ Error MapsCache::import_text(const char* text, size_t length) {
   }
 }
 Error MapsCache::capture() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
 #if defined(__linux__) || defined(__ANDROID__)
   try {
@@ -195,6 +183,9 @@ Error MapsCache::capture() {
 #endif
 }
 Error MapsCache::invalidate() {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return admission.error();
+
   if (Error e = detail::process_entry()) return e;
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -205,6 +196,9 @@ Error MapsCache::invalidate() {
   }
 }
 bool MapsCache::has_bindings() const noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return true;
+
   if (detail::process_entry()) return true;
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
@@ -212,33 +206,5 @@ bool MapsCache::has_bindings() const noexcept {
   } catch (...) {
     return true;
   }
-}
-Error prepare_fork() noexcept {
-  if (Error e = detail::process_entry()) return e;
-  try {
-    if (Error e = detail::initialize_c_store()) return e;
-    std::lock_guard<std::mutex> lock(detail::op_mutex());
-    auto& registry = detail::Registry::instance();
-    if (!detail::page_size() || !registry.salt_ready())
-      return Error::Make(ErrorCode::kUnsupportedFormat);
-    if (!registry.fork_clean()) return Error::Make(ErrorCode::kIndeterminate);
-    detail::fork_prepared.store(true);
-    return Error::Ok();
-  } catch (...) {
-    return detail::current_exception_error();
-  }
-}
-Error after_fork_parent() noexcept {
-  if (!detail::fork_prepared.load() || detail::owner_pid.load() != detail::current_pid())
-    return Error::Make(ErrorCode::kInvalidArgument);
-  detail::fork_prepared.store(false);
-  return Error::Ok();
-}
-Error after_fork_child() noexcept {
-  if (!detail::fork_prepared.load() || detail::owner_pid.load() == detail::current_pid())
-    return Error::Make(ErrorCode::kInvalidArgument);
-  detail::owner_pid.store(detail::current_pid());
-  detail::fork_prepared.store(false);
-  return Error::Ok();
 }
 }  // namespace yukiplt

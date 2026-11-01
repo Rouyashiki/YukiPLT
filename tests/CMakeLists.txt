@@ -32,6 +32,7 @@ add_library(yukiplt_regression_core STATIC
     "${YUKIPLT_ROOT}/src/session.cpp"
     "${YUKIPLT_ROOT}/src/memory.cpp"
     "${YUKIPLT_ROOT}/src/maps_cache.cpp"
+    "${YUKIPLT_ROOT}/src/fork.cpp"
     "${YUKIPLT_ROOT}/src/registry.cpp"
     "${YUKIPLT_ROOT}/src/rules.cpp"
     "${YUKIPLT_ROOT}/tests/overrides.cpp"
@@ -56,6 +57,9 @@ endforeach()
 
 # Fault injection wraps cross-unit runtime calls without production switches.
 target_link_options(yukiplt_regression_core INTERFACE
+    -Wl,--wrap=pthread_mutex_unlock
+    -Wl,--wrap=pthread_key_create
+    -Wl,--wrap=pthread_getspecific
     -Wl,--wrap=dl_iterate_phdr
     -Wl,--wrap=_ZN7yukiplt6detail10active_opsEv
     -Wl,--wrap=_ZN7yukiplt6detail23active_image_enumeratorEv)

@@ -141,6 +141,10 @@ yukiplt_c_error add(yukiplt_c_rules* h, const yukiplt_c_image_selector* f, const
 
 extern "C" {
 yukiplt_c_error yukiplt_c_rules_create(yukiplt_c_rules* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token) return invalid();
@@ -151,25 +155,45 @@ yukiplt_c_error yukiplt_c_rules_create(yukiplt_c_rules* out) noexcept {
   });
 }
 yukiplt_c_error yukiplt_c_rules_destroy(yukiplt_c_rules* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary(
       [&] { return h ? destroy(h->token, Kind::kRules) : Error::Make(ErrorCode::kNullPointer); });
 }
 yukiplt_c_error yukiplt_c_rules_add(yukiplt_c_rules* h, const yukiplt_c_image_selector* f,
                                     const yukiplt_c_selector* s, void* replacement,
                                     void** originals, size_t capacity, uint64_t* id) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return add(h, f, s, replacement, originals, capacity, id);
 }
 yukiplt_c_error yukiplt_c_rules_add_function(yukiplt_c_rules* h, const yukiplt_c_image_selector* f,
                                              const yukiplt_c_function_selector* s,
                                              void* replacement, void** originals, size_t capacity,
                                              uint64_t* id) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return add(h, f, s, replacement, originals, capacity, id);
 }
 yukiplt_c_error yukiplt_c_rules_refresh(yukiplt_c_rules* h, yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return run(h, out, [](RuleSet& r, RuleOperationReport& p) { return r.refresh(p); });
 }
 yukiplt_c_error yukiplt_c_rules_release_image(yukiplt_c_rules* h, const yukiplt_c_image* v,
                                               yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
   return run(h, out,
              [&](RuleSet& r, RuleOperationReport& p) { return r.release_image(image(*v), p); });
@@ -177,6 +201,10 @@ yukiplt_c_error yukiplt_c_rules_release_image(yukiplt_c_rules* h, const yukiplt_
 yukiplt_c_error yukiplt_c_rules_notify_loaded(yukiplt_c_rules* h, const yukiplt_c_image* v,
                                               const char* path,
                                               yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v || !path) return converted(Error::Make(ErrorCode::kNullPointer));
   return run(h, out, [&](RuleSet& r, RuleOperationReport& p) {
     return r.notify_loaded(image(*v), path, p);
@@ -184,21 +212,41 @@ yukiplt_c_error yukiplt_c_rules_notify_loaded(yukiplt_c_rules* h, const yukiplt_
 }
 yukiplt_c_error yukiplt_c_rules_notify_unloading(yukiplt_c_rules* h, const yukiplt_c_image* v,
                                                  yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
   return run(h, out,
              [&](RuleSet& r, RuleOperationReport& p) { return r.notify_unloading(image(*v), p); });
 }
 yukiplt_c_error yukiplt_c_rules_remove(yukiplt_c_rules* h, uint64_t id,
                                        yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return run(h, out, [&](RuleSet& r, RuleOperationReport& p) { return r.remove_rule(id, p); });
 }
 yukiplt_c_error yukiplt_c_rules_unhook(yukiplt_c_rules* h, yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return run(h, out, [](RuleSet& r, RuleOperationReport& p) { return r.unhook(p); });
 }
 yukiplt_c_error yukiplt_c_rules_abandon(yukiplt_c_rules* h, yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return run(h, out, [](RuleSet& r, RuleOperationReport& p) { return r.abandon(p); });
 }
 yukiplt_c_error yukiplt_c_rules_prune_history(yukiplt_c_rules* h, size_t* removed) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !removed) return Error::Make(ErrorCode::kNullPointer);
     auto rules = get<Rules>(h, Kind::kRules);
@@ -211,6 +259,10 @@ yukiplt_c_error yukiplt_c_rules_prune_history(yukiplt_c_rules* h, size_t* remove
 }
 yukiplt_c_error yukiplt_c_rules_get_statistics(const yukiplt_c_rules* h,
                                                yukiplt_c_rules_statistics* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !out) return Error::Make(ErrorCode::kNullPointer);
     auto rules = get<Rules>(h, Kind::kRules);
@@ -222,6 +274,10 @@ yukiplt_c_error yukiplt_c_rules_get_statistics(const yukiplt_c_rules* h,
 }
 yukiplt_c_error yukiplt_c_rules_get_rule_statistics(const yukiplt_c_rules* h, uint64_t id,
                                                     yukiplt_c_rule_statistics* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !out) return Error::Make(ErrorCode::kNullPointer);
     auto rules = get<Rules>(h, Kind::kRules);
@@ -237,6 +293,10 @@ yukiplt_c_error yukiplt_c_rules_get_rule_statistics(const yukiplt_c_rules* h, ui
 }
 yukiplt_c_error yukiplt_c_rules_snapshot_bindings(const yukiplt_c_rules* h,
                                                   yukiplt_c_bindings* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !out) return Error::Make(ErrorCode::kNullPointer);
     if (out->token) return invalid();
@@ -251,6 +311,10 @@ yukiplt_c_error yukiplt_c_rules_snapshot_bindings(const yukiplt_c_rules* h,
   });
 }
 yukiplt_c_error yukiplt_c_bindings_destroy(yukiplt_c_bindings* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return h ? destroy(h->token, Kind::kBindings) : Error::Make(ErrorCode::kNullPointer);
   });
@@ -258,6 +322,10 @@ yukiplt_c_error yukiplt_c_bindings_destroy(yukiplt_c_bindings* h) noexcept {
 yukiplt_c_error yukiplt_c_bindings_copy(const yukiplt_c_bindings* h, yukiplt_c_binding_record* rows,
                                         size_t capacity, char* text, size_t text_capacity,
                                         size_t* required_count, size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h) return Error::Make(ErrorCode::kNullPointer);
     auto bindings = get<Bindings>(h, Kind::kBindings);
@@ -284,12 +352,20 @@ yukiplt_c_error yukiplt_c_bindings_copy(const yukiplt_c_bindings* h, yukiplt_c_b
   });
 }
 yukiplt_c_error yukiplt_c_rule_report_destroy(yukiplt_c_rule_report* h) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&] {
     return h ? destroy(h->token, Kind::kRuleReport) : Error::Make(ErrorCode::kNullPointer);
   });
 }
 yukiplt_c_error yukiplt_c_rule_report_get_info(const yukiplt_c_rule_report* h,
                                                yukiplt_c_rule_report_info* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h || !out) return Error::Make(ErrorCode::kNullPointer);
     auto report = get<Report>(h, Kind::kRuleReport);
@@ -302,6 +378,10 @@ yukiplt_c_error yukiplt_c_rule_report_copy(const yukiplt_c_rule_report* h,
                                            yukiplt_c_rule_event* rows, size_t capacity, char* text,
                                            size_t text_capacity, size_t* required_count,
                                            size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     if (!h) return Error::Make(ErrorCode::kNullPointer);
     auto report = get<Report>(h, Kind::kRuleReport);
@@ -334,6 +414,10 @@ extern "C" {
 yukiplt_c_error yukiplt_c_rules_refresh_cached(const yukiplt_c_maps_cache* cache,
                                                yukiplt_c_rules* h,
                                                yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
     if (!lease) return invalid();
@@ -345,6 +429,10 @@ yukiplt_c_error yukiplt_c_rules_refresh_cached(const yukiplt_c_maps_cache* cache
 }
 yukiplt_c_error yukiplt_c_rules_unhook_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
                                               yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
     if (!lease) return invalid();
@@ -357,6 +445,10 @@ yukiplt_c_error yukiplt_c_rules_unhook_cached(const yukiplt_c_maps_cache* cache,
 yukiplt_c_error yukiplt_c_rules_release_image_cached(const yukiplt_c_maps_cache* cache,
                                                      yukiplt_c_rules* h, const yukiplt_c_image* v,
                                                      yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
@@ -371,6 +463,10 @@ yukiplt_c_error yukiplt_c_rules_notify_loaded_cached(const yukiplt_c_maps_cache*
                                                      yukiplt_c_rules* h, const yukiplt_c_image* v,
                                                      const char* path,
                                                      yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
@@ -385,6 +481,10 @@ yukiplt_c_error yukiplt_c_rules_notify_unloading_cached(const yukiplt_c_maps_cac
                                                         yukiplt_c_rules* h,
                                                         const yukiplt_c_image* v,
                                                         yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   if (!v) return converted(Error::Make(ErrorCode::kNullPointer));
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
@@ -397,6 +497,10 @@ yukiplt_c_error yukiplt_c_rules_notify_unloading_cached(const yukiplt_c_maps_cac
 }
 yukiplt_c_error yukiplt_c_rules_remove_cached(const yukiplt_c_maps_cache* cache, yukiplt_c_rules* h,
                                               uint64_t id, yukiplt_c_rule_report* out) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error())
+    return {static_cast<uint32_t>(admission.error().code), admission.error().sys_errno};
+
   return boundary([&]() -> Error {
     auto lease = get_cache(cache);
     if (!lease) return invalid();

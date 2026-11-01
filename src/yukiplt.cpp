@@ -600,12 +600,12 @@ HookHandle& HookHandle::operator=(HookHandle&& o) noexcept {
   return *this;
 }
 
-// Destructors and move assignment must never block or throw: try the op lock
-// once and fall back to a generic warning when it is held (for example by a
-// thread inside an operation), or when locking reports an error.
+// Best-effort diagnostics keep admission through op-lock release and logging.
+// try_lock avoids waiting for an operation that already owns the op lock.
 void HookHandle::warn_if_installed() const noexcept {
-  if (detail::process_entry()) return;
   if (id_ == kInvalid) return;
+  detail::OperationGuard admission;
+  if (admission.error()) return;
   try {
     std::unique_lock<std::mutex> lock(detail::op_mutex(), std::try_to_lock);
     if (!lock.owns_lock()) {

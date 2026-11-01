@@ -1044,6 +1044,52 @@ TEST(MultithreadFork, DrainsCStoreBeforePublishingObjectToken) {
 }  // namespace
 
 namespace contracts_checks {
+TEST_F(ContractFixture, ForkDrainsHandleDiagnostics) {
+  static std::atomic<bool> release{false};
+  for (bool timeout : {true, false}) {
+    ASSERT_TRUE(enable_atfork(native_config(timeout ? 20 : 5000)).ok());
+    for (bool overwrite : {false, true}) {
+      HookRequest request{"alpha", kReplA, &outputs[0]};
+      auto installed = hook_batch(view(), &request, 1);
+      ASSERT_TRUE(installed.ok());
+      const uint64_t id = detail_api::id(installed.handle);
+      checkpoint_entered.store(false);
+      release.store(false);
+      void (*checkpoint)() = await_fork_drain;
+      if (timeout) {
+        checkpoint = [] {
+          checkpoint_entered.store(true);
+          while (!release.load()) std::this_thread::yield();
+        };
+      }
+      std::thread worker([&] {
+        auto handle = std::move(installed.handle);
+        detail::set_mutex_unlock_callback(detail::op_mutex().native_handle(), false, checkpoint);
+        if (overwrite) handle = HookHandle{};
+      });
+      while (!checkpoint_entered.load()) std::this_thread::yield();
+      pid_t child = fork();
+      if (!child) {
+        if (timeout) {
+          yukiplt_c_maps_cache cache{};
+          _exit(fork_phase(YUKIPLT_C_FORK_REJECTED, YUKIPLT_C_FORK_REASON_TIMEOUT) ||
+                yukiplt_c_maps_cache_create(&cache).code != YUKIPLT_C_FORK_CHILD_UNAVAILABLE);
+        }
+        if (fork_phase(YUKIPLT_C_FORK_READY)) _exit(1);
+        auto inherited = detail_api::make(id);
+        _exit(unhook(inherited).ok() && slot(0) == 0x1000 ? 0 : 2);
+      }
+      release.store(true);
+      worker.join();
+      wait_child(child);
+      // Reclaim the deliberately dropped handle so both processes clean up.
+      auto retained = detail_api::make(id);
+      EXPECT_TRUE(unhook(retained).ok());
+    }
+    EXPECT_TRUE(disable_atfork().ok());
+  }
+}
+
 TEST_F(ContractFixture, ForkDrainsTransactionAndSessionReportPublication) {
   ASSERT_TRUE(enable_atfork(native_config()).ok());
   // Check both a held op mutex and the interval after commit unlocks it.

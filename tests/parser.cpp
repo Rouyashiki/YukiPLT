@@ -492,6 +492,46 @@ TEST_F(FuncInstallFixture, ExplicitJumpSlotRequiresUndefinedFunctionAndZeroAdden
   }
 }
 
+TEST_F(FuncInstallFixture, LegacyBatchKeepsRequestOrderAndValidatesUnselectedImports) {
+  for (size_t count : {1u, 8u, 9u, 64u}) {
+    ElfBuilder b;
+    std::vector<std::string> names;
+    for (size_t i = 0; i <= count; ++i) {
+      names.push_back("indexed_import_" + std::to_string(i));
+      b.add_symbol(names.back().c_str(), i + 1).add_jump_slot(i + 1);
+    }
+    set_backing(b.build());
+    std::vector<HookRequest> requests;
+    std::vector<SlotReport> reports(count);
+    for (size_t i = 0; i < count; ++i) {
+      wr(image.got_slot_addr(i), 0x1111 + i);
+      requests.push_back({names[count - i - 1].c_str(), kReplA, nullptr});
+    }
+    auto installed = hook_batch(view(), requests.data(), count, reports.data());
+    ASSERT_TRUE(installed.ok());
+    for (size_t i = 0; i < count; ++i) {
+      EXPECT_EQ(reports[i].address, image.got_slot_addr(count - i - 1));
+      EXPECT_EQ(rd(reports[i].address), reinterpret_cast<uintptr_t>(kReplA));
+    }
+    ASSERT_FALSE(unhook(installed.handle));
+    if (count > 1) {
+      requests.back().symbol = requests.front().symbol;
+      EXPECT_EQ(hook_batch(view(), requests.data(), count).error.code, ErrorCode::kInvalidArgument);
+    }
+    auto inspected = detail::inspect(image.load_bias(), image.phdr_table(), image.phdr_count);
+    ASSERT_TRUE(inspected);
+    auto* symbol = reinterpret_cast<NativeElfSym*>(inspected.value().symtab) + count + 1;
+    symbol->st_name = inspected.value().strsz;
+    requests[0].symbol = nullptr;
+    cas_calls = maps_calls = 0;
+    auto bad = hook_batch(view(), requests.data(), count);
+    EXPECT_EQ(bad.error.code, ErrorCode::kCorruptedElf);
+    EXPECT_FALSE(bad.handle.valid());
+    EXPECT_EQ(cas_calls, 0u);
+    EXPECT_EQ(maps_calls, 0u);
+  }
+}
+
 TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
   ElfBuilder b;
   b.add_symbol("weak", 1)

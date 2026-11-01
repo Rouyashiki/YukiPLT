@@ -14,6 +14,16 @@ namespace yukiplt::detail {
 
 // Pure parsing over an inspected image whose metadata remains readable.
 // May allocate; the public API catches failures before leaving the loader callback.
+struct ImportView {
+  std::string_view symbol;
+  uint32_t symbol_index;
+  size_t relocation_index;
+  uintptr_t slot_address;
+};
+// Views expire when the caller's image stability window ends. The visitor
+// cannot stop validation of later records or the final duplicate-slot check.
+Error walk_imports(const InspectedImage&, void (*visit)(void*, const ImportView&), void*,
+                   size_t& skipped);
 Result<ImportSnapshot> snapshot_imports(const InspectedImage& image);
 
 // Upper bound on the dynamic symbol table index, derived from a hash table or,

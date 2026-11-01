@@ -30,7 +30,8 @@ bool readable(const InspectedImage& image, uintptr_t address, size_t size) {
 }
 
 template <typename T>
-Result<T> read(const InspectedImage& image, uintptr_t base, size_t index = 0) {
+[[gnu::always_inline]] inline Result<T> read(const InspectedImage& image, uintptr_t base,
+                                             size_t index = 0) {
   if (index > std::numeric_limits<uintptr_t>::max() / sizeof(T))
     return Error::Make(ErrorCode::kIntegerOverflow);
   uintptr_t address;
@@ -125,7 +126,11 @@ Result<size_t> symbol_count(const InspectedImage& image) {
 
 Result<size_t> dynamic_symbol_count(const InspectedImage& image) { return symbol_count(image); }
 
-Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
+namespace {
+template <bool Own>
+Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
+                                         void (*visit)(void*, const ImportView&) = nullptr,
+                                         void* context = nullptr) {
   ImportSnapshot snapshot;
   if (image.jmprel_count == 0) return snapshot;
   auto count = symbol_count(image);
@@ -168,8 +173,13 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
     if (address % kNativeSlotSize != 0 || !image.addr_in_writable_load(address, kNativeSlotSize))
       return Error::Make(ErrorCode::kCorruptedElf);
 
-    snapshot.imports.push_back(
-        {std::string(name, static_cast<size_t>(end - name)), symbol_index, i, address});
+    if constexpr (Own) {
+      snapshot.imports.push_back(
+          {std::string(name, static_cast<size_t>(end - name)), symbol_index, i, address});
+    } else {
+      visit(context,
+            {std::string_view(name, static_cast<size_t>(end - name)), symbol_index, i, address});
+    }
     addresses.push_back(address);
   }
   // Preserve table order in the snapshot; sort a separate address list so
@@ -178,6 +188,18 @@ Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
   if (std::adjacent_find(addresses.begin(), addresses.end()) != addresses.end())
     return Error::Make(ErrorCode::kCorruptedElf);
   return snapshot;
+}
+}  // namespace
+
+Error walk_imports(const InspectedImage& image, void (*visit)(void*, const ImportView&),
+                   void* context, size_t& skipped) {
+  auto result = walk_imports_impl<false>(image, visit, context);
+  if (!result) return result.error();
+  skipped = result.value().skipped_relocations;
+  return Error::Ok();
+}
+Result<ImportSnapshot> snapshot_imports(const InspectedImage& image) {
+  return walk_imports_impl<true>(image);
 }
 
 namespace {

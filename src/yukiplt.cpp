@@ -186,39 +186,78 @@ Error validate_outputs(const Request* reqs, size_t count,
 
 /// Resolve every request against `img` to a unique slot, enforcing one-slot
 /// uniqueness and no duplicate targets within the batch.
+struct NameRequests {
+  const HookRequest* requests;
+  size_t count;
+  size_t heads[128]{};
+  size_t next[kMaxBatch]{};
+  uintptr_t selected[kMaxBatch]{};
+  bool found[kMaxBatch]{};
+  bool ambiguous[kMaxBatch]{};
+
+  static size_t hash(std::string_view name) noexcept {
+    size_t value = 2166136261u;
+    for (unsigned char c : name) value = (value ^ c) * 16777619u;
+    return value & 127;
+  }
+  void prepare() noexcept {
+    if (count <= 8) return;
+    for (size_t i = 0; i < count; ++i) {
+      const char* name = requests[i].symbol;
+      if (!name || !*name) continue;
+      size_t bucket = hash(name);
+      while (heads[bucket] && std::strcmp(requests[heads[bucket] - 1].symbol, name))
+        bucket = (bucket + 1) & 127;
+      next[i] = heads[bucket];
+      heads[bucket] = i + 1;
+    }
+  }
+  void match(size_t i, const detail::ImportView& entry) noexcept {
+    if (found[i]) ambiguous[i] = true;
+    found[i] = true;
+    selected[i] = entry.slot_address;
+  }
+  void visit(const detail::ImportView& entry) noexcept {
+    if (count <= 8) {
+      for (size_t i = 0; i < count; ++i)
+        if (requests[i].symbol && *requests[i].symbol && entry.symbol == requests[i].symbol)
+          match(i, entry);
+    } else {
+      size_t bucket = hash(entry.symbol);
+      while (heads[bucket]) {
+        if (entry.symbol == requests[heads[bucket] - 1].symbol) {
+          for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1, entry);
+          break;
+        }
+        bucket = (bucket + 1) & 127;
+      }
+    }
+  }
+};
+
 Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t count,
                     detail::SmallVec<PlannedSlot, 4>& out, detail::CauseContext* cause = nullptr) {
-  // One complete validated scan for the batch; do not parse version metadata
-  // on the legacy name-only path.
-  auto snapshot = detail::snapshot_imports(img);
-  if (!snapshot) return snapshot.error();
+  NameRequests matches{reqs, count};
+  matches.prepare();
+  size_t skipped = 0;
+  if (Error error = detail::walk_imports(
+          img,
+          [](void* context, const detail::ImportView& entry) {
+            static_cast<NameRequests*>(context)->visit(entry);
+          },
+          &matches, skipped))
+    return error;
+  // Preserve legacy request-order errors after complete ELF validation.
   for (size_t i = 0; i < count; ++i) {
-    if (reqs[i].symbol == nullptr || reqs[i].replacement == nullptr)
-      return Error::Make(ErrorCode::kNullPointer);
-    // The legacy name path keeps its historical code for an empty name
-    // (kSymbolNotFound) but never lets "" match an unnamed record.
-    if (reqs[i].symbol[0] == '\0') return Error::Make(ErrorCode::kSymbolNotFound);
-
-    const ImportInfo* selected = nullptr;
-    for (const auto& entry : snapshot.value().imports) {
-      if (entry.symbol != reqs[i].symbol) continue;
-      if (selected) return Error::Make(ErrorCode::kAmbiguousSymbol);
-      selected = &entry;
-    }
-    if (!selected) return Error::Make(ErrorCode::kSymbolNotFound);
-    uintptr_t addr = selected->slot_address;
-    for (const PlannedSlot& p : out) {
-      if (p.address == addr)
+    if (!reqs[i].symbol || !reqs[i].replacement) return Error::Make(ErrorCode::kNullPointer);
+    if (!*reqs[i].symbol || !matches.found[i]) return Error::Make(ErrorCode::kSymbolNotFound);
+    if (matches.ambiguous[i]) return Error::Make(ErrorCode::kAmbiguousSymbol);
+    for (const PlannedSlot& previous : out)
+      if (previous.address == matches.selected[i])
         return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
                                   ErrorCause::kDuplicateTarget, cause);
-    }
-    PlannedSlot ps;
-    ps.address = addr;
-    ps.original = 0;
-    ps.replacement = reinterpret_cast<uintptr_t>(reqs[i].replacement);
-    ps.out_original = reqs[i].out_original;
-    ps.report_index = i;
-    out.push_back(ps);
+    out.push_back({matches.selected[i], 0, reinterpret_cast<uintptr_t>(reqs[i].replacement),
+                   reqs[i].out_original, i});
   }
   return Error::Ok();
 }

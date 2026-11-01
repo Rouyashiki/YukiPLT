@@ -981,11 +981,10 @@ uint32_t type_bit(uint32_t relocation_type) noexcept {
   return 0;
 }
 
-// A record is acceptable to hook only as JUMP_SLOT, or as GLOB_DAT with addend
-// zero, symbol type STT_FUNC and an undefined (imported) symbol.
+// Both explicit function relocation types require an undefined STT_FUNC.
 bool is_acceptable(const FunctionReloc& record) noexcept {
-  if (record.entry.relocation_type == kRelJumpSlot) return true;
-  if (record.entry.relocation_type != kRelGlobDat) return false;
+  if (record.entry.relocation_type != kRelJumpSlot && record.entry.relocation_type != kRelGlobDat)
+    return false;
   return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined;
 }
 

@@ -13,11 +13,11 @@
 #include <vector>
 
 #include "aps2_encoder.hpp"
-#include "elf_builder.hpp"
 #include "elf.hpp"
+#include "elf_builder.hpp"
 #include "imports.hpp"
-#include "overrides.hpp"
 #include "memory.hpp"
+#include "overrides.hpp"
 #include "registry.hpp"
 #include "versioned_elf.hpp"
 #include "yukiplt.hpp"
@@ -439,7 +439,7 @@ TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModificat
 
 TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
   ElfBuilder b;
-  b.add_symbol("good", 1);
+  b.add_symbol("good", 1).set_symbol_undefined(1);
   b.add_symbol("bad", 2).set_symbol_undefined(2).set_symbol_type(2, STT_OBJECT);
   b.add_jump_slot(1);
   b.add_rela(2, YUKIPLT_RELOC_GLOB_DAT, 0);
@@ -458,6 +458,38 @@ TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
   EXPECT_EQ(cas_calls, 0u);
   EXPECT_EQ(maps_calls, 0u);
   EXPECT_EQ(live_groups(), baseline);
+}
+
+TEST_F(FuncInstallFixture, ExplicitJumpSlotRequiresUndefinedFunctionAndZeroAddend) {
+  for (int invalid = 0; invalid < 6; ++invalid) {
+#if !YUKIPLT_USES_RELA
+    if (invalid == 5) continue;
+#endif
+    ElfBuilder b;
+    b.add_symbol("target", 1).set_symbol_undefined(1);
+    const uint8_t types[] = {STT_OBJECT, STT_NOTYPE, STT_TLS, 10};
+    if (invalid < 4) b.set_symbol_type(1, types[invalid]);
+    if (invalid == 4) b.set_symbol_undefined(1, false);
+    b.add_jump_slot(1, invalid == 5 ? 1 : 0);
+    set_backing(b.build());
+    wr(image.got_slot_addr(0), 0x1111);
+    auto selector = sel("target", kSourceJmprel, kTypeJumpSlot);
+    const auto baseline = live_groups();
+    auto result = hook_function_import(view(), selector, kReplA, &outputs[0]);
+    EXPECT_EQ(result.error.code, ErrorCode::kUnsupportedRelocation) << invalid;
+    EXPECT_FALSE(result.handle.valid());
+    EXPECT_EQ(rd(image.got_slot_addr(0)), 0x1111u);
+    EXPECT_EQ(outputs[0], nullptr);
+    EXPECT_EQ(cas_calls, 0u);
+    EXPECT_EQ(maps_calls, 0u);
+    EXPECT_EQ(live_groups(), baseline);
+    FunctionHookTarget target{view(), {selector, kReplA, nullptr, false, 0}};
+    EXPECT_EQ(build_function_hook_plan(&target, 1).error().code, ErrorCode::kUnsupportedRelocation);
+    auto legacy = hook(view(), "target", kReplA, nullptr);
+    ASSERT_TRUE(legacy.ok());
+    EXPECT_FALSE(unhook(legacy.handle));
+    cas_calls = maps_calls = 0;
+  }
 }
 
 TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {

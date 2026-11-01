@@ -358,9 +358,9 @@ YUKIPLT_API int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
 // sources).  Same image/selector/transaction/ownership/original-output contract
 // as yukiplt_c_hook/yukiplt_c_hook_batch.  Each selector's struct_size must equal
 // sizeof(yukiplt_c_function_selector), and its sources/types masks must both be
-// nonzero.  Acceptance is a whitelist: a slot is hookable only as JUMP_SLOT, or
-// as GLOB_DAT whose import symbol is an undefined STT_FUNC with addend zero and a
-// nonzero current slot value; any other matched relocation fails the whole call
+// nonzero. Both JUMP_SLOT and GLOB_DAT require an undefined STT_FUNC with zero
+// effective addend. Only GLOB_DAT additionally requires a nonzero current slot
+// value; any ineligible matched relocation fails the whole call
 // with UNSUPPORTED_RELOCATION and modifies nothing.  Unhook/abandon/query with
 // the shared yukiplt_c_unhook/abandon/query functions.
 YUKIPLT_API yukiplt_c_error

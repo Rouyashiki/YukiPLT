@@ -175,7 +175,7 @@ struct RuleOomFixture {
 
   RuleOomFixture() {
     test::ElfBuilder b;
-    b.add_symbol("target", 1).add_jump_slot(1);
+    b.add_symbol("target", 1).set_symbol_undefined(1).add_jump_slot(1);
     image = b.build();
     __atomic_store_n(reinterpret_cast<uintptr_t*>(image.got_slot_addr(0)), uintptr_t{0x1000},
                      __ATOMIC_RELEASE);

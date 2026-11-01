@@ -1,6 +1,6 @@
 # Build and package
 
-Use Clang, CMake 3.22 or newer, Ninja and the Android NDK. Select the native ABI
+Use Clang, CMake 3.24 or newer, Ninja and the Android NDK. Select the native ABI
 of the process that will load the library. The minimum Android API is 23.
 
 ```sh
@@ -22,6 +22,19 @@ runtime. The `c++_static` shared configuration has no such dependency.
 For an existing CMake project, use `add_subdirectory(path/to/YukiPLT)` and link
 your target with `yukiplt`. Configure the parent project with the same NDK,
 ABI, API and STL settings. Project warnings apply only to YukiPLT's targets.
+
+Release builds use `YUKIPLT_RELEASE_OPTIMIZATION=Oz` and
+`YUKIPLT_LTO=ON` by default. Select `Oz`, `O2` or `O3` explicitly to
+compare optimization settings for your workload. `YUKIPLT_LTO=ON` requires
+Clang and CMake 3.24 or newer; configuration checks an archive-to-host Full LTO
+link and fails if the selected toolchain cannot complete it. These options
+affect YukiPLT's Release target, leaving other targets and build types unchanged.
+Static Full LTO packages propagate the required final-link option through their
+exported CMake target. Use the matching Clang/LLVM toolchain when consuming a
+bitcode archive. Set `YUKIPLT_LTO=OFF` to disable LTO; this also permits
+CMake 3.22 or newer. Existing build directories retain their cached setting;
+pass `-DYUKIPLT_LTO=ON` to enable it there. Measure sanitizer builds separately
+from production builds.
 
 Shared artifacts use hidden visibility, an explicit export map, 16K LOAD
 alignment and NODELETE. Internal calls bind to the same copy of the library.

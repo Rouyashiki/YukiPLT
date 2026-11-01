@@ -388,15 +388,10 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
 
 }  // namespace
 
-// Attach version metadata to a caller-supplied set of imports (from DT_JMPREL,
-// DT_RELA or DT_ANDROID_RELA).  Shared by snapshot_versioned_imports() and the
-// function-import path so version parsing lives in one place.
-Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
-                                                 std::vector<ImportInfo> imports,
-                                                 size_t skipped_relocations,
-                                                 ScanBudget* shared_budget) {
-  ScanBudget local_budget;
-  ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
+namespace {
+template <typename EntryAt, typename Prepare, typename Store>
+Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt entry_at,
+                            Prepare prepare, Store store, ScanBudget& budget) {
   auto tags = version_tags(image);
   if (!tags) return tags.error();
   const auto& t = tags.value();
@@ -425,7 +420,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
     // A referenced symbol proves this contiguous VERSYM prefix exists. Do not
     // use a LOAD-derived dynsym upper bound as an exact version-table count.
     uintptr_t last = 0;
-    for (const auto& entry : imports) last = std::max(last, uintptr_t{entry.symbol_index});
+    for (size_t i = 0; i < count; ++i) last = std::max(last, uintptr_t{entry_at(i).symbol_index});
     uintptr_t count, bytes, end;
     if (!safe_add(last, 1, count) || !safe_mul(count, sizeof(NativeElfHalf), bytes) ||
         !safe_add(versym, bytes, end))
@@ -436,11 +431,10 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
         (next != scan.ranges.begin() && std::prev(next)->second > versym))
       return Error::Make(ErrorCode::kCorruptedElf);
   }
-  VersionedImportSnapshot result;
-  result.skipped_relocations = skipped_relocations;
-  if (Error e = budget.take_objects<VersionedImport>(imports.size())) return e;
-  result.imports.reserve(imports.size());
-  for (auto& entry : imports) {
+  if (Error e = budget.take_objects<VersionedImport>(count)) return e;
+  prepare(count);
+  for (size_t i = 0; i < count; ++i) {
+    auto& entry = entry_at(i);
     SymbolVersion version;
     version.table_present = t.present[0];
     if (t.present[0]) {
@@ -466,8 +460,29 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
         version.source = found->source;
       }
     }
-    result.imports.push_back({std::move(entry), std::move(version)});
+    store(i, std::move(version));
   }
+  return Error::Ok();
+}
+
+}  // namespace
+
+Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
+                                                 std::vector<ImportInfo> imports,
+                                                 size_t skipped_relocations,
+                                                 ScanBudget* shared_budget) {
+  ScanBudget local_budget;
+  ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
+  VersionedImportSnapshot result;
+  result.skipped_relocations = skipped_relocations;
+  auto error = resolve_versions_impl(
+      image, imports.size(), [&](size_t i) -> ImportInfo& { return imports[i]; },
+      [&](size_t count) { result.imports.reserve(count); },
+      [&](size_t i, SymbolVersion version) {
+        result.imports.push_back({std::move(imports[i]), std::move(version)});
+      },
+      budget);
+  if (error) return error;
   return result;
 }
 
@@ -497,6 +512,18 @@ Error validate_selector(const ImportSelector& selector) noexcept {
   return Error::Ok();
 }
 
+bool import_matches(const VersionedImport& entry, const ImportSelector& selector) noexcept {
+  return !(
+      entry.import.symbol != selector.symbol ||
+      (selector.relocation_index != ~size_t{0} &&
+       entry.import.relocation_index != selector.relocation_index) ||
+      (selector.version_match == VersionMatch::kUnversioned && entry.version.index >= 2) ||
+      (selector.version_match == VersionMatch::kExact && entry.version.name != selector.version) ||
+      (selector.dependency != nullptr && entry.version.dependency != selector.dependency) ||
+      (selector.hidden == HiddenMatch::kHidden && !entry.version.hidden) ||
+      (selector.hidden == HiddenMatch::kNonHidden && entry.version.hidden));
+}
+
 Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
                              const ImportSelector& selector) {
   auto invalid = validate_selector(selector);
@@ -504,16 +531,7 @@ Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
   size_t selected = ~size_t{0};
   for (size_t i = 0; i < snapshot.imports.size(); ++i) {
     const auto& entry = snapshot.imports[i];
-    if (entry.import.symbol != selector.symbol ||
-        (selector.relocation_index != ~size_t{0} &&
-         entry.import.relocation_index != selector.relocation_index) ||
-        (selector.version_match == VersionMatch::kUnversioned && entry.version.index >= 2) ||
-        (selector.version_match == VersionMatch::kExact &&
-         entry.version.name != selector.version) ||
-        (selector.dependency != nullptr && entry.version.dependency != selector.dependency) ||
-        (selector.hidden == HiddenMatch::kHidden && !entry.version.hidden) ||
-        (selector.hidden == HiddenMatch::kNonHidden && entry.version.hidden))
-      continue;
+    if (!import_matches(entry, selector)) continue;
     if (selected != ~size_t{0}) return Error::Make(ErrorCode::kAmbiguousSymbol);
     selected = i;
   }
@@ -943,15 +961,16 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
   }
   state.slots = {};
 
-  // Attach version metadata over the whole set, preserving order.
-  std::vector<ImportInfo> infos;
+  // Preserve the logical budget and its order while attaching versions in place.
   if (Error e = budget.take_objects<ImportInfo>(result.records.size())) return e;
-  infos.reserve(result.records.size());
-  for (auto& record : result.records) infos.push_back(std::move(record.entry.base.import));
-  auto versioned = resolve_versions(image, std::move(infos), result.skipped_relocations, &budget);
-  if (!versioned) return versioned.error();
-  for (size_t i = 0; i < result.records.size(); ++i)
-    result.records[i].entry.base = std::move(versioned.value().imports[i]);
+  auto error = resolve_versions_impl(
+      image, result.records.size(),
+      [&](size_t i) -> ImportInfo& { return result.records[i].entry.base.import; }, [](size_t) {},
+      [&](size_t i, SymbolVersion version) {
+        result.records[i].entry.base.version = std::move(version);
+      },
+      budget);
+  if (error) return error;
   return result;
 }
 
@@ -1031,6 +1050,13 @@ bool base_matches(const FunctionReloc& record, const FunctionImportSelector& sel
 
 }  // namespace
 
+bool function_reloc_matches(const FunctionReloc& record,
+                            const FunctionImportSelector& selector) noexcept {
+  return (source_bit(record.entry.source) & selector.sources) != 0 &&
+         (type_bit(record.entry.relocation_type) & selector.types) != 0 &&
+         base_matches(record, selector);
+}
+
 Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
                                      const FunctionImportSelector& selector) {
   if (Error e = validate_function_selector(selector)) return e;
@@ -1039,9 +1065,7 @@ Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
   for (size_t i = 0; i < scan.records.size(); ++i) {
     const FunctionReloc& record = scan.records[i];
     // Only records in the opted-in sources and types are candidates.
-    if ((source_bit(record.entry.source) & selector.sources) == 0) continue;
-    if ((type_bit(record.entry.relocation_type) & selector.types) == 0) continue;
-    if (!base_matches(record, selector)) continue;
+    if (!function_reloc_matches(record, selector)) continue;
     // A matched record that is not hookable fails the whole call: never skip it
     // and silently hook a different slot of the same name.
     if (!is_acceptable(record)) return Error::Make(ErrorCode::kUnsupportedRelocation);

@@ -532,6 +532,70 @@ TEST_F(FuncInstallFixture, LegacyBatchKeepsRequestOrderAndValidatesUnselectedImp
   }
 }
 
+TEST_F(FuncInstallFixture, IndexedSelectorsPreserveCollisionsChainsAndErrorOrder) {
+  auto bucket = [](const std::string& name) {
+    size_t value = 2166136261u;
+    for (unsigned char c : name) value = (value ^ c) * 16777619u;
+    return value & 127;
+  };
+  std::vector<std::string> names{"same_name", "same_name"};
+  for (size_t i = 0; names.size() < 64; ++i) {
+    auto name = "collision_" + std::to_string(i);
+    if (bucket(name) == bucket(names[0])) names.push_back(std::move(name));
+  }
+  for (size_t count : {8u, 9u, 64u}) {
+    for (bool invalid_tail : {false, true}) {
+      ElfBuilder builder;
+      for (size_t i = 0; i < count; ++i)
+        builder.add_symbol(names[i].c_str(), i + 1)
+            .set_symbol_undefined(i + 1)
+            .add_jump_slot(i + 1);
+      if (invalid_tail)
+        builder.add_symbol(names[0].c_str(), count + 1)
+            .set_symbol_undefined(count + 1)
+            .set_symbol_type(count + 1, STT_OBJECT)
+            .add_jump_slot(count + 1);
+      set_backing(builder.build());
+      std::vector<SelectedHookRequest> selected;
+      std::vector<FunctionHookRequest> functions;
+      std::vector<SlotReport> reports(count);
+      for (size_t i = 0; i < count; ++i) {
+        ImportSelector target{names[i].c_str()};
+        target.relocation_index = i;
+        selected.push_back({target, kReplA, nullptr});
+        functions.push_back({{target, kSourceJmprel, kTypeJumpSlot}, kReplA, nullptr});
+        wr(image.got_slot_addr(i), 0x1111 + i);
+      }
+      auto legacy = hook_imports(view(), selected.data(), count, reports.data());
+      ASSERT_TRUE(legacy.ok());
+      for (size_t i = 0; i < count; ++i) EXPECT_EQ(reports[i].address, image.got_slot_addr(i));
+      ASSERT_FALSE(unhook(legacy.handle));
+      auto explicit_functions =
+          hook_function_imports(view(), functions.data(), count, reports.data());
+      ASSERT_TRUE(explicit_functions.ok());
+      for (size_t i = 0; i < count; ++i) EXPECT_EQ(reports[i].address, image.got_slot_addr(i));
+      ASSERT_FALSE(unhook(explicit_functions.handle));
+
+      selected[0].target.relocation_index = ~size_t{0};
+      functions[0].target.base.relocation_index = ~size_t{0};
+      cas_calls = maps_calls = 0;
+      EXPECT_EQ(hook_imports(view(), selected.data(), count).error.code,
+                ErrorCode::kAmbiguousSymbol);
+      EXPECT_EQ(hook_function_imports(view(), functions.data(), count).error.code,
+                invalid_tail ? ErrorCode::kUnsupportedRelocation : ErrorCode::kAmbiguousSymbol);
+      functions[1].target.base = functions[0].target.base;
+      functions[0].target.base.symbol = "missing";
+      EXPECT_EQ(hook_function_imports(view(), functions.data(), count).error.code,
+                ErrorCode::kSymbolNotFound);
+      std::swap(functions[0], functions[1]);
+      EXPECT_EQ(hook_function_imports(view(), functions.data(), count).error.code,
+                invalid_tail ? ErrorCode::kUnsupportedRelocation : ErrorCode::kAmbiguousSymbol);
+      EXPECT_EQ(cas_calls, 0u);
+      EXPECT_EQ(maps_calls, 0u);
+    }
+  }
+}
+
 TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
   ElfBuilder b;
   b.add_symbol("weak", 1)
@@ -576,6 +640,24 @@ TEST(Versions, VersymCannotAliasNamedVersionRecordsOrChangeSelection) {
 
     EXPECT_TRUE(inspect_imports(fixture.view()));
   }
+}
+
+TEST(Versions, FunctionSnapshotOwnsVersionTextAfterImageChanges) {
+  VersionedElf fixture;
+  auto snapshot = inspect_function_imports(fixture.view(), kSourceJmprel);
+  ASSERT_TRUE(snapshot);
+  ASSERT_EQ(snapshot.value().imports.size(), 2u);
+  EXPECT_EQ(snapshot.value().imports[0].base.version.name, "VERSION_1");
+  EXPECT_TRUE(snapshot.value().imports[0].base.version.hidden);
+  EXPECT_EQ(snapshot.value().imports[1].base.version.name, "VERSION_2");
+  std::memset(fixture.image.buffer.data(), 0, fixture.image.buffer.size());
+  for (const auto& entry : snapshot.value().imports) {
+    EXPECT_EQ(entry.base.import.symbol, "versioned");
+    EXPECT_EQ(entry.base.version.dependency, "libversions.so");
+    EXPECT_EQ(entry.base.version.source, VersionSource::kNeeded);
+  }
+  EXPECT_EQ(snapshot.value().imports[0].base.version.name, "VERSION_1");
+  EXPECT_EQ(snapshot.value().imports[1].base.version.name, "VERSION_2");
 }
 
 }  // namespace versions_checks

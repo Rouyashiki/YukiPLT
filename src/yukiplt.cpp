@@ -8,6 +8,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <stdexcept>
 
 #include "common.hpp"
@@ -206,7 +207,7 @@ struct NameRequests {
       const char* name = requests[i].symbol;
       if (!name || !*name) continue;
       size_t bucket = hash(name);
-      while (heads[bucket] && std::strcmp(requests[heads[bucket] - 1].symbol, name))
+      while (heads[bucket] && std::strcmp(requests[heads[bucket] - 1].symbol, name) != 0)
         bucket = (bucket + 1) & 127;
       next[i] = heads[bucket];
       heads[bucket] = i + 1;
@@ -262,14 +263,72 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
   return Error::Ok();
 }
 
+// Fixed request metadata is separate from decoded-record materialization.
+struct SelectedRequests {
+  const char* names[kMaxBatch]{};
+  size_t heads[128]{};
+  size_t next[kMaxBatch]{};
+  size_t selected[kMaxBatch]{};
+  ErrorCode errors[kMaxBatch]{};
+
+  template <typename Name>
+  void prepare(size_t count, Name name) noexcept {
+    for (size_t i = 0; i < count; ++i) {
+      names[i] = name(i);
+      selected[i] = ~size_t{0};
+      size_t bucket = NameRequests::hash(names[i]);
+      while (heads[bucket] && std::strcmp(names[heads[bucket] - 1], names[i]) != 0)
+        bucket = (bucket + 1) & 127;
+      next[i] = heads[bucket];
+      heads[bucket] = i + 1;
+    }
+  }
+  template <typename Match>
+  void visit(std::string_view name, Match match) {
+    size_t bucket = NameRequests::hash(name);
+    while (heads[bucket]) {
+      if (name == names[heads[bucket] - 1]) {
+        for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1);
+        return;
+      }
+      bucket = (bucket + 1) & 127;
+    }
+  }
+  void choose(size_t request, size_t record, bool acceptable = true) noexcept {
+    if (!acceptable || errors[request] == ErrorCode::kUnsupportedRelocation) {
+      errors[request] = ErrorCode::kUnsupportedRelocation;
+      return;
+    }
+    if (selected[request] != ~size_t{0}) errors[request] = ErrorCode::kAmbiguousSymbol;
+    selected[request] = record;
+  }
+  Result<size_t> result(size_t request) const {
+    if (errors[request] != ErrorCode::kSuccess) return Error::Make(errors[request]);
+    if (selected[request] == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
+    return selected[request];
+  }
+};
+
 Error plan_selected_requests(const InspectedImage& img, const SelectedHookRequest* reqs,
                              size_t count, detail::SmallVec<PlannedSlot, 4>& out,
                              detail::CauseContext* cause = nullptr) {
   auto snapshot = detail::snapshot_versioned_imports(img, cause);
   if (!snapshot) return snapshot.error();
+  std::optional<SelectedRequests> matches;
+  if (count > 8) {
+    matches.emplace();
+    matches->prepare(count, [&](size_t i) { return reqs[i].target.symbol; });
+    for (size_t record = 0; record < snapshot.value().imports.size(); ++record) {
+      const auto& entry = snapshot.value().imports[record];
+      matches->visit(entry.import.symbol, [&](size_t i) {
+        if (detail::import_matches(entry, reqs[i].target)) matches->choose(i, record);
+      });
+    }
+  }
   for (size_t i = 0; i < count; ++i) {
     if (reqs[i].replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
-    auto selected = detail::select_import(snapshot.value(), reqs[i].target);
+    auto selected =
+        matches ? matches->result(i) : detail::select_import(snapshot.value(), reqs[i].target);
     if (!selected) return selected.error();
     const auto address = snapshot.value().imports[selected.value()].import.slot_address;
     for (const auto& previous : out) {
@@ -533,8 +592,21 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
   budget.cause = cause;
   auto scan = detail::scan_function_imports(img, sources, &budget);
   if (!scan) return scan.error();
+  std::optional<SelectedRequests> matches;
+  if (count > 8) {
+    matches.emplace();
+    matches->prepare(count, [&](size_t i) { return reqs[i].target.base.symbol; });
+    for (size_t record = 0; record < scan.value().records.size(); ++record) {
+      const auto& entry = scan.value().records[record];
+      matches->visit(entry.entry.base.import.symbol, [&](size_t i) {
+        if (detail::function_reloc_matches(entry, reqs[i].target))
+          matches->choose(i, record, detail::function_reloc_acceptable(entry));
+      });
+    }
+  }
   for (size_t i = 0; i < count; ++i) {
-    auto selected = detail::select_function_reloc(scan.value(), reqs[i].target);
+    auto selected =
+        matches ? matches->result(i) : detail::select_function_reloc(scan.value(), reqs[i].target);
     if (!selected) return selected.error();
     const auto& record = scan.value().records[selected.value()].entry;
     const uintptr_t address = record.base.import.slot_address;

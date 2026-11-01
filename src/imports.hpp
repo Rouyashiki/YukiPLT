@@ -40,6 +40,7 @@ Result<VersionedImportSnapshot> resolve_versions(const InspectedImage& image,
                                                  size_t skipped_relocations,
                                                  ScanBudget* budget = nullptr);
 Error validate_selector(const ImportSelector& selector) noexcept;
+bool import_matches(const VersionedImport&, const ImportSelector&) noexcept;
 Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
                              const ImportSelector& selector);
 
@@ -66,6 +67,7 @@ Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, uint32_t s
                                                     ScanBudget* budget = nullptr,
                                                     const char* expected_path = nullptr);
 bool function_reloc_acceptable(const FunctionReloc&) noexcept;
+bool function_reloc_matches(const FunctionReloc&, const FunctionImportSelector&) noexcept;
 
 // `sources` is a non-zero subset of RelocationSourceBit.  Validates RELA/APS2
 // metadata lazily (inspect() never fails on it).

@@ -13,7 +13,7 @@ cmake --build build-android
 cmake --install build-android --prefix package --component production
 ```
 
-The package contains `lib/libyukiplt.so`, `include/yukiplt.h` (C) and
+This local CMake install contains `lib/libyukiplt.so`, `include/yukiplt.h` (C) and
 `include/yukiplt.hpp` (C++), the license and these
 integration guides. For the `c++_shared` configuration, deploy the matching NDK's
 `libc++_shared.so` too, including for C callers. Android does not supply that
@@ -29,8 +29,8 @@ compare optimization settings for your workload. `YUKIPLT_LTO=ON` requires
 Clang and CMake 3.24 or newer; configuration checks an archive-to-host Full LTO
 link and fails if the selected toolchain cannot complete it. These options
 affect YukiPLT's Release target, leaving other targets and build types unchanged.
-Static Full LTO packages propagate the required final-link option through their
-exported CMake target. Use the matching Clang/LLVM toolchain when consuming a
+CMake-installed static Full LTO packages propagate the required final-link option
+through their exported CMake target. Use the matching Clang/LLVM toolchain when consuming a
 bitcode archive. Set `YUKIPLT_LTO=OFF` to disable LTO; this also permits
 CMake 3.22 or newer. Existing build directories retain their cached setting;
 pass `-DYUKIPLT_LTO=ON` to enable it there. Measure sanitizer builds separately
@@ -38,13 +38,19 @@ from production builds.
 
 The `Build and check` GitHub Actions workflow runs on pushes, pull requests and
 manual dispatch. It uses NDK r30 (`30.0.16248370`) and CMake 4.1.2 to build API 23
-Release packages for all four supported ABIs, with both libc++ configurations
-and Full LTO enabled. Download `yukiplt-<abi>-<stl>` from the run's artifacts.
-Each artifact contains separate `STATIC/` and `SHARED/` install trees with the
-`.a` and `.so`, headers, CMake package files and documentation, plus build
-information and SHA-256 checksums. The static archive contains LLVM bitcode;
-consume it with the matching NDK toolchain. For `c++_shared`, supply that NDK's
-matching `libc++_shared.so` as described above.
+Release packages for all four supported ABIs, with Full LTO enabled. Each job
+builds one library type, and each artifact contains only that binary at its root:
+
+- `yukiplt-<abi>-shared-libcxx-static`: `libyukiplt.so` with static libc++.
+- `yukiplt-<abi>-shared-libcxx-shared`: `libyukiplt.so` with shared libc++.
+- `yukiplt-<abi>-static`: `libyukiplt.a`; the final host link selects libc++.
+
+CI disables debug information for all three variants and strips shared
+libraries before packaging, checking that their dynamic exports are preserved.
+The static archive contains LLVM bitcode and retains the symbols required for
+linking; consume it with the matching NDK toolchain and `-flto=full` at final link.
+Use headers from the same source revision. For the shared-libcxx-shared variant,
+supply that NDK's matching `libc++_shared.so` as described above.
 
 CI checks all tracked C/C++ sources and headers with the NDK's clang-format.
 It also runs the NDK's clang-tidy on `src/` using each ABI/STL shared build's

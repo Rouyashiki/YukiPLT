@@ -45,7 +45,7 @@ jobs:
             xargs -0 -r clang-format --dry-run --Werror
 
   android:
-    name: Android / ${{ matrix.abi }} / ${{ matrix.stl }}
+    name: Android / ${{ matrix.abi }} / ${{ matrix.variant.name }}
     needs: format
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -53,10 +53,14 @@ jobs:
       fail-fast: false
       matrix:
         abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
-        stl: [c++_static, c++_shared]
+        variant:
+          - {name: shared-libcxx-static, type: SHARED, stl: c++_static}
+          - {name: shared-libcxx-shared, type: SHARED, stl: c++_shared}
+          - {name: static, type: STATIC, stl: c++_static}
     env:
       ABI: ${{ matrix.abi }}
-      STL: ${{ matrix.stl }}
+      STL: ${{ matrix.variant.stl }}
+      LIBRARY_TYPE: ${{ matrix.variant.type }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -70,48 +74,54 @@ jobs:
           echo "$ANDROID_HOME/cmake/$CMAKE_VERSION/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/ndk/$NDK_VERSION/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
-      - name: Build and install static and shared libraries
+      - name: Build selected library
         run: |
-          for type in STATIC SHARED; do
-            cmake -S . -B "build-$type" -G Ninja \
-              -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
-              -DANDROID_ABI="$ABI" \
-              -DANDROID_PLATFORM=android-23 \
-              -DANDROID_STL="$STL" \
-              -DCMAKE_BUILD_TYPE=Release \
-              -DYUKIPLT_LIBRARY_TYPE="$type" \
-              -DYUKIPLT_LTO=ON \
-              -DYUKIPLT_RELEASE_OPTIMIZATION=Oz
-            cmake --build "build-$type" --parallel 2
-            cmake --install "build-$type" --prefix "$PWD/package/$type" --component production
-          done
-          test -s package/STATIC/lib/libyukiplt.a
-          test -s package/SHARED/lib/libyukiplt.so
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="$ABI" \
+            -DANDROID_PLATFORM=android-23 \
+            -DANDROID_STL="$STL" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS_RELEASE="-Oz -DNDEBUG -g0" \
+            -DYUKIPLT_LIBRARY_TYPE="$LIBRARY_TYPE" \
+            -DYUKIPLT_LTO=ON \
+            -DYUKIPLT_RELEASE_OPTIMIZATION=Oz
+          cmake --build build --parallel 2
 
       - name: Run clang-tidy
+        if: matrix.variant.type == 'SHARED'
         run: |
           clang-tidy --version
           git ls-files -z -- 'src/*.cpp' |
-            xargs -0 -r -n 1 -P 2 clang-tidy -p build-SHARED
+            xargs -0 -r -n 1 -P 2 clang-tidy -p build
 
-      - name: Record build information and checksums
+      - name: Package selected library
+        id: artifact
         run: |
-          {
-            printf 'commit=%s\nabi=%s\nstl=%s\napi=23\nlto=full\noptimization=Oz\n' \
-              "$GITHUB_SHA" "$ABI" "$STL"
-            cat "$NDK_ROOT/source.properties"
-            clang++ --version
-            cmake --version
-          } > package/build-info.txt
-          cd package
-          find . -type f ! -name SHA256SUMS -print0 |
-            sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/yukiplt-SHA256SUMS"
-          mv "$RUNNER_TEMP/yukiplt-SHA256SUMS" SHA256SUMS
+          mkdir -p package
+          if [ "$LIBRARY_TYPE" = SHARED ]; then
+            library=libyukiplt.so
+            cp "build/src/$library" "package/$library"
+            llvm-nm --dynamic --defined-only "package/$library" > "$RUNNER_TEMP/exports-before.txt"
+            llvm-strip --strip-unneeded "package/$library"
+            llvm-nm --dynamic --defined-only "package/$library" > "$RUNNER_TEMP/exports-after.txt"
+            cmp "$RUNNER_TEMP/exports-before.txt" "$RUNNER_TEMP/exports-after.txt"
+            llvm-readelf --sections "package/$library" > "$RUNNER_TEMP/sections.txt"
+            if grep -Eq '\.(debug_|zdebug_|symtab[[:space:]])' "$RUNNER_TEMP/sections.txt"; then
+              echo 'Packaged shared library still contains debug information or a static symbol table' >&2
+              exit 1
+            fi
+          else
+            library=libyukiplt.a
+            cp "build/src/$library" "package/$library"
+          fi
+          test -s "package/$library"
+          echo "path=package/$library" >> "$GITHUB_OUTPUT"
 
-      - name: Upload libraries and development files
+      - name: Upload library package
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: yukiplt-${{ matrix.abi }}-${{ matrix.stl }}
-          path: package/
+          name: yukiplt-${{ matrix.abi }}-${{ matrix.variant.name }}
+          path: ${{ steps.artifact.outputs.path }}
           if-no-files-found: error
           retention-days: 14

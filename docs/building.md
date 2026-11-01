@@ -36,6 +36,23 @@ CMake 3.22 or newer. Existing build directories retain their cached setting;
 pass `-DYUKIPLT_LTO=ON` to enable it there. Measure sanitizer builds separately
 from production builds.
 
+The `Build and check` GitHub Actions workflow runs on pushes, pull requests and
+manual dispatch. It uses NDK r30 (`30.0.16248370`) and CMake 4.1.2 to build API 23
+Release packages for all four supported ABIs, with both libc++ configurations
+and Full LTO enabled. Download `yukiplt-<abi>-<stl>` from the run's artifacts.
+Each artifact contains separate `STATIC/` and `SHARED/` install trees with the
+`.a` and `.so`, headers, CMake package files and documentation, plus build
+information and SHA-256 checksums. The static archive contains LLVM bitcode;
+consume it with the matching NDK toolchain. For `c++_shared`, supply that NDK's
+matching `libc++_shared.so` as described above.
+
+CI checks all tracked C/C++ sources and headers with the NDK's clang-format.
+It also runs the NDK's clang-tidy on `src/` using each ABI/STL shared build's
+compilation database and the repository's `.clang-tidy` policy. Formatting
+violations and clang-tidy errors fail the workflow; tidy warnings remain
+warnings. These jobs build and analyze Android code; they do not run it on an
+Android device.
+
 Shared artifacts use hidden visibility, an explicit export map, 16K LOAD
 alignment and NODELETE. Internal calls bind to the same copy of the library.
 Keep the owning loader group alive; NODELETE is not a substitute for the

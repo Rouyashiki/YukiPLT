@@ -84,9 +84,11 @@ bool admitted(unsigned thread) noexcept {
   return false;
 }
 Error process_check() noexcept {
-  unsigned empty = 0;
   const unsigned pid = current_pid();
-  owner.compare_exchange_strong(empty, pid);
+  if (owner.load() == 0) {
+    unsigned empty = 0;
+    owner.compare_exchange_strong(empty, pid);
+  }
   if (owner.load() != pid || phase.load() == YUKIPLT_C_FORK_REJECTED)
     return Error::Make(ErrorCode::kForkChildUnavailable);
   if (manual.load()) return Error::Make(ErrorCode::kInvalidArgument);
@@ -256,6 +258,7 @@ OperationGuard::OperationGuard() noexcept {
 }
 OperationGuard::~OperationGuard() {
   if (!owns_ || owner.load() != current_pid()) return;
+  bool notify = false;
   {
     ListLock lock;
     auto** link = &operations;
@@ -265,9 +268,11 @@ OperationGuard::~OperationGuard() {
     if (tokens_enabled.load()) (void)pthread_setspecific(token_key, nullptr);
 #endif
     *link = next;
-    active.fetch_sub(1, std::memory_order_release);
+    const unsigned previous = active.fetch_sub(1, std::memory_order_release);
+    // prepare either observes zero after taking this lock or receives the final wake.
+    notify = previous == 1 && phase.load() == YUKIPLT_C_FORK_DRAINING;
   }
-  wake();
+  if (notify) wake();
 }
 Error process_entry() noexcept {
   if (auto e = process_check()) return e;

@@ -75,44 +75,81 @@ bool valid_maps_suffix(const char* cursor, const char* end) noexcept {
   return parse_number(cursor, end, 16, ' ') && parse_number(cursor, end, 16, ':') &&
          parse_number(cursor, end, 16, ' ') && parse_number(cursor, end, 10, '\0');
 }
-Error parse_snapshot(const char* text, size_t length, detail::MapsCacheState& result) {
-  if (!text) return Error::Make(ErrorCode::kNullPointer);
-  if (!length) return Error::Make(ErrorCode::kVmaUnavailable);
-  if (length > kMapsBytes) return Error::Make(ErrorCode::kOutOfBounds);
-  result.page_size = detail::page_size();
-  if (!result.page_size) return Error::Make(ErrorCode::kUnsupportedFormat);
-  uintptr_t previous = 0;
-  size_t begin = 0;
-  while (begin < length) {
-    size_t end = begin;
-    while (end < length && text[end] != '\n') {
-      if (text[end] == '\0') return Error::Make(ErrorCode::kVmaUnavailable);
-      ++end;
+class SnapshotParser {
+ public:
+  explicit SnapshotParser(detail::MapsCacheState& result) : result_(result) {}
+
+  Error feed(const char* text, size_t length) {
+    if (!text) return Error::Make(ErrorCode::kNullPointer);
+    if (length > kMapsBytes - bytes_) return Error::Make(ErrorCode::kOutOfBounds);
+    bytes_ += length;
+    while (length != 0) {
+      size_t size = 0;
+#if defined(__arm__)
+      // Short-line memchr calls are costly on ARM32 Bionic.
+      while (size < length && text[size] != '\n') {
+        if (text[size] == '\0') return Error::Make(ErrorCode::kVmaUnavailable);
+        ++size;
+      }
+#else
+      const auto* newline = static_cast<const char*>(std::memchr(text, '\n', length));
+      size = newline ? static_cast<size_t>(newline - text) : length;
+      if (std::memchr(text, '\0', size)) return Error::Make(ErrorCode::kVmaUnavailable);
+#endif
+      if (size == length) {
+        pending_.append(text, size);
+        return Error::Ok();
+      }
+      if (pending_.empty()) {
+        if (Error error = line(text, size)) return error;
+      } else {
+        pending_.append(text, size);
+        if (Error error = line(pending_.data(), pending_.size())) return error;
+        pending_.clear();
+      }
+      text += size + 1;
+      length -= size + 1;
+    }
+    return Error::Ok();
+  }
+
+  Error finish() {
+    if (!bytes_) return Error::Make(ErrorCode::kVmaUnavailable);
+    return pending_.empty() ? Error::Ok() : line(pending_.data(), pending_.size());
+  }
+
+ private:
+  Error line(const char* text, size_t length) {
+    if (!result_.page_size) {
+      result_.page_size = detail::page_size();
+      if (!result_.page_size) return Error::Make(ErrorCode::kUnsupportedFormat);
     }
     detail::VmaInfo vma;
-    size_t permission = begin;
-    while (permission < end && text[permission] != ' ') ++permission;
-    if (permission + 5 >= end || !valid_maps_suffix(text + permission + 5, text + end))
+    size_t permission = 0;
+    while (permission < length && text[permission] != ' ') ++permission;
+    if (permission + 5 >= length || !valid_maps_suffix(text + permission + 5, text + length))
       return Error::Make(ErrorCode::kVmaUnavailable);
-    if (!detail::parse_maps_line(text + begin, end - begin, vma) || vma.begin < previous ||
-        vma.begin % result.page_size || vma.end % result.page_size)
+    if (!detail::parse_maps_line(text, length, vma) || vma.begin < previous_ ||
+        ((vma.begin | vma.end) & (result_.page_size - 1)) != 0)
       return Error::Make(ErrorCode::kVmaUnavailable);
-    if (result.mappings.size() >= kMapsRecords ||
-        result.mappings.size() >= kMapsBytes / sizeof(detail::VmaInfo))
+    if (result_.mappings.size() >= kMapsRecords ||
+        result_.mappings.size() >= kMapsBytes / sizeof(detail::VmaInfo))
       return Error::Make(ErrorCode::kOutOfBounds);
-    result.mappings.push_back(vma);
-    previous = vma.end;
-    begin = end + (end < length ? 1 : 0);
+    result_.mappings.push_back(vma);
+    previous_ = vma.end;
+    return Error::Ok();
   }
-  return Error::Ok();
-}
+
+  detail::MapsCacheState& result_;
+  std::string pending_;
+  size_t bytes_ = 0;
+  uintptr_t previous_ = 0;
+};
 }  // namespace
-static Error replace_snapshot(std::shared_ptr<detail::MapsCacheState>& state_, const char* text,
-                              size_t length) {
+static Error replace_snapshot(std::shared_ptr<detail::MapsCacheState>& state_,
+                              std::shared_ptr<detail::MapsCacheState> next) {
   if (Error e = detail::process_entry()) return e;
   try {
-    auto next = std::make_shared<detail::MapsCacheState>();
-    if (Error e = parse_snapshot(text, length, *next)) return e;
     if (Error e = detail::Registry::instance().prepare_cache_update(state_.get(), *next)) return e;
     if (state_) {
       // Existing handles retain this stable state object. Swap only after validation.
@@ -141,7 +178,11 @@ Error MapsCache::import_text(const char* text, size_t length) {
   if (Error e = detail::process_entry()) return e;
   try {
     std::lock_guard<std::mutex> lock(detail::op_mutex());
-    return replace_snapshot(state_, text, length);
+    auto next = std::make_shared<detail::MapsCacheState>();
+    SnapshotParser parser(*next);
+    if (Error error = parser.feed(text, length)) return error;
+    if (Error error = parser.finish()) return error;
+    return replace_snapshot(state_, std::move(next));
   } catch (...) {
     return detail::current_exception_error();
   }
@@ -161,7 +202,8 @@ Error MapsCache::capture() {
       int fd;
       ~Close() { close(fd); }
     } close_fd{fd};
-    std::string text;
+    auto next = std::make_shared<detail::MapsCacheState>();
+    SnapshotParser parser(*next);
     char buffer[8192];
     for (;;) {
       ssize_t count = read(fd, buffer, sizeof(buffer));
@@ -170,11 +212,10 @@ Error MapsCache::capture() {
         return Error::Sys(ErrorCode::kVmaUnavailable, errno);
       }
       if (count == 0) break;
-      if (static_cast<size_t>(count) > kMapsBytes - text.size())
-        return Error::Make(ErrorCode::kOutOfBounds);
-      text.append(buffer, static_cast<size_t>(count));
+      if (Error error = parser.feed(buffer, static_cast<size_t>(count))) return error;
     }
-    return replace_snapshot(state_, text.data(), text.size());
+    if (Error error = parser.finish()) return error;
+    return replace_snapshot(state_, std::move(next));
   } catch (...) {
     return detail::current_exception_error();
   }

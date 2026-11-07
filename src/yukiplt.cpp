@@ -196,17 +196,12 @@ struct NameRequests {
   bool found[kMaxBatch]{};
   bool ambiguous[kMaxBatch]{};
 
-  static size_t hash(std::string_view name) noexcept {
-    size_t value = 2166136261u;
-    for (unsigned char c : name) value = (value ^ c) * 16777619u;
-    return value & 127;
-  }
   void prepare() noexcept {
     if (count <= 8) return;
     for (size_t i = 0; i < count; ++i) {
       const char* name = requests[i].symbol;
       if (!name || !*name) continue;
-      size_t bucket = hash(name);
+      size_t bucket = detail::SelectedRequests::hash(name);
       while (heads[bucket] && std::strcmp(requests[heads[bucket] - 1].symbol, name) != 0)
         bucket = (bucket + 1) & 127;
       next[i] = heads[bucket];
@@ -224,7 +219,7 @@ struct NameRequests {
         if (requests[i].symbol && *requests[i].symbol && entry.symbol == requests[i].symbol)
           match(i, entry);
     } else {
-      size_t bucket = hash(entry.symbol);
+      size_t bucket = detail::SelectedRequests::hash(entry.symbol);
       while (heads[bucket]) {
         if (entry.symbol == requests[heads[bucket] - 1].symbol) {
           for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1, entry);
@@ -263,58 +258,12 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
   return Error::Ok();
 }
 
-// Fixed request metadata is separate from decoded-record materialization.
-struct SelectedRequests {
-  const char* names[kMaxBatch]{};
-  size_t heads[128]{};
-  size_t next[kMaxBatch]{};
-  size_t selected[kMaxBatch]{};
-  ErrorCode errors[kMaxBatch]{};
-
-  template <typename Name>
-  void prepare(size_t count, Name name) noexcept {
-    for (size_t i = 0; i < count; ++i) {
-      names[i] = name(i);
-      selected[i] = ~size_t{0};
-      size_t bucket = NameRequests::hash(names[i]);
-      while (heads[bucket] && std::strcmp(names[heads[bucket] - 1], names[i]) != 0)
-        bucket = (bucket + 1) & 127;
-      next[i] = heads[bucket];
-      heads[bucket] = i + 1;
-    }
-  }
-  template <typename Match>
-  void visit(std::string_view name, Match match) {
-    size_t bucket = NameRequests::hash(name);
-    while (heads[bucket]) {
-      if (name == names[heads[bucket] - 1]) {
-        for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1);
-        return;
-      }
-      bucket = (bucket + 1) & 127;
-    }
-  }
-  void choose(size_t request, size_t record, bool acceptable = true) noexcept {
-    if (!acceptable || errors[request] == ErrorCode::kUnsupportedRelocation) {
-      errors[request] = ErrorCode::kUnsupportedRelocation;
-      return;
-    }
-    if (selected[request] != ~size_t{0}) errors[request] = ErrorCode::kAmbiguousSymbol;
-    selected[request] = record;
-  }
-  Result<size_t> result(size_t request) const {
-    if (errors[request] != ErrorCode::kSuccess) return Error::Make(errors[request]);
-    if (selected[request] == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
-    return selected[request];
-  }
-};
-
 Error plan_selected_requests(const InspectedImage& img, const SelectedHookRequest* reqs,
                              size_t count, detail::SmallVec<PlannedSlot, 4>& out,
                              detail::CauseContext* cause = nullptr) {
   auto snapshot = detail::snapshot_versioned_imports(img, cause);
   if (!snapshot) return snapshot.error();
-  std::optional<SelectedRequests> matches;
+  std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
     matches.emplace();
     matches->prepare(count, [&](size_t i) { return reqs[i].target.symbol; });
@@ -592,7 +541,7 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
   budget.cause = cause;
   auto scan = detail::scan_function_imports(img, sources, &budget);
   if (!scan) return scan.error();
-  std::optional<SelectedRequests> matches;
+  std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
     matches.emplace();
     matches->prepare(count, [&](size_t i) { return reqs[i].target.base.symbol; });

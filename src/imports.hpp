@@ -12,6 +12,57 @@
 
 namespace yukiplt::detail {
 
+// Fixed request metadata, separate from decoded-record materialization.
+struct SelectedRequests {
+  const char* names[64]{};
+  size_t heads[128]{};
+  size_t next[64]{};
+  size_t selected[64]{};
+  ErrorCode errors[64]{};
+
+  static size_t hash(std::string_view name) noexcept {
+    size_t value = 2166136261u;
+    for (unsigned char c : name) value = (value ^ c) * 16777619u;
+    return value & 127;
+  }
+  template <typename Name>
+  void prepare(size_t count, Name name) noexcept {
+    for (size_t i = 0; i < count; ++i) {
+      names[i] = name(i);
+      selected[i] = ~size_t{0};
+      size_t bucket = hash(names[i]);
+      while (heads[bucket] && std::strcmp(names[heads[bucket] - 1], names[i]) != 0)
+        bucket = (bucket + 1) & 127;
+      next[i] = heads[bucket];
+      heads[bucket] = i + 1;
+    }
+  }
+  template <typename Match>
+  void visit(std::string_view name, Match match) {
+    size_t bucket = hash(name);
+    while (heads[bucket]) {
+      if (name == names[heads[bucket] - 1]) {
+        for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1);
+        return;
+      }
+      bucket = (bucket + 1) & 127;
+    }
+  }
+  void choose(size_t request, size_t record, bool acceptable = true) noexcept {
+    if (!acceptable || errors[request] == ErrorCode::kUnsupportedRelocation) {
+      errors[request] = ErrorCode::kUnsupportedRelocation;
+      return;
+    }
+    if (selected[request] != ~size_t{0}) errors[request] = ErrorCode::kAmbiguousSymbol;
+    selected[request] = record;
+  }
+  Result<size_t> result(size_t request) const {
+    if (errors[request] != ErrorCode::kSuccess) return Error::Make(errors[request]);
+    if (selected[request] == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
+    return selected[request];
+  }
+};
+
 // Pure parsing over an inspected image whose metadata remains readable.
 // May allocate; the public API catches failures before leaving the loader callback.
 struct ImportView {

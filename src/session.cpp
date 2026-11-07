@@ -528,6 +528,8 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       size_t count = 0;
       bool loaded = false;
       detail::RawFunctionSnapshot snapshot;
+      std::unique_ptr<detail::SelectedRequests> matches;
+      size_t consumed = 0;
     };
     std::vector<Cached> cache;
     FunctionHookPlan plan;
@@ -546,7 +548,7 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       size_t group = 0;
       for (; group < cache.size(); ++group)
         if (same_image(cache[group].image, targets[i].image)) break;
-      if (group == cache.size()) cache.push_back({targets[i].image, 0, 0, false, {}});
+      if (group == cache.size()) cache.push_back({targets[i].image, 0, 0, false, {}, {}, 0});
       if (++cache[group].count > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
       cache[group].sources |= request.target.sources;
     }
@@ -561,9 +563,27 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
         auto snapshot = detail::inspect_function_relocs(cached.image, cached.sources);
         if (!snapshot) return snapshot.error();
         cached.snapshot = std::move(snapshot.value());
+        if (cached.count > 8) {
+          size_t indices[kGroupLimit]{};
+          size_t n = 0;
+          for (size_t j = i; j < count; ++j)
+            if (same_image(cached.image, targets[j].image)) indices[n++] = j;
+          cached.matches = std::make_unique<detail::SelectedRequests>();
+          cached.matches->prepare(
+              n, [&](size_t j) { return targets[indices[j]].request.target.base.symbol; });
+          for (size_t record = 0; record < cached.snapshot.records.size(); ++record) {
+            const auto& entry = cached.snapshot.records[record];
+            cached.matches->visit(entry.entry.base.import.symbol, [&](size_t j) {
+              if (detail::function_reloc_matches(entry, targets[indices[j]].request.target))
+                cached.matches->choose(j, record, detail::function_reloc_acceptable(entry));
+            });
+          }
+        }
         cached.loaded = true;
       }
-      auto selected = detail::select_function_reloc(cached.snapshot, request.target);
+      auto selected = cached.matches
+                          ? cached.matches->result(cached.consumed++)
+                          : detail::select_function_reloc(cached.snapshot, request.target);
       if (!selected) return selected.error();
       const auto& found = cached.snapshot.records[selected.value()].entry;
       for (const auto& prior : plan.targets_)

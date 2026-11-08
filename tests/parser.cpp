@@ -570,6 +570,25 @@ TEST_F(FuncInstallFixture, IndexedSelectorsPreserveCollisionsChainsAndErrorOrder
       ASSERT_TRUE(legacy.ok());
       for (size_t i = 0; i < count; ++i) EXPECT_EQ(reports[i].address, image.got_slot_addr(i));
       ASSERT_FALSE(unhook(legacy.handle));
+      std::vector<HookTarget> plan_targets;
+      for (const auto& request : selected)
+        plan_targets.push_back({view(), request.target, request.replacement, nullptr});
+      auto plan = build_hook_plan(plan_targets.data(), plan_targets.size());
+      ASSERT_TRUE(plan);
+      for (size_t i = 0; i < count; ++i)
+        EXPECT_EQ(plan.value().targets()[i].selected.import.slot_address, image.got_slot_addr(i));
+      plan_targets[0].import.relocation_index = ~size_t{0};
+      plan_targets.back().import.symbol = nullptr;
+      size_t failed = ~size_t{0};
+      auto rejected_plan = build_hook_plan(plan_targets.data(), plan_targets.size(), &failed);
+      ASSERT_FALSE(rejected_plan);
+      EXPECT_EQ(rejected_plan.error().code, ErrorCode::kAmbiguousSymbol);
+      EXPECT_EQ(failed, 0u);
+      plan_targets[0].import.relocation_index = 0;
+      rejected_plan = build_hook_plan(plan_targets.data(), plan_targets.size(), &failed);
+      ASSERT_FALSE(rejected_plan);
+      EXPECT_EQ(rejected_plan.error().code, ErrorCode::kNullPointer);
+      EXPECT_EQ(failed, count - 1);
       auto explicit_functions =
           hook_function_imports(view(), functions.data(), count, reports.data());
       ASSERT_TRUE(explicit_functions.ok());

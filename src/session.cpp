@@ -266,6 +266,8 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
     struct CachedSnapshot {
       ImageView image;
       VersionedImportSnapshot snapshot;
+      std::unique_ptr<detail::SelectedRequests> matches;
+      size_t consumed = 0;
     };
     std::vector<CachedSnapshot> snapshots;
     for (size_t i = 0; i < count; ++i) {
@@ -296,10 +298,37 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
       if (cached == snapshots.size()) {
         auto snapshot = inspect_versioned_imports(target.image);
         if (!snapshot) return snapshot.error();
-        snapshots.push_back({target.image, std::move(snapshot.value())});
+        snapshots.push_back({target.image, std::move(snapshot.value()), {}, 0});
+        size_t indices[kGroupLimit]{};
+        bool eligible[kGroupLimit]{};
+        size_t n = 0;
+        for (size_t j = i; j < count; ++j) {
+          if (!same_image(target.image, targets[j].image)) continue;
+          if (n == kGroupLimit) {
+            ++n;
+            break;
+          }
+          indices[n] = j;
+          eligible[n++] = !detail::validate_selector(targets[j].import);
+        }
+        if (n > 8 && n <= kGroupLimit) {
+          auto& entry = snapshots.back();
+          entry.matches = std::make_unique<detail::SelectedRequests>();
+          entry.matches->prepare(
+              n, [&](size_t j) { return eligible[j] ? targets[indices[j]].import.symbol : ""; });
+          for (size_t record = 0; record < entry.snapshot.imports.size(); ++record) {
+            const auto& imported = entry.snapshot.imports[record];
+            entry.matches->visit(imported.import.symbol, [&](size_t j) {
+              if (eligible[j] && detail::import_matches(imported, targets[indices[j]].import))
+                entry.matches->choose(j, record);
+            });
+          }
+        }
       }
-      const auto& snapshot = snapshots[cached].snapshot;
-      auto selected = detail::select_import(snapshot, target.import);
+      auto& entry = snapshots[cached];
+      const auto& snapshot = entry.snapshot;
+      auto selected = entry.matches ? entry.matches->result(entry.consumed++)
+                                    : detail::select_import(snapshot, target.import);
       if (!selected) return selected.error();
       const auto& found = snapshot.imports[selected.value()];
       for (const auto& previous : plan.targets_) {

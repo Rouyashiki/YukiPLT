@@ -329,7 +329,9 @@ TEST(ImportAllocation, PageIndexGrowthFailureDoesNotPublishClaim) {
       reg.drop(id);
       success = true;
     }
+    fail_after = 0;
     for (auto previous : existing) reg.drop(previous);
+    fail_after = -1;
     if (success) break;
   }
   EXPECT_TRUE(success);

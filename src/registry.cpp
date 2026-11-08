@@ -317,7 +317,13 @@ uint64_t Registry::claim(const ImageIdentity& image, const SlotRecord* slots, si
     // Keep the free list able to hold every record without a later allocation,
     // so freeing a record (finish_restore/release) never throws. Reserve before
     // adding the record, so either allocation can fail without losing it.
-    free_list_.reserve(records_.size() + 1);
+    const size_t needed = records_.size() + 1;
+    if (needed > free_list_.capacity()) {
+      const size_t limit = std::min(size_t{kIndexLimit}, SIZE_MAX / sizeof(uint32_t));
+      if (needed > limit) throw std::length_error("Registry capacity");
+      const size_t capacity = free_list_.capacity();
+      free_list_.reserve(capacity > limit / 2 ? limit : std::max(needed, capacity * 2));
+    }
     const auto index = static_cast<uint32_t>(records_.size());
     Record record;
     record.generation = generation_floor_;

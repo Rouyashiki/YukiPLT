@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <limits>
 #include <new>
+#include <set>
 #include <stdexcept>
+#include <tuple>
 
 #include "common.hpp"
 #include "imports.hpp"
@@ -28,6 +31,64 @@ bool same_image(const ImageView& a, const ImageView& b) noexcept {
   return a.load_bias == b.load_bias && a.phdr_table == b.phdr_table &&
          a.phdr_count == b.phdr_count && a.instance_token == b.instance_token;
 }
+
+// Only large operations build indexes; group numbers follow first appearance.
+class OperationImages {
+ public:
+  template <typename ImageAt>
+  OperationImages(size_t count, ImageAt image_at) {
+    if (count <= kGroupLimit) return;
+    struct Entry {
+      ImageView image;
+      size_t first;
+      size_t group = 0;
+    };
+    auto key = [](const ImageView& image) {
+      return std::make_tuple(image.load_bias, reinterpret_cast<uintptr_t>(image.phdr_table),
+                             image.phdr_count, image.instance_token);
+    };
+    std::vector<Entry> sorted;
+    sorted.reserve(count);
+    for (size_t i = 0; i < count; ++i) sorted.push_back({image_at(i), i});
+    std::sort(sorted.begin(), sorted.end(), [&](const Entry& a, const Entry& b) {
+      return key(a.image) == key(b.image) ? a.first < b.first : key(a.image) < key(b.image);
+    });
+    sorted.erase(
+        std::unique(sorted.begin(), sorted.end(),
+                    [](const Entry& a, const Entry& b) { return same_image(a.image, b.image); }),
+        sorted.end());
+    first_.reserve(sorted.size());
+    for (const auto& entry : sorted) first_.push_back(entry.first);
+    std::sort(first_.begin(), first_.end());
+    for (auto& entry : sorted)
+      entry.group = static_cast<size_t>(
+          std::lower_bound(first_.begin(), first_.end(), entry.first) - first_.begin());
+    groups_.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+      auto found = std::lower_bound(sorted.begin(), sorted.end(), image_at(i),
+                                    [&](const Entry& entry, const ImageView& image) {
+                                      return key(entry.image) < key(image);
+                                    });
+      groups_.push_back(found->group);
+    }
+    next_.resize(count, ~size_t{0});
+    seen_.resize(first_.size());
+    auto last = first_;
+    for (size_t i = 0; i < count; ++i) {
+      const size_t group = groups_[i];
+      if (i != first_[group]) next_[last[group]] = i;
+      last[group] = i;
+    }
+  }
+  bool enabled() const noexcept { return !groups_.empty(); }
+  size_t group(size_t index) const noexcept { return groups_[index]; }
+  size_t first(size_t index) const noexcept { return first_[groups_[index]]; }
+  size_t next(size_t index) const noexcept { return next_[index]; }
+  size_t visit(size_t index) noexcept { return ++seen_[groups_[index]]; }
+
+ private:
+  std::vector<size_t> groups_, first_, next_, seen_;
+};
 
 ImportSelector exact_selector(const VersionedImport& chosen) noexcept {
   ImportSelector result;
@@ -261,6 +322,8 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
   if (failed_target) *failed_target = ~size_t{0};
   if (targets == nullptr || count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   try {
+    OperationImages images(count, [&](size_t i) { return targets[i].image; });
+    std::set<uintptr_t> outputs, slots;
     HookPlan plan;
     plan.targets_.reserve(count);
     struct CachedSnapshot {
@@ -278,10 +341,17 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
           reinterpret_cast<uintptr_t>(target.out_original) % alignof(void*) != 0)
         return Error::Make(ErrorCode::kInvalidArgument);
       size_t group_size = 1;
-      for (size_t j = 0; j < i; ++j) {
-        if (target.out_original && target.out_original == targets[j].out_original)
+      if (images.enabled()) {
+        if (target.out_original &&
+            !outputs.insert(reinterpret_cast<uintptr_t>(target.out_original)).second)
           return Error::Make(ErrorCode::kInvalidArgument);
-        if (same_image(target.image, targets[j].image)) ++group_size;
+        group_size = images.visit(i);
+      } else {
+        for (size_t j = 0; j < i; ++j) {
+          if (target.out_original && target.out_original == targets[j].out_original)
+            return Error::Make(ErrorCode::kInvalidArgument);
+          if (same_image(target.image, targets[j].image)) ++group_size;
+        }
       }
       if (group_size > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
       if (count == 1) {
@@ -291,14 +361,17 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
             {target.image, std::move(found.value()), target.replacement, target.out_original});
         continue;
       }
-      size_t cached = 0;
-      for (; cached < snapshots.size(); ++cached)
-        if (same_image(snapshots[cached].image, target.image)) break;
+      size_t cached = images.enabled() ? images.group(i) : 0;
+      if (!images.enabled())
+        for (; cached < snapshots.size(); ++cached)
+          if (same_image(snapshots[cached].image, target.image)) break;
       if (cached == snapshots.size()) {
         ImportSelector selectors[kGroupLimit];
         size_t n = 0;
-        for (size_t j = i; j < count && n < kGroupLimit; ++j)
-          if (same_image(target.image, targets[j].image)) selectors[n++] = targets[j].import;
+        for (size_t j = i; j < count && n < kGroupLimit;
+             j = images.enabled() ? images.next(j) : j + 1)
+          if (images.enabled() || same_image(target.image, targets[j].image))
+            selectors[n++] = targets[j].import;
         auto selected = detail::inspect_selected_imports(target.image, selectors, n);
         if (!selected) return selected.error();
         snapshots.push_back({target.image, std::move(selected.value()), 0});
@@ -307,26 +380,34 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
       auto& selected = entry.selected[entry.consumed++];
       if (!selected) return selected.error();
       const auto& found = selected.value();
-      for (const auto& previous : plan.targets_) {
-        if (previous.selected.import.slot_address == found.import.slot_address)
+      if (images.enabled()) {
+        if (!slots.insert(found.import.slot_address).second)
           return Error::Make(ErrorCode::kInvalidArgument);
+      } else {
+        for (const auto& previous : plan.targets_)
+          if (previous.selected.import.slot_address == found.import.slot_address)
+            return Error::Make(ErrorCode::kInvalidArgument);
       }
       plan.targets_.push_back({target.image, found, target.replacement, target.out_original});
     }
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
       const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);
       if (!output) continue;
-      for (const auto& target : plan.targets_)
-        if (output == target.selected.import.slot_address) {
-          if (failed_target) *failed_target = i;
-          return Error::Make(ErrorCode::kInvalidArgument);
-        }
+      bool overlaps = images.enabled() && slots.find(output) != slots.end();
+      if (!images.enabled())
+        for (const auto& target : plan.targets_)
+          overlaps |= output == target.selected.import.slot_address;
+      if (overlaps) {
+        if (failed_target) *failed_target = i;
+        return Error::Make(ErrorCode::kInvalidArgument);
+      }
     }
     plan.paths_.reserve(plan.targets_.size());
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
-      size_t previous = 0;
-      while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
-        ++previous;
+      size_t previous = images.enabled() ? images.first(i) : 0;
+      if (!images.enabled())
+        while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
+          ++previous;
       if (previous < i) {
         plan.paths_.push_back(plan.paths_[previous]);
         continue;
@@ -352,11 +433,13 @@ Result<HookSession> prepare_session(const HookPlan& plan) {
   try {
     HookSession session;
     session.targets_.reserve(plan.targets().size());
+    OperationImages images(plan.targets().size(),
+                           [&](size_t i) { return plan.targets()[i].image; });
     for (const auto& target : plan.targets()) {
-      size_t group = 0;
-      for (; group < session.images_.size(); ++group) {
-        if (same_image(session.images_[group].image, target.image)) break;
-      }
+      size_t group = images.enabled() ? images.group(session.targets_.size()) : 0;
+      if (!images.enabled())
+        for (; group < session.images_.size(); ++group)
+          if (same_image(session.images_[group].image, target.image)) break;
       if (group == session.images_.size()) {
         SessionImageResult result;
         result.image = target.image;
@@ -536,6 +619,8 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       size_t consumed = 0;
     };
     std::vector<Cached> cache;
+    OperationImages images(count, [&](size_t i) { return targets[i].image; });
+    std::set<uintptr_t> outputs, slots;
     FunctionHookPlan plan;
     plan.targets_.reserve(count);
     // Validate requests before scanning each group's union of explicit sources.
@@ -546,12 +631,19 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       if (!request.replacement ||
           reinterpret_cast<uintptr_t>(request.out_original) % alignof(void*) != 0)
         return Error::Make(ErrorCode::kInvalidArgument);
-      for (size_t j = 0; j < i; ++j)
-        if (request.out_original && request.out_original == targets[j].request.out_original)
+      if (images.enabled()) {
+        if (request.out_original &&
+            !outputs.insert(reinterpret_cast<uintptr_t>(request.out_original)).second)
           return Error::Make(ErrorCode::kInvalidArgument);
-      size_t group = 0;
-      for (; group < cache.size(); ++group)
-        if (same_image(cache[group].image, targets[i].image)) break;
+      } else {
+        for (size_t j = 0; j < i; ++j)
+          if (request.out_original && request.out_original == targets[j].request.out_original)
+            return Error::Make(ErrorCode::kInvalidArgument);
+      }
+      size_t group = images.enabled() ? images.group(i) : 0;
+      if (!images.enabled())
+        for (; group < cache.size(); ++group)
+          if (same_image(cache[group].image, targets[i].image)) break;
       if (group == cache.size()) cache.push_back({targets[i].image, 0, 0, false, {}, 0});
       if (++cache[group].count > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
       cache[group].sources |= request.target.sources;
@@ -560,14 +652,15 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       if (failed_target) *failed_target = i;
       const auto& target = targets[i];
       const auto& request = target.request;
-      size_t group = 0;
-      while (!same_image(cache[group].image, target.image)) ++group;
+      size_t group = images.enabled() ? images.group(i) : 0;
+      if (!images.enabled())
+        while (!same_image(cache[group].image, target.image)) ++group;
       auto& cached = cache[group];
       if (!cached.loaded) {
         FunctionImportSelector selectors[kGroupLimit];
         size_t n = 0;
-        for (size_t j = i; j < count; ++j)
-          if (same_image(cached.image, targets[j].image))
+        for (size_t j = i; j < count; j = images.enabled() ? images.next(j) : j + 1)
+          if (images.enabled() || same_image(cached.image, targets[j].image))
             selectors[n++] = targets[j].request.target;
         auto selected =
             detail::inspect_selected_functions(cached.image, cached.sources, selectors, n);
@@ -578,26 +671,35 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       auto& selected = cached.selected[cached.consumed++];
       if (!selected) return selected.error();
       const auto& found = selected.value();
-      for (const auto& prior : plan.targets_)
-        if (prior.selected.base.import.slot_address == found.base.import.slot_address)
+      if (images.enabled()) {
+        if (!slots.insert(found.base.import.slot_address).second)
           return Error::Make(ErrorCode::kInvalidArgument);
+      } else {
+        for (const auto& prior : plan.targets_)
+          if (prior.selected.base.import.slot_address == found.base.import.slot_address)
+            return Error::Make(ErrorCode::kInvalidArgument);
+      }
       plan.targets_.push_back({target.image, found, request.replacement, request.out_original,
                                request.require_current, request.expected_current});
     }
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
       const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);
       if (!output) continue;
-      for (const auto& target : plan.targets_)
-        if (output == target.selected.base.import.slot_address) {
-          if (failed_target) *failed_target = i;
-          return Error::Make(ErrorCode::kInvalidArgument);
-        }
+      bool overlaps = images.enabled() && slots.find(output) != slots.end();
+      if (!images.enabled())
+        for (const auto& target : plan.targets_)
+          overlaps |= output == target.selected.base.import.slot_address;
+      if (overlaps) {
+        if (failed_target) *failed_target = i;
+        return Error::Make(ErrorCode::kInvalidArgument);
+      }
     }
     plan.paths_.reserve(plan.targets_.size());
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
-      size_t previous = 0;
-      while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
-        ++previous;
+      size_t previous = images.enabled() ? images.first(i) : 0;
+      if (!images.enabled())
+        while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
+          ++previous;
       if (previous < i) {
         plan.paths_.push_back(plan.paths_[previous]);
         continue;
@@ -622,11 +724,13 @@ Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan& pla
   try {
     FunctionHookSession session;
     session.targets_.reserve(plan.targets().size());
+    OperationImages images(plan.targets().size(),
+                           [&](size_t i) { return plan.targets()[i].image; });
     for (const auto& target : plan.targets()) {
-      size_t group = 0;
-      for (; group < session.images_.size(); ++group) {
-        if (same_image(session.images_[group].image, target.image)) break;
-      }
+      size_t group = images.enabled() ? images.group(session.targets_.size()) : 0;
+      if (!images.enabled())
+        for (; group < session.images_.size(); ++group)
+          if (same_image(session.images_[group].image, target.image)) break;
       if (group == session.images_.size()) {
         FunctionSessionImageResult result;
         result.image = target.image;

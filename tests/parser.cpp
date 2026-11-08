@@ -646,6 +646,69 @@ TEST_F(FuncInstallFixture, ZeroWeakJumpSlotRemainsSupported) {
 
 }  // namespace function_imports_checks
 
+TEST(Plans, LargeGroupsKeepIdentityOrderAndCrossImageRejections) {
+  using namespace yukiplt;
+  test::ElfBuilder builder;
+  std::vector<std::string> names;
+  for (size_t i = 0; i < 96; ++i) {
+    names.push_back("large_plan_" + std::to_string(i));
+    builder.add_symbol(names.back().c_str(), static_cast<uint32_t>(i + 1))
+        .set_symbol_undefined(static_cast<uint32_t>(i + 1))
+        .add_jump_slot(static_cast<uint32_t>(i + 1));
+  }
+  auto image = builder.build();
+  void* outputs[96]{};
+  std::vector<HookTarget> targets;
+  for (size_t i = 0; i < 96; ++i)
+    targets.push_back({{image.load_bias(), image.phdr_table(), image.phdr_count, 41 + i % 3},
+                       {names[i].c_str()},
+                       reinterpret_cast<void*>(uintptr_t{0x1234}),
+                       &outputs[i]});
+  auto check = [&](ErrorCode expected, size_t failure) {
+    std::vector<FunctionHookTarget> functions;
+    for (const auto& target : targets)
+      functions.push_back({target.image,
+                           {{target.import, kSourceJmprel, kTypeJumpSlot},
+                            target.replacement,
+                            target.out_original}});
+    size_t failed = ~size_t{0};
+    auto legacy = build_hook_plan(targets.data(), targets.size(), &failed);
+    EXPECT_EQ(legacy ? ErrorCode::kSuccess : legacy.error().code, expected);
+    EXPECT_EQ(failed, failure);
+    auto explicit_plan = build_function_hook_plan(functions.data(), functions.size(), &failed);
+    EXPECT_EQ(explicit_plan ? ErrorCode::kSuccess : explicit_plan.error().code, expected);
+    EXPECT_EQ(failed, failure);
+    if (legacy && explicit_plan) {
+      auto a = prepare_session(legacy.value());
+      auto b = prepare_function_session(explicit_plan.value());
+      ASSERT_TRUE(a);
+      ASSERT_TRUE(b);
+      ASSERT_EQ(a.value().images().size(), 3u);
+      ASSERT_EQ(b.value().images().size(), 3u);
+      for (size_t g = 0; g < 3; ++g) {
+        EXPECT_EQ(a.value().images()[g].image.instance_token, 41 + g);
+        EXPECT_EQ(b.value().images()[g].image.instance_token, 41 + g);
+        for (size_t j = 0; j < 32; ++j) {
+          EXPECT_EQ(a.value().images()[g].target_indices[j], g + 3 * j);
+          EXPECT_EQ(b.value().images()[g].target_indices[j], g + 3 * j);
+        }
+      }
+    }
+  };
+  check(ErrorCode::kSuccess, ~size_t{0});
+  targets.back().out_original = &outputs[0];
+  check(ErrorCode::kInvalidArgument, 95);
+  targets.back().out_original = &outputs[95];
+  targets.back().import = targets.front().import;
+  check(ErrorCode::kInvalidArgument, 95);
+  targets.back().import = {names.back().c_str()};
+  targets.front().out_original = reinterpret_cast<void**>(image.got_slot_addr(1));
+  check(ErrorCode::kInvalidArgument, 0);
+  targets.front().out_original = &outputs[0];
+  for (auto& target : targets) target.image.instance_token = 41;
+  check(ErrorCode::kInvalidArgument, 64);
+}
+
 namespace versions_checks {
 using namespace yukiplt;
 using namespace yukiplt::test;

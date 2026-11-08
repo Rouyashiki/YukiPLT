@@ -71,6 +71,54 @@ struct ImportView {
   size_t relocation_index;
   uintptr_t slot_address;
 };
+struct SymbolVersionView {
+  std::string_view name;
+  std::string_view dependency;
+  uint16_t index = 1;
+  bool table_present = false;
+  bool hidden = false;
+  VersionSource source = VersionSource::kNone;
+};
+struct VersionedImportView {
+  ImportView import;
+  SymbolVersionView version;
+};
+struct VersionedScanView {
+  std::vector<VersionedImportView> imports;
+  size_t skipped_relocations = 0;
+};
+struct FunctionImportView {
+  VersionedImportView base;
+  RelocationSource source = RelocationSource::kJmprel;
+  uint32_t relocation_type = 0;
+  uint8_t symbol_type = 0;
+};
+struct FunctionRelocView {
+  FunctionImportView entry;
+  int64_t addend = 0;
+  bool symbol_undefined = false;
+};
+struct FunctionScanView {
+  std::vector<FunctionRelocView> records;
+  size_t skipped_relocations = 0;
+};
+VersionedImport own_import(const VersionedImportView&);
+FunctionImport own_import(const FunctionImportView&);
+Result<VersionedScanView> scan_versioned_views(const InspectedImage&, CauseContext* = nullptr);
+Result<FunctionScanView> scan_function_views(const InspectedImage&, uint32_t,
+                                             ScanBudget* = nullptr);
+bool import_matches(const VersionedImportView&, const ImportSelector&) noexcept;
+Result<size_t> select_import(const VersionedScanView&, const ImportSelector&);
+bool function_reloc_acceptable(const FunctionRelocView&) noexcept;
+bool function_reloc_matches(const FunctionRelocView&, const FunctionImportSelector&) noexcept;
+Result<size_t> select_function_reloc(const FunctionScanView&, const FunctionImportSelector&);
+
+// Selection and owning copies finish before the inspection window closes.
+Result<std::vector<Result<VersionedImport>>> inspect_selected_imports(const ImageView&,
+                                                                      const ImportSelector*,
+                                                                      size_t);
+Result<std::vector<Result<FunctionImport>>> inspect_selected_functions(
+    const ImageView&, uint32_t, const FunctionImportSelector*, size_t);
 // Views expire when the caller's image stability window ends. The visitor
 // cannot stop validation of later records or the final duplicate-slot check.
 Error walk_imports(const InspectedImage&, void (*visit)(void*, const ImportView&), void*,

@@ -577,9 +577,16 @@ TEST_F(FuncInstallFixture, IndexedSelectorsPreserveCollisionsChainsAndErrorOrder
       ASSERT_TRUE(plan);
       for (size_t i = 0; i < count; ++i)
         EXPECT_EQ(plan.value().targets()[i].selected.import.slot_address, image.got_slot_addr(i));
+      const auto last_selector = plan_targets.back().import;
+      plan_targets.back().import = plan_targets.front().import;
+      size_t failed = ~size_t{0};
+      auto duplicate_plan = build_hook_plan(plan_targets.data(), plan_targets.size(), &failed);
+      ASSERT_FALSE(duplicate_plan);
+      EXPECT_EQ(duplicate_plan.error().code, ErrorCode::kInvalidArgument);
+      EXPECT_EQ(failed, count - 1);
+      plan_targets.back().import = last_selector;
       plan_targets[0].import.relocation_index = ~size_t{0};
       plan_targets.back().import.symbol = nullptr;
-      size_t failed = ~size_t{0};
       auto rejected_plan = build_hook_plan(plan_targets.data(), plan_targets.size(), &failed);
       ASSERT_FALSE(rejected_plan);
       EXPECT_EQ(rejected_plan.error().code, ErrorCode::kAmbiguousSymbol);
@@ -669,6 +676,19 @@ TEST(Versions, FunctionSnapshotOwnsVersionTextAfterImageChanges) {
   EXPECT_EQ(snapshot.value().imports[0].base.version.name, "VERSION_1");
   EXPECT_TRUE(snapshot.value().imports[0].base.version.hidden);
   EXPECT_EQ(snapshot.value().imports[1].base.version.name, "VERSION_2");
+  ImportSelector selector{"versioned", VersionMatch::kExact, "VERSION_1"};
+  auto selected = find_import(fixture.view(), selector);
+  auto function = find_function_import(fixture.view(), {selector, kSourceJmprel, kTypeJumpSlot});
+  ASSERT_TRUE(selected);
+  ASSERT_TRUE(function);
+  HookTarget targets[2]{
+      {fixture.view(), selector, reinterpret_cast<void*>(uintptr_t{0x1234}), nullptr},
+      {fixture.view(),
+       {"versioned", VersionMatch::kExact, "VERSION_2"},
+       reinterpret_cast<void*>(uintptr_t{0x1234}),
+       nullptr}};
+  auto plan = build_hook_plan(targets, 2);
+  ASSERT_TRUE(plan);
   std::memset(fixture.image.buffer.data(), 0, fixture.image.buffer.size());
   for (const auto& entry : snapshot.value().imports) {
     EXPECT_EQ(entry.base.import.symbol, "versioned");
@@ -677,6 +697,10 @@ TEST(Versions, FunctionSnapshotOwnsVersionTextAfterImageChanges) {
   }
   EXPECT_EQ(snapshot.value().imports[0].base.version.name, "VERSION_1");
   EXPECT_EQ(snapshot.value().imports[1].base.version.name, "VERSION_2");
+  EXPECT_EQ(selected.value().version.name, "VERSION_1");
+  EXPECT_EQ(function.value().base.version.dependency, "libversions.so");
+  EXPECT_EQ(plan.value().targets()[1].selected.version.name, "VERSION_2");
+  EXPECT_EQ(plan.value().targets()[0].selected.import.symbol, "versioned");
 }
 
 }  // namespace versions_checks
@@ -703,6 +727,12 @@ TEST(ScanLimits, SharedRecordAndMaterializationBudgetsHaveExactBoundaries) {
     auto result = scan_function_imports(parsed.value(), sources, &budget);
     EXPECT_EQ(bool(result), size == used);
     if (!result) EXPECT_EQ(result.error().code, ErrorCode::kOutOfBounds);
+    ScanBudget view_budget{2, size};
+    auto view = scan_function_views(parsed.value(), sources, &view_budget);
+    EXPECT_EQ(bool(view), bool(result));
+    if (!view) EXPECT_EQ(view.error().code, result.error().code);
+    EXPECT_EQ(view_budget.bytes, budget.bytes);
+    EXPECT_EQ(view_budget.relocations, budget.relocations);
   }
   ScanBudget across_images{3, ScanBudget{}.bytes};
   ASSERT_TRUE(scan_function_imports(parsed.value(), sources, &across_images));

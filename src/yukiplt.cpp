@@ -261,7 +261,7 @@ Error plan_requests(const InspectedImage& img, const HookRequest* reqs, size_t c
 Error plan_selected_requests(const InspectedImage& img, const SelectedHookRequest* reqs,
                              size_t count, detail::SmallVec<PlannedSlot, 4>& out,
                              detail::CauseContext* cause = nullptr) {
-  auto snapshot = detail::snapshot_versioned_imports(img, cause);
+  auto snapshot = detail::scan_versioned_views(img, cause);
   if (!snapshot) return snapshot.error();
   std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
@@ -539,7 +539,7 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
   }
   detail::ScanBudget budget;
   budget.cause = cause;
-  auto scan = detail::scan_function_imports(img, sources, &budget);
+  auto scan = detail::scan_function_views(img, sources, &budget);
   if (!scan) return scan.error();
   std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
@@ -1540,11 +1540,11 @@ Result<VersionedImport> find_import(const ImageView& image, const ImportSelector
   if (invalid) return invalid;
   return inspect_metadata<VersionedImport>(
       image, [&](const InspectedImage& inspected) -> Result<VersionedImport> {
-        auto snapshot = detail::snapshot_versioned_imports(inspected);
+        auto snapshot = detail::scan_versioned_views(inspected);
         if (!snapshot) return snapshot.error();
         auto selected = detail::select_import(snapshot.value(), selector);
         if (!selected) return selected.error();
-        return std::move(snapshot.value().imports[selected.value()]);
+        return detail::own_import(snapshot.value().imports[selected.value()]);
       });
 }
 
@@ -1574,11 +1574,11 @@ Result<FunctionImport> find_function_import(const ImageView& image,
   if (invalid) return invalid;
   return inspect_metadata<FunctionImport>(
       image, [&](const InspectedImage& inspected) -> Result<FunctionImport> {
-        auto scan = detail::scan_function_imports(inspected, selector.sources);
+        auto scan = detail::scan_function_views(inspected, selector.sources);
         if (!scan) return scan.error();
         auto selected = detail::select_function_reloc(scan.value(), selector);
         if (!selected) return selected.error();
-        return std::move(scan.value().records[selected.value()].entry);
+        return detail::own_import(scan.value().records[selected.value()].entry);
       });
 }
 
@@ -1621,11 +1621,11 @@ Result<VersionedImport> find_import_named(const NamedImage& image, const ImportS
   return inspect_metadata<VersionedImport>(
       image.image,
       [&](const InspectedImage& inspected) -> Result<VersionedImport> {
-        auto snapshot = detail::snapshot_versioned_imports(inspected);
+        auto snapshot = detail::scan_versioned_views(inspected);
         if (!snapshot) return snapshot.error();
         auto selected = detail::select_import(snapshot.value(), selector);
         if (!selected) return selected.error();
-        return std::move(snapshot.value().imports[selected.value()]);
+        return detail::own_import(snapshot.value().imports[selected.value()]);
       },
       image.path.c_str());
 }
@@ -1659,11 +1659,11 @@ Result<FunctionImport> find_function_import_named(const NamedImage& image,
   return inspect_metadata<FunctionImport>(
       image.image,
       [&](const InspectedImage& inspected) -> Result<FunctionImport> {
-        auto scan = detail::scan_function_imports(inspected, selector.sources);
+        auto scan = detail::scan_function_views(inspected, selector.sources);
         if (!scan) return scan.error();
         auto selected = detail::select_function_reloc(scan.value(), selector);
         if (!selected) return selected.error();
-        return std::move(scan.value().records[selected.value()].entry);
+        return detail::own_import(scan.value().records[selected.value()].entry);
       },
       image.path.c_str());
 }
@@ -1813,6 +1813,108 @@ HookResult hook_function_imports_diagnosed_named(const NamedImage& image,
                              return hook_functions_impl(image.image, image.path.c_str(), reqs,
                                                         count, reports, recorded, cause);
                            });
+}
+
+namespace {
+template <typename Owned, typename Scan, typename Selector>
+std::vector<Result<Owned>> select_owned_requests(const Scan& scan, const Selector* selectors,
+                                                 size_t count) {
+  constexpr bool functions = std::is_same_v<Owned, FunctionImport>;
+  const auto& records = [&]() -> const auto& {
+    if constexpr (functions)
+      return scan.records;
+    else
+      return scan.imports;
+  }();
+  auto invalid = [&](size_t i) {
+    if constexpr (functions)
+      return detail::validate_function_selector(selectors[i]);
+    else
+      return detail::validate_selector(selectors[i]);
+  };
+  auto select = [&](size_t i) {
+    if constexpr (functions)
+      return detail::select_function_reloc(scan, selectors[i]);
+    else
+      return detail::select_import(scan, selectors[i]);
+  };
+  std::optional<detail::SelectedRequests> matches;
+  if (count > 8) {
+    matches.emplace();
+    matches->prepare(count, [&](size_t i) {
+      if (invalid(i)) return "";
+      if constexpr (functions)
+        return selectors[i].base.symbol;
+      else
+        return selectors[i].symbol;
+    });
+    for (size_t r = 0; r < records.size(); ++r) {
+      const auto& record = records[r];
+      auto name = [&] {
+        if constexpr (functions)
+          return record.entry.base.import.symbol;
+        else
+          return record.import.symbol;
+      }();
+      matches->visit(name, [&](size_t i) {
+        if (invalid(i)) return;
+        if constexpr (functions) {
+          if (detail::function_reloc_matches(record, selectors[i]))
+            matches->choose(i, r, detail::function_reloc_acceptable(record));
+        } else if (detail::import_matches(record, selectors[i]))
+          matches->choose(i, r);
+      });
+    }
+  }
+  std::vector<Result<Owned>> result;
+  result.reserve(count);
+  uintptr_t slots[64]{};
+  for (size_t i = 0; i < count; ++i) {
+    auto error = invalid(i);
+    auto selected = error ? Result<size_t>(error) : matches ? matches->result(i) : select(i);
+    if (!selected) {
+      result.emplace_back(selected.error());
+      break;
+    }
+    slots[i] = [&] {
+      if constexpr (functions)
+        return records[selected.value()].entry.base.import.slot_address;
+      else
+        return records[selected.value()].import.slot_address;
+    }();
+    bool duplicate = false;
+    for (size_t j = 0; j < i; ++j) duplicate |= slots[j] == slots[i];
+    if (duplicate) {
+      result.emplace_back(Error::Make(ErrorCode::kInvalidArgument));
+      break;
+    }
+    if constexpr (functions)
+      result.emplace_back(detail::own_import(records[selected.value()].entry));
+    else
+      result.emplace_back(detail::own_import(records[selected.value()]));
+  }
+  return result;
+}
+}  // namespace
+
+Result<std::vector<Result<VersionedImport>>> detail::inspect_selected_imports(
+    const ImageView& image, const ImportSelector* selectors, size_t count) {
+  return inspect_metadata<std::vector<Result<VersionedImport>>>(
+      image, [&](const InspectedImage& inspected) -> Result<std::vector<Result<VersionedImport>>> {
+        auto scan = detail::scan_versioned_views(inspected);
+        if (!scan) return scan.error();
+        return select_owned_requests<VersionedImport>(scan.value(), selectors, count);
+      });
+}
+Result<std::vector<Result<FunctionImport>>> detail::inspect_selected_functions(
+    const ImageView& image, uint32_t sources, const FunctionImportSelector* selectors,
+    size_t count) {
+  return inspect_metadata<std::vector<Result<FunctionImport>>>(
+      image, [&](const InspectedImage& inspected) -> Result<std::vector<Result<FunctionImport>>> {
+        auto scan = detail::scan_function_views(inspected, sources);
+        if (!scan) return scan.error();
+        return select_owned_requests<FunctionImport>(scan.value(), selectors, count);
+      });
 }
 
 Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageView& image,

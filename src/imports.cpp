@@ -218,14 +218,15 @@ Result<T> read_version(const InspectedImage& image, uintptr_t address, size_t in
   return value;
 }
 
-Result<std::string> string_at(const InspectedImage& image, uint32_t offset, ScanBudget& budget) {
+template <typename Text>
+Result<Text> string_at(const InspectedImage& image, uint32_t offset, ScanBudget& budget) {
   if (offset >= image.strsz || !readable(image, image.strtab, image.strsz))
     return Error::Make(ErrorCode::kCorruptedElf);
   const char* begin = reinterpret_cast<const char*>(image.strtab + offset);
   const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - offset));
   if (end == nullptr || end == begin) return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = budget.take_bytes(static_cast<size_t>(end - begin) + 1)) return e;
-  return std::string(begin, static_cast<size_t>(end - begin));
+  return Text(begin, static_cast<size_t>(end - begin));
 }
 
 Result<uintptr_t> advance(uintptr_t base, uint32_t offset, size_t minimum) {
@@ -257,12 +258,14 @@ Result<Tags> version_tags(const InspectedImage& image) {
   return Error::Make(ErrorCode::kCorruptedElf);
 }
 
-struct NamedVersion {
+template <typename Text>
+struct NamedVersionData {
   uint16_t index;
   VersionSource source;
-  std::string name;
-  std::string dependency;
+  Text name;
+  Text dependency;
 };
+using NamedVersion = NamedVersionData<std::string>;
 
 struct VersionScan {
   ScanBudget& budget;
@@ -302,15 +305,16 @@ Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionSca
 // Validate every linked entry, even versions that no selected import uses.
 // Forward, non-overlapping relative offsets and exact terminal links bound
 // traversal by both the declared counts and the readable mapping.
+template <typename Text>
 Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
-                 std::vector<NamedVersion>& out, VersionScan& scan) {
+                 std::vector<NamedVersionData<Text>>& out, VersionScan& scan) {
   for (uint64_t i = 0; i < count; ++i) {
     auto record = read_record<NativeElfVerneed>(image, address, scan);
     if (!record) return record.error();
     const auto& need = record.value();
     if (need.vn_version != 1 || need.vn_cnt == 0 || (i + 1 == count) != (need.vn_next == 0))
       return Error::Make(ErrorCode::kCorruptedElf);
-    auto file = string_at(image, need.vn_file, scan.budget);
+    auto file = string_at<Text>(image, need.vn_file, scan.budget);
     if (!file) return file.error();
     auto aux = advance(address, need.vn_aux, sizeof(NativeElfVerneed));
     if (!aux) return aux.error();
@@ -329,9 +333,9 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
         return Error::Make(ErrorCode::kCorruptedElf);
       if (Error e = scan.claim_index(index)) return e;
       if (Error e = scan.budget.take_bytes(file.value().size() + 1)) return e;
-      auto name = string_at(image, value.vna_name, scan.budget);
+      auto name = string_at<Text>(image, value.vna_name, scan.budget);
       if (!name) return name.error();
-      if (elf_hash_value(name.value().c_str()) != value.vna_hash)
+      if (elf_hash_value(name.value().data()) != value.vna_hash)
         return Error::Make(ErrorCode::kCorruptedElf);
       out.push_back({index, VersionSource::kNeeded, std::move(name.value()), file.value()});
       if (value.vna_next != 0) {
@@ -344,8 +348,9 @@ Error read_needs(const InspectedImage& image, uintptr_t address, uint64_t count,
   return Error::Ok();
 }
 
+template <typename Text>
 Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t count,
-                       std::vector<NamedVersion>& out, VersionScan& scan) {
+                       std::vector<NamedVersionData<Text>>& out, VersionScan& scan) {
   for (uint64_t i = 0; i < count; ++i) {
     auto record = read_record<NativeElfVerdef>(image, address, scan);
     if (!record) return record.error();
@@ -369,10 +374,10 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
       if (!item) return item.error();
       if ((j + 1 == definition.vd_cnt) != (item.value().vda_next == 0))
         return Error::Make(ErrorCode::kCorruptedElf);
-      auto name = string_at(image, item.value().vda_name, scan.budget);
+      auto name = string_at<Text>(image, item.value().vda_name, scan.budget);
       if (!name) return name.error();
       if (j == 0) {
-        if (elf_hash_value(name.value().c_str()) != definition.vd_hash)
+        if (elf_hash_value(name.value().data()) != definition.vd_hash)
           return Error::Make(ErrorCode::kCorruptedElf);
         out.push_back({index, VersionSource::kDefined, std::move(name.value()), {}});
       }
@@ -389,7 +394,7 @@ Error read_definitions(const InspectedImage& image, uintptr_t address, uint64_t 
 }  // namespace
 
 namespace {
-template <typename EntryAt, typename Prepare, typename Store>
+template <typename Version = SymbolVersion, typename EntryAt, typename Prepare, typename Store>
 Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt entry_at,
                             Prepare prepare, Store store, ScanBudget& budget) {
   auto tags = version_tags(image);
@@ -398,7 +403,8 @@ Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt e
   if (t.present[1] != t.present[2] || t.present[3] != t.present[4] ||
       (!t.present[0] && (t.present[1] || t.present[3])))
     return Error::Make(ErrorCode::kCorruptedElf);
-  std::vector<NamedVersion> versions;
+  using Named = NamedVersionData<decltype(Version::name)>;
+  std::vector<Named> versions;
   VersionScan scan{budget, {}, {}};
   for (size_t pair : {size_t{1}, size_t{3}}) {
     if (!t.present[pair]) continue;
@@ -412,7 +418,7 @@ Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt e
     if (error) return error;
   }
   std::sort(versions.begin(), versions.end(),
-            [](const NamedVersion& a, const NamedVersion& b) { return a.index < b.index; });
+            [](const Named& a, const Named& b) { return a.index < b.index; });
   uintptr_t versym = t.values[0];
   if (t.present[0] && !image.dptr_adjusted && !safe_add(image.load_bias, versym, versym))
     return Error::Make(ErrorCode::kIntegerOverflow);
@@ -435,7 +441,7 @@ Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt e
   prepare(count);
   for (size_t i = 0; i < count; ++i) {
     auto& entry = entry_at(i);
-    SymbolVersion version;
+    Version version;
     version.table_present = t.present[0];
     if (t.present[0]) {
       auto value = read_version<NativeElfHalf>(image, versym, entry.symbol_index);
@@ -446,7 +452,7 @@ Error resolve_versions_impl(const InspectedImage& image, size_t count, EntryAt e
       if (version.index >= 2) {
         auto found =
             std::lower_bound(versions.begin(), versions.end(), version.index,
-                             [](const NamedVersion& v, uint16_t index) { return v.index < index; });
+                             [](const Named& v, uint16_t index) { return v.index < index; });
         if (found == versions.end() || found->index != version.index)
           return Error::Make(ErrorCode::kCorruptedElf);
         auto symbol = read_version<NativeElfSym>(image, image.symtab, entry.symbol_index);
@@ -512,7 +518,8 @@ Error validate_selector(const ImportSelector& selector) noexcept {
   return Error::Ok();
 }
 
-bool import_matches(const VersionedImport& entry, const ImportSelector& selector) noexcept {
+template <typename Entry>
+bool import_matches_impl(const Entry& entry, const ImportSelector& selector) noexcept {
   return !(
       entry.import.symbol != selector.symbol ||
       (selector.relocation_index != ~size_t{0} &&
@@ -524,8 +531,8 @@ bool import_matches(const VersionedImport& entry, const ImportSelector& selector
       (selector.hidden == HiddenMatch::kNonHidden && entry.version.hidden));
 }
 
-Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
-                             const ImportSelector& selector) {
+template <typename Snapshot>
+Result<size_t> select_import_impl(const Snapshot& snapshot, const ImportSelector& selector) {
   auto invalid = validate_selector(selector);
   if (invalid) return invalid;
   size_t selected = ~size_t{0};
@@ -537,6 +544,49 @@ Result<size_t> select_import(const VersionedImportSnapshot& snapshot,
   }
   if (selected == ~size_t{0}) return Error::Make(ErrorCode::kSymbolNotFound);
   return selected;
+}
+
+bool import_matches(const VersionedImport& entry, const ImportSelector& selector) noexcept {
+  return import_matches_impl(entry, selector);
+}
+bool import_matches(const VersionedImportView& entry, const ImportSelector& selector) noexcept {
+  return import_matches_impl(entry, selector);
+}
+Result<size_t> select_import(const VersionedImportSnapshot& scan, const ImportSelector& selector) {
+  return select_import_impl(scan, selector);
+}
+Result<size_t> select_import(const VersionedScanView& scan, const ImportSelector& selector) {
+  return select_import_impl(scan, selector);
+}
+
+VersionedImport own_import(const VersionedImportView& entry) {
+  const auto& v = entry.version;
+  return {{std::string(entry.import.symbol), entry.import.symbol_index,
+           entry.import.relocation_index, entry.import.slot_address},
+          {std::string(v.name), std::string(v.dependency), v.index, v.table_present, v.hidden,
+           v.source}};
+}
+FunctionImport own_import(const FunctionImportView& entry) {
+  return {own_import(entry.base), entry.source, entry.relocation_type, entry.symbol_type};
+}
+
+Result<VersionedScanView> scan_versioned_views(const InspectedImage& image, CauseContext* cause) {
+  VersionedScanView result;
+  auto error = walk_imports(
+      image,
+      [](void* context, const ImportView& entry) {
+        static_cast<VersionedScanView*>(context)->imports.push_back({entry, {}});
+      },
+      &result, result.skipped_relocations);
+  if (error) return error;
+  ScanBudget budget;
+  budget.cause = cause;
+  error = resolve_versions_impl<SymbolVersionView>(
+      image, result.imports.size(),
+      [&](size_t i) -> ImportView& { return result.imports[i].import; }, [](size_t) {},
+      [&](size_t i, SymbolVersionView version) { result.imports[i].version = version; }, budget);
+  if (error) return error;
+  return result;
 }
 
 namespace {
@@ -815,9 +865,10 @@ Error validate_sources(uint32_t sources) noexcept {
 // Per-scan state shared by every source.  The dynsym bound and the string
 // table are validated on the first record that needs a symbol, so an image
 // with nothing to import never has its hash table or strings read.
+template <typename Snapshot>
 struct ScanState {
   const InspectedImage& image;
-  RawFunctionSnapshot& result;
+  Snapshot& result;
   ScanBudget& budget;
   /// Destination of every non-NONE record.  Duplicates are detected as each
   /// record is decoded (AGENTS: checked early, before later records or
@@ -827,7 +878,8 @@ struct ScanState {
   bool symbols_ready = false;
 };
 
-Error ensure_symbols(ScanState& state) {
+template <typename Snapshot>
+Error ensure_symbols(ScanState<Snapshot>& state) {
   if (state.symbols_ready) return Error::Ok();
   auto bound = dynamic_symbol_count(state.image);
   if (!bound) return bound.error();
@@ -841,7 +893,8 @@ Error ensure_symbols(ScanState& state) {
 // Read a record's symbol name (bounded by STRSZ), ELF symbol type and whether it
 // is undefined.  An empty name is recorded as-is, as the legacy snapshot does;
 // no selector can match it, because a selector's symbol must be non-empty.
-Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& name,
+template <typename Snapshot, typename Text>
+Error read_symbol(const ScanState<Snapshot>& state, uint32_t symbol_index, Text& name,
                   uint8_t& symbol_type, bool& undefined) {
   const InspectedImage& image = state.image;
   if (symbol_index == 0 || symbol_index >= state.symbol_bound)
@@ -859,7 +912,7 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
   const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - sym.st_name));
   if (end == nullptr) return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = state.budget.take_bytes(static_cast<size_t>(end - begin) + 1)) return e;
-  name.assign(begin, static_cast<size_t>(end - begin));
+  name = Text(begin, static_cast<size_t>(end - begin));
   symbol_type = static_cast<uint8_t>(ELF64_ST_TYPE(sym.st_info));
   undefined = sym.st_shndx == kShnUndef;
   return Error::Ok();
@@ -869,7 +922,8 @@ Error read_symbol(const ScanState& state, uint32_t symbol_index, std::string& na
 // symbol index are materialized, whichever table holds them (labelled with their
 // real source and type); every other record is only counted, so a large table
 // of RELATIVE or other relocations retains only its address for alias checking.
-Error keep(ScanState& state, const DecodedReloc& reloc) {
+template <typename Snapshot>
+Error keep(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
   // NONE has no destination. Every other record participates even when it is
   // not a supported function import or has symbol index zero.
   if (reloc.type != 0) {
@@ -882,7 +936,7 @@ Error keep(ScanState& state, const DecodedReloc& reloc) {
       uintptr_t color;
       uintptr_t key;
     };
-    if (Error e = state.budget.take_objects<SlotNodeCost>(1)) return e;
+    if (Error e = state.budget.template take_objects<SlotNodeCost>(1)) return e;
     state.slots.insert(reloc.slot_address);
   }
   if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
@@ -893,8 +947,8 @@ Error keep(ScanState& state, const DecodedReloc& reloc) {
       !state.image.addr_in_writable_load(reloc.slot_address, kNativeSlotSize))
     return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = ensure_symbols(state)) return e;
-  if (Error e = state.budget.take_objects<FunctionReloc>(1)) return e;
-  FunctionReloc record;
+  if (Error e = state.budget.template take_objects<FunctionReloc>(1)) return e;
+  typename decltype(state.result.records)::value_type record;
   if (Error e = read_symbol(state, reloc.symbol_index, record.entry.base.import.symbol,
                             record.entry.symbol_type, record.symbol_undefined))
     return e;
@@ -908,14 +962,16 @@ Error keep(ScanState& state, const DecodedReloc& reloc) {
   return Error::Ok();
 }
 
+template <typename Snapshot>
 Error visit_record(void* context, const DecodedReloc& reloc) {
-  return keep(*static_cast<ScanState*>(context), reloc);
+  return keep(*static_cast<ScanState<Snapshot>*>(context), reloc);
 }
 
 }  // namespace
 
-Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
-                                                  ScanBudget* shared_budget) {
+template <typename Snapshot, typename Version>
+Result<Snapshot> scan_functions_impl(const InspectedImage& image, uint32_t sources,
+                                     ScanBudget* shared_budget) {
   if (Error e = validate_sources(sources)) return e;
   // Scanning DT_RELA or DT_ANDROID_RELA refuses an image whose relocation tags
   // are unusable (a repeated tag, a pointer without its size, an overflowing
@@ -925,10 +981,10 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
       (sources & (kSourceNativeDynamic | kSourceNativeAndroidPacked)) != 0)
     return Error::Make(ErrorCode::kUnsupportedFormat);
 
-  RawFunctionSnapshot result;
+  Snapshot result;
   ScanBudget local_budget;
   ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
-  ScanState state{image, result, budget, {}};
+  ScanState<Snapshot> state{image, result, budget, {}};
 
   if ((sources & kSourceJmprel) != 0 && image.jmprel_count != 0) {
     if (Error e = budget.take_records(image.jmprel_count)) return e;
@@ -954,24 +1010,32 @@ Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, u
     }
   }
   if (sources & kSourceNativeDynamic) {
-    if (Error e = decode_dynamic_relocations(image, visit_record, &state, &budget)) return e;
+    if (Error e = decode_dynamic_relocations(image, visit_record<Snapshot>, &state, &budget))
+      return e;
   }
   if (sources & kSourceNativeAndroidPacked) {
-    if (Error e = decode_android_packed(image, visit_record, &state, &budget)) return e;
+    if (Error e = decode_android_packed(image, visit_record<Snapshot>, &state, &budget)) return e;
   }
   state.slots = {};
 
   // Preserve the logical budget and its order while attaching versions in place.
   if (Error e = budget.take_objects<ImportInfo>(result.records.size())) return e;
-  auto error = resolve_versions_impl(
+  auto error = resolve_versions_impl<Version>(
       image, result.records.size(),
-      [&](size_t i) -> ImportInfo& { return result.records[i].entry.base.import; }, [](size_t) {},
-      [&](size_t i, SymbolVersion version) {
-        result.records[i].entry.base.version = std::move(version);
-      },
+      [&](size_t i) -> auto& { return result.records[i].entry.base.import; }, [](size_t) {},
+      [&](size_t i, Version version) { result.records[i].entry.base.version = std::move(version); },
       budget);
   if (error) return error;
   return result;
+}
+
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
+                                                  ScanBudget* budget) {
+  return scan_functions_impl<RawFunctionSnapshot, SymbolVersion>(image, sources, budget);
+}
+Result<FunctionScanView> scan_function_views(const InspectedImage& image, uint32_t sources,
+                                             ScanBudget* budget) {
+  return scan_functions_impl<FunctionScanView, SymbolVersionView>(image, sources, budget);
 }
 
 Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& image,
@@ -1023,14 +1087,16 @@ uint32_t type_bit(uint32_t relocation_type) noexcept {
 }
 
 // Both explicit function relocation types require an undefined STT_FUNC.
-bool is_acceptable(const FunctionReloc& record) noexcept {
+template <typename Record>
+bool is_acceptable(const Record& record) noexcept {
   if (record.entry.relocation_type != kRelJumpSlot && record.entry.relocation_type != kRelGlobDat)
     return false;
   return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined;
 }
 
 // Does the base (name/version/hidden/index) selector match this record?
-bool base_matches(const FunctionReloc& record, const FunctionImportSelector& selector) {
+template <typename Record>
+bool base_matches(const Record& record, const FunctionImportSelector& selector) {
   const auto& entry = record.entry;
   const auto& sel = selector.base;
   if (entry.base.import.symbol != sel.symbol) return false;
@@ -1050,20 +1116,20 @@ bool base_matches(const FunctionReloc& record, const FunctionImportSelector& sel
 
 }  // namespace
 
-bool function_reloc_matches(const FunctionReloc& record,
-                            const FunctionImportSelector& selector) noexcept {
+template <typename Record>
+bool function_matches_impl(const Record& record, const FunctionImportSelector& selector) noexcept {
   return (source_bit(record.entry.source) & selector.sources) != 0 &&
          (type_bit(record.entry.relocation_type) & selector.types) != 0 &&
          base_matches(record, selector);
 }
 
-Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
-                                     const FunctionImportSelector& selector) {
+template <typename Snapshot>
+Result<size_t> select_function_impl(const Snapshot& scan, const FunctionImportSelector& selector) {
   if (Error e = validate_function_selector(selector)) return e;
   size_t selected = ~size_t{0};
   bool ambiguous = false;
   for (size_t i = 0; i < scan.records.size(); ++i) {
-    const FunctionReloc& record = scan.records[i];
+    const auto& record = scan.records[i];
     // Only records in the opted-in sources and types are candidates.
     if (!function_reloc_matches(record, selector)) continue;
     // A matched record that is not hookable fails the whole call: never skip it
@@ -1079,6 +1145,26 @@ Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
 
 bool function_reloc_acceptable(const FunctionReloc& record) noexcept {
   return is_acceptable(record);
+}
+
+bool function_reloc_matches(const FunctionReloc& record,
+                            const FunctionImportSelector& selector) noexcept {
+  return function_matches_impl(record, selector);
+}
+bool function_reloc_matches(const FunctionRelocView& record,
+                            const FunctionImportSelector& selector) noexcept {
+  return function_matches_impl(record, selector);
+}
+bool function_reloc_acceptable(const FunctionRelocView& record) noexcept {
+  return is_acceptable(record);
+}
+Result<size_t> select_function_reloc(const RawFunctionSnapshot& scan,
+                                     const FunctionImportSelector& selector) {
+  return select_function_impl(scan, selector);
+}
+Result<size_t> select_function_reloc(const FunctionScanView& scan,
+                                     const FunctionImportSelector& selector) {
+  return select_function_impl(scan, selector);
 }
 
 }  // namespace yukiplt::detail

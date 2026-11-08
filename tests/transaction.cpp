@@ -1,15 +1,95 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <fcntl.h>
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cerrno>
+#include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 
 #include "memory.hpp"
+
+namespace {
+thread_local int maps_source = -1, maps_descriptor = -1;
+thread_local size_t maps_chunk = 8192, maps_reads = 0, maps_error_after = ~size_t{0};
+thread_local bool maps_interrupt = false;
+}  // namespace
+extern "C" int __real_open(const char*, int, ...);
+extern "C" ssize_t __real_read(int, void*, size_t);
+extern "C" int __wrap_open(const char* path, int flags, ...) {
+  if (maps_source >= 0 && std::strcmp(path, "/proc/self/maps") == 0)
+    return maps_descriptor = dup(maps_source);
+  mode_t mode = 0;
+  if ((flags & O_CREAT) || (flags & O_TMPFILE) == O_TMPFILE) {
+    va_list args;
+    va_start(args, flags);
+    mode = va_arg(args, mode_t);
+    va_end(args);
+  }
+  return __real_open(path, flags, mode);
+}
+extern "C" ssize_t __wrap_read(int fd, void* data, size_t count) {
+  if (maps_source >= 0 && fd == maps_descriptor) {
+    if (maps_interrupt) {
+      maps_interrupt = false;
+      errno = EINTR;
+      return -1;
+    }
+    if (maps_reads++ == maps_error_after) {
+      errno = EIO;
+      return -1;
+    }
+    if (count > maps_chunk) count = maps_chunk;
+  }
+  return __real_read(fd, data, count);
+}
+
+TEST(MapsReader, ChunkBoundariesTruncationErrorsAndEarlyCompletion) {
+  using namespace yukiplt;
+  using namespace yukiplt::detail;
+  auto run = [](const std::string& text, size_t chunk, bool interrupt = false,
+                size_t error_after = ~size_t{0}) {
+    FILE* stream = std::tmpfile();
+    if (!stream) return Error::Sys(ErrorCode::kVmaUnavailable, errno);
+    const auto wrote = std::fwrite(text.data(), 1, text.size(), stream);
+    if (wrote != text.size()) {
+      std::fclose(stream);
+      return Error::Make(ErrorCode::kInvalidArgument);
+    }
+    std::rewind(stream);
+    maps_source = fileno(stream);
+    maps_descriptor = -1;
+    maps_chunk = chunk;
+    maps_interrupt = interrupt;
+    maps_reads = 0;
+    maps_error_after = error_after;
+    uintptr_t page = 0x3000;
+    VmaInfo vma{};
+    MapsCoverage coverage(&page, 1, 0x1000, &vma);
+    const auto error = read_maps_into(coverage);
+    maps_source = maps_descriptor = -1;
+    std::fclose(stream);
+    return error;
+  };
+  const std::string target = "3000-4000 r--p 00000000 00:00 0 ";
+  const std::string prefix = "1000-2000 rw-p 00000000 00:00 0 " + std::string(9000, 'x') + "\n";
+  for (size_t chunk : {size_t{3}, size_t{511}, size_t{8192}}) {
+    EXPECT_TRUE(run(prefix + target + "tail", chunk).ok());
+    EXPECT_TRUE(run(prefix + target + std::string(9000, 'y'), chunk, true).ok());
+    EXPECT_TRUE(run(target + "\ninvalid suffix\n", chunk).ok());
+    EXPECT_EQ(run("\n" + target, chunk).code, ErrorCode::kVmaUnavailable);
+    EXPECT_EQ(run(prefix, chunk).code, ErrorCode::kOutOfBounds);
+  }
+  const auto failed = run(prefix + target, 17, true, 1);
+  EXPECT_EQ(failed.code, ErrorCode::kVmaUnavailable);
+  EXPECT_EQ(failed.sys_errno, EIO);
+}
 
 namespace txn_checks {
 using namespace yukiplt;

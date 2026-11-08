@@ -186,14 +186,29 @@ int for_each_maps_line(F&& on_line) noexcept {
       if (line_len > 0) on_line(line, line_len);
       break;
     }
-    for (ssize_t k = 0; k < n && !stop; ++k) {
-      char c = buf[k];
-      if (c == '\n') {
-        stop = !on_line(line, line_len);
-        line_len = 0;
-      } else if (line_len < sizeof(line)) {
-        line[line_len++] = c;
+    const char* cursor = buf;
+    const char* end = buf + n;
+    while (cursor < end && !stop) {
+#if defined(__arm__)
+      const char* newline = cursor;
+      while (newline < end && *newline != '\n') ++newline;
+      if (newline == end) newline = nullptr;
+#else
+      const auto* newline = static_cast<const char*>(std::memchr(cursor, '\n', end - cursor));
+#endif
+      const size_t length = static_cast<size_t>((newline ? newline : end) - cursor);
+      if (line_len == 0 && newline) {
+        stop = !on_line(cursor, std::min(length, sizeof(line)));
+      } else {
+        const size_t copied = std::min(length, sizeof(line) - line_len);
+        std::memcpy(line + line_len, cursor, copied);
+        line_len += copied;
+        if (newline) {
+          stop = !on_line(line, line_len);
+          line_len = 0;
+        }
       }
+      cursor = newline ? newline + 1 : end;
     }
   }
 

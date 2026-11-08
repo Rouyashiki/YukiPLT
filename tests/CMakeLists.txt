@@ -63,3 +63,5 @@ target_link_options(yukiplt_regression_core INTERFACE
     -Wl,--wrap=dl_iterate_phdr
     -Wl,--wrap=_ZN7yukiplt6detail10active_opsEv
     -Wl,--wrap=_ZN7yukiplt6detail23active_image_enumeratorEv)
+
+target_link_options(yukiplt_regressions PRIVATE -Wl,--wrap=open -Wl,--wrap=read)

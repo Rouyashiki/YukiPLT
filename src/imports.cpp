@@ -927,7 +927,11 @@ Error keep(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
   // NONE has no destination. Every other record participates even when it is
   // not a supported function import or has symbol index zero.
   if (reloc.type != 0) {
-    if (state.slots.find(reloc.slot_address) != state.slots.end())
+    auto& slots = state.slots;
+    const auto position = slots.empty() || *slots.rbegin() < reloc.slot_address
+                              ? slots.end()
+                              : slots.lower_bound(reloc.slot_address);
+    if (position != slots.end() && *position == reloc.slot_address)
       return Error::Make(ErrorCode::kCorruptedElf);
     // Charge the set entry at its node size, not just the 8-byte key (R-10):
     // a red-black node carries parent/left/right links and a color.
@@ -937,7 +941,7 @@ Error keep(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
       uintptr_t key;
     };
     if (Error e = state.budget.template take_objects<SlotNodeCost>(1)) return e;
-    state.slots.insert(reloc.slot_address);
+    slots.emplace_hint(position, reloc.slot_address);
   }
   if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
     ++state.result.skipped_relocations;

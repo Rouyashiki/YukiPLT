@@ -2191,62 +2191,46 @@ static Error query_impl(const HookHandle& handle, SlotReport* out, size_t cap, s
   if (!handle.valid()) return Error::Make(ErrorCode::kInvalidArgument);
   const uint64_t id = detail_api::id(handle);
   try {
-    // Snapshot the recorded slots, then read live values.  A system image's
-    // slots are read only inside the linker callback, so a concurrent dlclose
-    // cannot unmap them mid-read; an image no longer loaded reports only the
-    // recorded values.
-    ImageIdentity image;
-    std::string system_path;
-    SlotRecord recs[kMaxBatch];
-    size_t n = 0;
-    {
-      std::lock_guard<std::mutex> lock(detail::op_mutex());
-      if (cache) {
-        if (Error e = Registry::instance().check_cache(id, state.get())) return e;
-      }
-      Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
-      if (snap) return snap;
-      // Count-only and recorded recovery queries do not need a path copy or
-      // a linker lookup. A live query owns its path across the lock handoff.
-      if (out != nullptr && cap != 0 && image.instance_token == 0 && !image.invalidated) {
-        Error path = Registry::instance().snapshot_path(id, system_path);
-        if (path) return path;
-      }
+    std::unique_lock<std::mutex> lock(detail::op_mutex());
+    auto& registry = Registry::instance();
+    if (cache) {
+      if (Error e = registry.check_cache(id, state.get())) return e;
     }
-    if (n > kMaxBatch) n = kMaxBatch;
+    ImageIdentity image;
+    size_t n = 0;
+    const size_t needed = out ? std::min(cap, kMaxBatch) : 0;
+    if (needed == 0) {
+      if (Error e = registry.snapshot(id, image, nullptr, 0, &n)) return e;
+      if (count) *count = std::min(n, kMaxBatch);
+      return Error::Ok();
+    }
 
-    if (out == nullptr || cap == 0) {
-      // Count-only: no live read, so no image access or transaction pages.
-    } else if (image.instance_token == 0 && !image.invalidated) {
+    SlotRecord recs[kMaxBatch];
+    if (Error e = registry.snapshot(id, image, recs, needed, &n)) return e;
+    if (image.instance_token == 0 && !image.invalidated) {
+      std::string system_path;
+      if (Error e = registry.snapshot_path(id, system_path)) return e;
+      lock.unlock();
       Error result = Error::Ok();
       bool matched = run_on_system_image(
           image,
           [&](const ImageView&) {
-            // Re-snapshot under the op lock: the group may have changed or been
-            // released between the two lock acquisitions.
+            // Recheck ownership after the linker -> op lock handoff.
             if (cache) {
-              result = Registry::instance().check_cache(id, state.get());
+              result = registry.check_cache(id, state.get());
               if (result) return;
             }
-            result = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
+            result = registry.snapshot(id, image, recs, needed, &n);
             if (result) return;
-            if (n > kMaxBatch) n = kMaxBatch;
-            result = fill_query(recs, n, /*live_image=*/true, out, cap, state.get());
+            result = fill_query(recs, n, /*live_image=*/true, out, needed, state.get());
           },
           system_path.c_str());
-      if (!matched) (void)fill_query(recs, n, /*live_image=*/false, out, cap, state.get());
+      if (!matched) (void)fill_query(recs, n, /*live_image=*/false, out, needed, state.get());
       if (result) return result;
     } else {
-      std::lock_guard<std::mutex> lock(detail::op_mutex());
-      if (cache) {
-        if (Error e = Registry::instance().check_cache(id, state.get())) return e;
-      }
-      Error snap = Registry::instance().snapshot(id, image, recs, kMaxBatch, &n);
-      if (snap) return snap;
-      if (n > kMaxBatch) n = kMaxBatch;
-      if (Error e = fill_query(recs, n, !image.invalidated, out, cap, state.get())) return e;
+      if (Error e = fill_query(recs, n, !image.invalidated, out, needed, state.get())) return e;
     }
-    if (count != nullptr) *count = n;
+    if (count) *count = std::min(n, kMaxBatch);
     return Error::Ok();
   } catch (...) {
     return detail::current_exception_error();

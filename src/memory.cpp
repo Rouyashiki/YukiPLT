@@ -398,7 +398,7 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
     if (page_of(extra_pages[i]) != extra_pages[i]) return Error::Make(ErrorCode::kInvalidArgument);
     bases.push_back(extra_pages[i]);
   }
-  std::sort(bases.begin(), bases.end());
+  if (extra_count != 0) std::sort(bases.begin(), bases.end());
   size_t unique = 0;
   for (size_t i = 0; i < bases.size(); ++i) {
     if (i == 0 || bases[i] != bases[i - 1]) bases[unique++] = bases[i];

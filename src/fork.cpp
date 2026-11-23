@@ -30,6 +30,7 @@ std::atomic<unsigned> token_readers{0};
 pthread_key_t token_key;
 #endif
 OperationGuard* thread_token() noexcept {
+  if (!tokens_enabled.load()) return nullptr;
   token_readers.fetch_add(1);
   OperationGuard* token = nullptr;
 #if defined(__linux__)

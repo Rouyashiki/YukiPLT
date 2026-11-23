@@ -233,6 +233,34 @@ TEST(ImportAllocation, RefreshCachePreparationFailureNeverPartiallyInstallsEithe
   }
 }
 
+TEST(ImportAllocation, NotifyPreparationFailureCountsOnlyCurrentMatchingHandles) {
+  RuleOomFixture fixture;
+  RuleSet rules;
+  for (const char* name : {"active.so", "other.so"})
+    ASSERT_TRUE(rules.add_rule({ImageMatch::kBasename, name}, ImportSelector{"target"},
+                               reinterpret_cast<void*>(uintptr_t{0xa000}), nullptr, 0));
+  const auto image = fixture.view();
+  ASSERT_EQ(rules.notify_loaded(image, "active.so").succeeded, 1u);
+  ASSERT_EQ(rules.release_image(image).succeeded, 1u);
+  ASSERT_EQ(rules.notify_loaded(image, "active.so").succeeded, 1u);
+  ASSERT_EQ(rules.bindings().size(), 2u);
+
+  RuleOperationReport report;
+  for (const char* path : {"active.so", "other.so"}) {
+    fail_after = 0;
+    auto failed = rules.notify_loaded(image, path, report);
+    fail_after = -1;
+    EXPECT_EQ(report.preparation_error.code, ErrorCode::kOutOfMemory);
+    EXPECT_TRUE(report.events.empty());
+    EXPECT_EQ(failed.attempted, 0u);
+    EXPECT_EQ(failed.failed, 1u);
+    EXPECT_EQ(failed.retained, std::strcmp(path, "active.so") == 0 ? 1u : 0u);
+  }
+  EXPECT_EQ(rules.notify_loaded(image, "active.so").retained, 1u);
+  EXPECT_EQ(rules.notify_loaded(image, "active.so", report).retained, 1u);
+  EXPECT_EQ(rules.unhook().succeeded, 1u);
+}
+
 TEST(ImportAllocation, CPlanAndSessionPreparationPreserveOutputsAndOwnership) {
   AllocationFixture fixture;
   auto v = fixture.view();

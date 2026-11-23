@@ -260,6 +260,7 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     if (st == RuleState::kPending || st == RuleState::kInstallFailed) {
       retry_in_place = true;
     } else if (st != RuleState::kReleased && st != RuleState::kInvalidated) {
+      if (handles_[existing].valid()) ++summary.retained;
       return;
     }
   }
@@ -462,10 +463,6 @@ RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path
     if (!filter_matches(rule.filter, image, path)) continue;
     apply_rule_to_image(rule, image, path, nullptr, summary, nullptr, cache);
   }
-  summary.retained = 0;
-  for (const auto& rule : rules_)
-    if (!rule.removed && filter_matches(rule.filter, image, path))
-      summary.retained += retained_for(rule.id, &image);
   return summary;
 }
 RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path) {
@@ -787,17 +784,17 @@ RuleSummary RuleSet::notify_loaded_impl(const ImageView& image, const char* path
   } catch (...) {
     const Error error = detail::current_exception_error();
     size_t retained = 0;
-    for (const auto& rule : rules_)
-      if (!rule.removed && filter_matches(rule.filter, image, path))
-        retained += retained_for(rule.id, &image);
+    for (const auto& rule : rules_) {
+      if (rule.removed || !filter_matches(rule.filter, image, path)) continue;
+      const size_t index = find_binding(rule.id, image);
+      if (index != ~size_t{0} && handles_[index].valid()) ++retained;
+    }
     return report_failure(report, error, retained);
   }
   RuleSummary summary;
   for (auto& event : report.events)
     apply_rule_to_image(*rule_by_id(event.rule_id), image, event.path.c_str(), nullptr, summary,
                         &event, cache);
-  summary.retained = 0;
-  for (const auto& event : report.events) summary.retained += retained_for(event.rule_id, &image);
   return summary;
 }
 RuleSummary RuleSet::notify_loaded(const ImageView& image, const char* path,

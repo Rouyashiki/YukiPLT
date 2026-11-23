@@ -379,7 +379,7 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
       auto& entry = snapshots[cached];
       auto& selected = entry.selected[entry.consumed++];
       if (!selected) return selected.error();
-      const auto& found = selected.value();
+      auto& found = selected.value();
       if (images.enabled()) {
         if (!slots.insert(found.import.slot_address).second)
           return Error::Make(ErrorCode::kInvalidArgument);
@@ -388,7 +388,8 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
           if (previous.selected.import.slot_address == found.import.slot_address)
             return Error::Make(ErrorCode::kInvalidArgument);
       }
-      plan.targets_.push_back({target.image, found, target.replacement, target.out_original});
+      plan.targets_.push_back(
+          {target.image, std::move(found), target.replacement, target.out_original});
     }
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
       const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);
@@ -670,7 +671,7 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       }
       auto& selected = cached.selected[cached.consumed++];
       if (!selected) return selected.error();
-      const auto& found = selected.value();
+      auto& found = selected.value();
       if (images.enabled()) {
         if (!slots.insert(found.base.import.slot_address).second)
           return Error::Make(ErrorCode::kInvalidArgument);
@@ -679,8 +680,9 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
           if (prior.selected.base.import.slot_address == found.base.import.slot_address)
             return Error::Make(ErrorCode::kInvalidArgument);
       }
-      plan.targets_.push_back({target.image, found, request.replacement, request.out_original,
-                               request.require_current, request.expected_current});
+      plan.targets_.push_back({target.image, std::move(found), request.replacement,
+                               request.out_original, request.require_current,
+                               request.expected_current});
     }
     for (size_t i = 0; i < plan.targets_.size(); ++i) {
       const auto output = reinterpret_cast<uintptr_t>(plan.targets_[i].out_original);

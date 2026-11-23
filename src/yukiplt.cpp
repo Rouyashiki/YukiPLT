@@ -697,6 +697,8 @@ Result<ImageView> image_from_soname(const char* soname) {
 #if defined(__linux__) || defined(__ANDROID__)
   struct CallbackData {
     const char* target;
+    bool exact_path;
+    size_t target_len;
     uintptr_t main_phdr;
     ImageView result;
     size_t matches;
@@ -704,7 +706,9 @@ Result<ImageView> image_from_soname(const char* soname) {
 
   CallbackData data;
   data.target = (soname != nullptr && soname[0] != '\0') ? soname : nullptr;
-  data.main_phdr = static_cast<uintptr_t>(getauxval(AT_PHDR));
+  data.exact_path = data.target && std::strchr(data.target, '/') != nullptr;
+  data.target_len = data.target && !data.exact_path ? std::strlen(data.target) : 0;
+  data.main_phdr = data.target ? 0 : static_cast<uintptr_t>(getauxval(AT_PHDR));
   data.result = {};
   data.matches = 0;
 
@@ -719,11 +723,11 @@ Result<ImageView> image_from_soname(const char* soname) {
         if (d->target == nullptr) {
           match = reinterpret_cast<uintptr_t>(info->dlpi_phdr) == d->main_phdr;
         } else if (name != nullptr) {
-          if (std::strchr(d->target, '/') != nullptr) {
+          if (d->exact_path) {
             match = std::strcmp(name, d->target) == 0;
           } else {
             size_t name_len = std::strlen(name);
-            size_t target_len = std::strlen(d->target);
+            const size_t target_len = d->target_len;
             match = std::strcmp(name, d->target) == 0 ||
                     (name_len > target_len && name[name_len - target_len - 1] == '/' &&
                      std::strcmp(name + name_len - target_len, d->target) == 0);

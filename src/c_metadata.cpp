@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
+#include <atomic>
 #include <cstring>
 #include <limits>
 #include <string_view>
@@ -33,11 +34,29 @@ static_assert(YUKIPLT_C_VERSION_SOURCE_NEEDED == 1 &&
               static_cast<uint32_t>(VersionSource::kNeeded) == YUKIPLT_C_VERSION_SOURCE_NEEDED);
 static_assert(YUKIPLT_C_VERSION_SOURCE_DEFINED == 2 &&
               static_cast<uint32_t>(VersionSource::kDefined) == YUKIPLT_C_VERSION_SOURCE_DEFINED);
+// Size queries and copies may race on an immutable handle. Concurrent first
+// readers can independently compute the same total from the owned records.
+struct TextBytes {
+  std::atomic<size_t> cached{SIZE_MAX};
+
+  template <typename Range, typename Add>
+  Result<size_t> get(const Range& values, Add add) {
+    size_t bytes = cached.load(std::memory_order_relaxed);
+    if (bytes != SIZE_MAX) return bytes;
+    bytes = 0;
+    for (const auto& value : values)
+      if (!add(bytes, value)) return Error::Make(ErrorCode::kIntegerOverflow);
+    cached.store(bytes, std::memory_order_relaxed);
+    return bytes;
+  }
+};
 struct Images final : Object {
+  TextBytes text_bytes;
   Images() : Object(Kind::kImages) {}
   std::vector<NamedImage> values;
 };
 struct Imports final : Object {
+  TextBytes text_bytes;
   Imports() : Object(Kind::kImports) {}
   std::variant<ImportSnapshot, VersionedImportSnapshot, FunctionImportSnapshot> value;
 };
@@ -129,13 +148,15 @@ yukiplt_c_error yukiplt_c_image_list_copy(const yukiplt_c_image_list* handle,
     if (!handle) return Error::Make(ErrorCode::kNullPointer);
     auto owned = acquire(handle->token, Kind::kImages);
     if (!owned) return invalid();
-    auto& values = static_cast<Images&>(*owned).values;
-    size_t bytes = 0;
-    for (const auto& value : values)
-      if (!append_size(bytes, value.path)) return Error::Make(ErrorCode::kIntegerOverflow);
+    auto& images = static_cast<Images&>(*owned);
+    auto& values = images.values;
+    auto bytes = images.text_bytes.get(values, [](size_t& size, const NamedImage& image) {
+      return append_size(size, image.path);
+    });
+    if (!bytes) return bytes.error();
     bool sizes_only = false;
-    if (auto e = buffers(values.size(), bytes, rows, capacity, text, text_capacity, required_count,
-                         required_text, sizes_only))
+    if (auto e = buffers(values.size(), bytes.value(), rows, capacity, text, text_capacity,
+                         required_count, required_text, sizes_only))
       return e;
     if (sizes_only) return Error::Ok();
     size_t offset = 0;
@@ -227,21 +248,22 @@ yukiplt_c_error yukiplt_c_import_snapshot_copy(const yukiplt_c_import_snapshot* 
     if (!handle || !kind || !skipped) return Error::Make(ErrorCode::kNullPointer);
     auto owned = acquire(handle->token, Kind::kImports);
     if (!owned) return invalid();
-    auto& value = static_cast<Imports&>(*owned).value;
+    auto& imports = static_cast<Imports&>(*owned);
+    auto& value = imports.value;
     return std::visit(
         [&](const auto& snapshot) -> Error {
-          size_t bytes = 0;
-          const auto& empty = empty_text();
-          for (const auto& item : snapshot.imports) {
-            auto v = record(item);
-            if (!append_size(bytes, v.import.symbol) ||
-                !append_size(bytes, v.version ? v.version->name : empty) ||
-                !append_size(bytes, v.version ? v.version->dependency : empty))
-              return Error::Make(ErrorCode::kIntegerOverflow);
-          }
+          const auto empty = empty_text();
+          auto bytes =
+              imports.text_bytes.get(snapshot.imports, [empty](size_t& size, const auto& item) {
+                auto v = record(item);
+                return append_size(size, v.import.symbol) &&
+                       append_size(size, v.version ? v.version->name : empty) &&
+                       append_size(size, v.version ? v.version->dependency : empty);
+              });
+          if (!bytes) return bytes.error();
           bool sizes_only = false;
-          if (auto e = buffers(snapshot.imports.size(), bytes, rows, capacity, text, text_capacity,
-                               required_count, required_text, sizes_only))
+          if (auto e = buffers(snapshot.imports.size(), bytes.value(), rows, capacity, text,
+                               text_capacity, required_count, required_text, sizes_only))
             return e;
           if (!sizes_only) {
             size_t offset = 0, index = 0;
@@ -272,6 +294,7 @@ static_assert(YUKIPLT_C_TEXT_SUFFIX == 3 && static_cast<uint32_t>(TextMatchKind:
 static_assert(YUKIPLT_C_TEXT_SUBSTRING == 4 &&
               static_cast<uint32_t>(TextMatchKind::kSubstring) == 4);
 struct Candidates final : Object {
+  TextBytes text_bytes;
   Candidates() : Object(Kind::kCandidates) {}
   std::vector<FunctionCandidate> value;
 };
@@ -431,17 +454,17 @@ yukiplt_c_error yukiplt_c_candidates_copy(const yukiplt_c_candidates* h,
     if (!h) return Error::Make(ErrorCode::kNullPointer);
     auto base = acquire(h->token, Kind::kCandidates);
     if (!base) return invalid();
-    auto& values = static_cast<Candidates&>(*base).value;
-    size_t bytes = 0;
-    for (const auto& c : values) {
-      if (!append_size(bytes, c.path) || !append_size(bytes, c.selected.base.import.symbol) ||
-          !append_size(bytes, c.selected.base.version.name) ||
-          !append_size(bytes, c.selected.base.version.dependency))
-        return Error::Make(ErrorCode::kIntegerOverflow);
-    }
+    auto& candidates = static_cast<Candidates&>(*base);
+    auto& values = candidates.value;
+    auto bytes = candidates.text_bytes.get(values, [](size_t& size, const FunctionCandidate& c) {
+      return append_size(size, c.path) && append_size(size, c.selected.base.import.symbol) &&
+             append_size(size, c.selected.base.version.name) &&
+             append_size(size, c.selected.base.version.dependency);
+    });
+    if (!bytes) return bytes.error();
     bool sizes_only = false;
-    if (auto e = buffers(values.size(), bytes, rows, capacity, text, text_capacity, required_count,
-                         required_text, sizes_only))
+    if (auto e = buffers(values.size(), bytes.value(), rows, capacity, text, text_capacity,
+                         required_count, required_text, sizes_only))
       return e;
     if (sizes_only) return Error::Ok();
     size_t offset = 0, index = 0;

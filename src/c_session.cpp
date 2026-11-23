@@ -35,12 +35,13 @@ struct Plan final : Object {
 };
 struct Recovery {
   RecoveryDiagnostic diagnostic;
-  std::vector<ResidualPage> pages;
+  size_t page_offset = 0;
 };
 struct Session final : Object {
   Session() : Object(Kind::kSession) {}
   std::variant<HookSession, FunctionHookSession> value;
   std::vector<Recovery> recovery;
+  std::vector<ResidualPage> pages;
   std::vector<uint8_t> attempted;
   bool can_destroy() const noexcept override {
     const auto ready = [](const auto* session) noexcept {
@@ -132,10 +133,11 @@ Error operate(Session& owned, Action action, yukiplt_c_summary* out, MapsCache* 
           for (size_t i = 0; i < groups.size(); ++i) {
             if (!groups[i].handle.valid()) continue;
             auto& r = owned.recovery[i];
-            if (auto e =
-                    query_recovery(groups[i].handle, &r.diagnostic, r.pages.data(), r.pages.size()))
+            const size_t capacity = groups[i].target_indices.size();
+            if (auto e = query_recovery(groups[i].handle, &r.diagnostic,
+                                        owned.pages.data() + r.page_offset, capacity))
               return e;
-            if (r.diagnostic.residual_page_count > r.pages.size())
+            if (r.diagnostic.residual_page_count > capacity)
               return Error::Make(ErrorCode::kOutOfBounds);
           }
         }
@@ -279,8 +281,12 @@ yukiplt_c_error yukiplt_c_prepare_session(const yukiplt_c_plan* h,
           if (!result) return result.error();
           owned->recovery.resize(result.value().images().size());
           owned->attempted.resize(result.value().images().size());
-          for (size_t i = 0; i < owned->recovery.size(); ++i)
-            owned->recovery[i].pages.resize(result.value().images()[i].target_indices.size());
+          owned->pages.resize(result.value().targets().size());
+          size_t offset = 0;
+          for (size_t i = 0; i < owned->recovery.size(); ++i) {
+            owned->recovery[i].page_offset = offset;
+            offset += result.value().images()[i].target_indices.size();
+          }
           owned->value = std::move(result.value());
           return Error::Ok();
         },
@@ -405,7 +411,7 @@ yukiplt_c_error yukiplt_c_session_recovery(const yukiplt_c_session* h, size_t in
               return Error::Make(ErrorCode::kOutOfBounds);
           } else if (g.state == SessionState::kAbandoned) {
             d = s.recovery[index].diagnostic;
-            source = s.recovery[index].pages.data();
+            source = s.pages.data() + s.recovery[index].page_offset;
           } else {
             if constexpr (std::is_same_v<std::decay_t<decltype(v)>, FunctionHookSession>)
               d = g.operation;

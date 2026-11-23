@@ -30,7 +30,8 @@ bool same_image(const ImageView& a, const ImageView& b) noexcept {
 // linker lock. No addresses from this cache are dereferenced here.
 class RefreshImages {
  public:
-  const Result<std::vector<NamedImage>>& get(const ImageSelector& filter) {
+  template <typename Enumerate>
+  const Result<std::vector<NamedImage>>& get(const ImageSelector& filter, Enumerate enumerate) {
     auto matches = [&](const Entry& entry) {
       if (entry.filter.match != filter.match) return false;
       if (filter.match == ImageMatch::kLoadBias && entry.filter.load_bias != filter.load_bias)
@@ -41,13 +42,13 @@ class RefreshImages {
       return true;
     };
     if (!first_) {
-      first_.emplace(Entry{filter, detail::active_image_enumerator()(filter)});
+      first_.emplace(Entry{filter, enumerate(filter)});
       return first_->images;
     }
     if (matches(*first_)) return first_->images;
     for (const auto& entry : entries_)
       if (matches(entry)) return entry.images;
-    entries_.push_back({filter, detail::active_image_enumerator()(filter)});
+    entries_.push_back({filter, enumerate(filter)});
     return entries_.back().images;
   }
 
@@ -88,16 +89,6 @@ const RuleSet::Rule* RuleSet::rule_by_id(uint64_t id) const noexcept {
 }
 RuleSet::Rule* RuleSet::rule_by_id(uint64_t id) noexcept {
   return const_cast<Rule*>(static_cast<const RuleSet&>(*this).rule_by_id(id));
-}
-
-size_t RuleSet::BindingKeyHash::operator()(const BindingKey& k) const noexcept {
-  uint64_t h = k.rule_id * 0x9E3779B97F4A7C15ull;
-  auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; };
-  mix(k.load_bias);
-  mix(reinterpret_cast<uintptr_t>(k.phdr_table));
-  mix(k.phdr_count);
-  mix(k.instance_token);
-  return static_cast<size_t>(h ^ (h >> 32));
 }
 
 size_t RuleSet::find_binding(uint64_t rule_id, const ImageView& image) const noexcept {
@@ -151,9 +142,13 @@ Result<uint64_t> RuleSet::add_rule(const ImageSelector& filter,
     rule.replacement = replacement;
     rule.out_originals = out_originals;
     rule.capacity = capacity;
+    const bool relocating = rules_.size() == rules_.capacity();
     rules_.push_back(std::move(rule));
-    // Re-point every rule's borrowed pointers: push_back may have reallocated.
-    for (auto& existing : rules_) rebind_selector(existing);
+    if (relocating) {
+      for (auto& existing : rules_) rebind_selector(existing);
+    } else {
+      rebind_selector(rules_.back());
+    }
     ++next_rule_id_;
     return rules_.back().id;
   } catch (...) {
@@ -233,13 +228,14 @@ bool filter_matches(const ImageSelector& filter, const ImageView& image,
 // the linker lock (null: no path check).
 void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
                                   const char* expected_path, RuleSummary& summary,
-                                  RuleOperationEvent* event, MapsCache* cache) {
+                                  RuleOperationEvent* event, MapsCache* cache, bool diagnostics) {
   const size_t existing = find_binding(rule.id, image);
   if (event && existing != ~size_t{0}) {
     event->binding_index = existing;
     event->state = bindings_[existing].state;
     event->error = bindings_[existing].error;
-    if (handles_[existing].valid()) read_recovery(handles_[existing], event->recovery);
+    if (diagnostics && handles_[existing].valid())
+      read_recovery(handles_[existing], event->recovery);
   }
   // Retry clean failures in place. Reapply ended bindings with fresh originals;
   // published slots may still be read and are never reused. Keep unresolved and
@@ -347,7 +343,7 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
     event->recovery = {};
     event->recovery.error = result.error;
     event->recovery.image_invalidated = result.error.code == ErrorCode::kImageInvalidated;
-    if (handles_[idx].valid()) read_recovery(handles_[idx], event->recovery);
+    if (diagnostics && handles_[idx].valid()) read_recovery(handles_[idx], event->recovery);
   }
   if (result.ok())
     ++summary.succeeded;
@@ -359,12 +355,12 @@ void RuleSet::apply_rule_to_image(Rule& rule, const ImageView& image, const char
 // Recheck retained system bindings under the linker lock without writing.
 // A mismatch preserves handle and ownership; third-party values are never adopted.
 void RuleSet::record_verification(size_t index, Error error, RuleSummary& summary,
-                                  RuleOperationEvent& event) {
+                                  RuleOperationEvent& event, bool diagnostics) {
   event.binding_index = index;
   event.state = bindings_[index].state;
   event.error = error;
   event.recovery = {};
-  if (handles_[index].valid()) read_recovery(handles_[index], event.recovery);
+  if (diagnostics && handles_[index].valid()) read_recovery(handles_[index], event.recovery);
   bindings_[index].error = error;
   if (!error) return;
   ++summary.attempted;
@@ -376,7 +372,7 @@ RuleSummary RuleSet::refresh_impl(MapsCache* cache) {
   if (detail::process_entry()) return {0, 0, 1, 0};
 
   RuleOperationReport report;
-  return refresh_impl(report, cache);
+  return refresh_impl(report, cache, false);
 }
 RuleSummary RuleSet::refresh() {
   yukiplt::detail::OperationGuard admission;
@@ -666,7 +662,7 @@ RuleSummary report_failure(RuleOperationReport& report, Error error, size_t reta
 }
 }  // namespace
 
-RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache) {
+RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache, bool diagnostics) {
   if (detail::process_entry()) return {0, 0, 1, 0};
 
   reset_report(report);
@@ -676,11 +672,21 @@ RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache)
     // Finish enumeration and all diagnostic string allocation before the first
     // installation. An enumeration error belongs to its rule, not to an unload.
     RefreshImages enumeration_cache;
-    std::unordered_set<BindingKey, BindingKeyHash> targets;
+    const auto enumerate = [](const ImageSelector& filter) {
+      auto images = detail::active_image_enumerator()(filter);
+      if (!images || images.value().size() < 2) return images;
+      std::unordered_set<BindingKey, BindingKeyHash> seen;
+      auto& list = images.value();
+      const auto end = std::remove_if(list.begin(), list.end(), [&](const NamedImage& named) {
+        return !seen.insert(key_of(0, named.image)).second;
+      });
+      list.erase(end, list.end());
+      return images;
+    };
     for (auto& rule : rules_) {
       if (rule.removed) continue;
       rebind_selector(rule);
-      const auto& images = enumeration_cache.get(rule.filter);
+      const auto& images = enumeration_cache.get(rule.filter, enumerate);
       if (!images) {
         RuleOperationEvent event;
         event.rule_id = rule.id;
@@ -689,7 +695,6 @@ RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache)
         report.events.push_back(std::move(event));
       } else {
         for (const auto& named : images.value()) {
-          if (!targets.insert(key_of(rule.id, named.image)).second) continue;
           RuleOperationEvent event;
           event.rule_id = rule.id;
           event.image = named.image;
@@ -729,7 +734,7 @@ RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache)
   RuleSummary summary;
   for (size_t i = 0; i < verification.size(); ++i) {
     auto& event = report.events[verification_events[i]];
-    record_verification(event.binding_index, verification[i].error, summary, event);
+    record_verification(event.binding_index, verification[i].error, summary, event, diagnostics);
   }
   for (auto& event : report.events) {
     if (event.stage == RuleOperationStage::kVerify) continue;
@@ -739,7 +744,7 @@ RuleSummary RuleSet::refresh_impl(RuleOperationReport& report, MapsCache* cache)
     }
     Rule& rule = *rule_by_id(event.rule_id);
     apply_rule_to_image(rule, event.image, event.path.c_str(), event.path.c_str(), summary, &event,
-                        cache);
+                        cache, diagnostics);
   }
   summary.retained = 0;
   for (const auto& event : report.events)

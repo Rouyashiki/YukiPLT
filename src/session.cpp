@@ -410,7 +410,7 @@ Result<HookPlan> build_hook_plan(const HookTarget* targets, size_t count, size_t
         while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
           ++previous;
       if (previous < i) {
-        plan.paths_.push_back(plan.paths_[previous]);
+        plan.paths_.emplace_back();  // prepare_session reads the first path for each image.
         continue;
       }
       if (failed_target) *failed_target = i;
@@ -703,7 +703,7 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
         while (previous < i && !same_image(plan.targets_[previous].image, plan.targets_[i].image))
           ++previous;
       if (previous < i) {
-        plan.paths_.push_back(plan.paths_[previous]);
+        plan.paths_.emplace_back();  // prepare_session reads the first path for each image.
         continue;
       }
       if (failed_target) *failed_target = i;

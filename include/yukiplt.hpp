@@ -1354,7 +1354,8 @@ class HookPlan {
   friend Result<HookPlan> build_hook_plan(const HookTarget*, size_t, size_t*);
   friend Result<HookSession> prepare_session(const HookPlan&);
   std::vector<PlannedTarget> targets_;
-  std::vector<std::string> paths_;  ///< Per target: system image path when planned.
+  std::vector<std::string>
+      paths_;  ///< Per target: only the first target of each image needs its planned path.
 };
 
 /// Resolve every target without writing GOT, outputs, permissions or Registry.
@@ -1495,7 +1496,8 @@ class FunctionHookPlan {
                                                            size_t*);
   friend Result<FunctionHookSession> prepare_function_session(const FunctionHookPlan&);
   std::vector<FunctionPlannedTarget> targets_;
-  std::vector<std::string> paths_;  ///< Per target: system image path when planned.
+  std::vector<std::string>
+      paths_;  ///< Per target: only the first target of each image needs its planned path.
 };
 /// Read-only owning metadata; never reads GOT or holds an image alive. One
 /// image group is limited to 64 targets, with no automatic splitting.  Like
@@ -1831,7 +1833,7 @@ class RuleSet {
                                  MapsCache* cache);
   RuleSummary notify_loaded_impl(const ImageView& image, const char* path,
                                  RuleOperationReport& report, MapsCache* cache);
-  RuleSummary refresh_impl(RuleOperationReport& report, MapsCache* cache);
+  RuleSummary refresh_impl(RuleOperationReport& report, MapsCache* cache, bool diagnostics = true);
   RuleSummary unhook_impl(MapsCache* cache);
   RuleSummary remove_rule_impl(uint64_t rule_id, MapsCache* cache);
   RuleSummary notify_unloading_impl(const ImageView& image, MapsCache* cache);
@@ -1862,10 +1864,11 @@ class RuleSet {
   // Apply one rule to one already-matched image instance, updating bindings.
   void apply_rule_to_image(Rule& rule, const ImageView& image, const char* path,
                            const char* expected_path, RuleSummary& summary,
-                           RuleOperationEvent* event = nullptr, MapsCache* cache = nullptr);
+                           RuleOperationEvent* event = nullptr, MapsCache* cache = nullptr,
+                           bool diagnostics = true);
   // Re-verify an installed system-image binding found again by refresh().
   void record_verification(size_t index, Error error, RuleSummary& summary,
-                           RuleOperationEvent& event);
+                           RuleOperationEvent& event, bool diagnostics);
   Error prepare_undo_report(RuleOperationReport& report, uint64_t rule_id, const ImageView* image,
                             RuleOperationStage stage) const;
   void finish_undo_report(RuleOperationReport& report) const;
@@ -1888,7 +1891,15 @@ class RuleSet {
     }
   };
   struct BindingKeyHash {
-    size_t operator()(const BindingKey& k) const noexcept;
+    size_t operator()(const BindingKey& k) const noexcept {
+      uint64_t h = k.rule_id * 0x9E3779B97F4A7C15ull;
+      auto mix = [&h](uint64_t v) { h = (h ^ v) * 0x100000001B3ull; };
+      mix(k.load_bias);
+      mix(reinterpret_cast<uintptr_t>(k.phdr_table));
+      mix(k.phdr_count);
+      mix(k.instance_token);
+      return static_cast<size_t>(h ^ (h >> 32));
+    }
   };
   static BindingKey key_of(uint64_t rule_id, const ImageView& image) noexcept {
     return {rule_id, image.load_bias, image.phdr_table, image.phdr_count, image.instance_token};

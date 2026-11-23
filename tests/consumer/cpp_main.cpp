@@ -109,6 +109,8 @@ int main() {
     Error admitted;
     if (!session.install(admitted).ok() || admitted) _exit(59);
     RuleSet rules;
+    RuleSet moved(std::move(rules));
+    rules = std::move(moved);
     if (!rules.refresh(admitted).ok() || admitted) _exit(60);
     if (!deny_open()) _exit(46);
     if (unhook_cached(cache, installed.handle) || call(1) != 11) _exit(47);

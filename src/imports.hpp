@@ -4,6 +4,8 @@
 #ifndef YUKIPLT_IMPORTS_HPP_
 #define YUKIPLT_IMPORTS_HPP_
 
+#include <algorithm>
+#include <functional>
 #include <vector>
 
 #include "common.hpp"
@@ -14,7 +16,8 @@ namespace yukiplt::detail {
 
 // Fixed request metadata, separate from decoded-record materialization.
 struct SelectedRequests {
-  const char* names[64]{};
+  static constexpr size_t kShortNameBytes = 64;
+  size_t lengths[64]{};
   size_t heads[128]{};
   size_t next[64]{};
   size_t selected[64]{};
@@ -25,28 +28,40 @@ struct SelectedRequests {
     for (unsigned char c : name) value = (value ^ c) * 16777619u;
     return value & 127;
   }
+  static size_t initial_bucket(std::string_view key) noexcept {
+    return key.size() < sizeof(uint32_t) ? hash(key) : std::hash<std::string_view>{}(key) & 127;
+  }
+  template <typename Name>
+  size_t bucket_for(std::string_view key, Name name) const noexcept {
+    size_t bucket = initial_bucket(key);
+    while (heads[bucket]) {
+      const size_t i = heads[bucket] - 1;
+      if (lengths[i] == key.size() &&
+          (key.empty() || std::memcmp(key.data(), name(i), key.size()) == 0))
+        break;
+      bucket = (bucket + 1) & 127;
+    }
+    return bucket;
+  }
   template <typename Name>
   void prepare(size_t count, Name name) noexcept {
     for (size_t i = 0; i < count; ++i) {
-      names[i] = name(i);
+      const std::string_view key = name(i);
+      lengths[i] = key.size();
       selected[i] = ~size_t{0};
-      size_t bucket = hash(names[i]);
-      while (heads[bucket] && std::strcmp(names[heads[bucket] - 1], names[i]) != 0)
-        bucket = (bucket + 1) & 127;
+      const size_t bucket = bucket_for(key, name);
       next[i] = heads[bucket];
       heads[bucket] = i + 1;
     }
   }
-  template <typename Match>
-  void visit(std::string_view name, Match match) {
-    size_t bucket = hash(name);
-    while (heads[bucket]) {
-      if (name == names[heads[bucket] - 1]) {
-        for (size_t link = heads[bucket]; link; link = next[link - 1]) match(link - 1);
-        return;
-      }
-      bucket = (bucket + 1) & 127;
-    }
+  template <typename Name, typename Match>
+  void visit(std::string_view key, size_t count, Name name, Match match) const {
+    // Many offsets can name suffixes of a single string. Hash a long suffix
+    // only if at least one selector can match its exact length.
+    if (key.size() > kShortNameBytes &&
+        std::find(lengths, lengths + count, key.size()) == lengths + count)
+      return;
+    for (size_t link = heads[bucket_for(key, name)]; link; link = next[link - 1]) match(link - 1);
   }
   void choose(size_t request, size_t record, bool acceptable = true) noexcept {
     if (!acceptable || errors[request] == ErrorCode::kUnsupportedRelocation) {
@@ -105,13 +120,23 @@ struct FunctionScanView {
 VersionedImport own_import(const VersionedImportView&);
 FunctionImport own_import(const FunctionImportView&);
 Result<VersionedScanView> scan_versioned_views(const InspectedImage&, CauseContext* = nullptr);
+// Batch scratch records may be grouped by name after validating them in relocation order.
+Result<VersionedScanView> scan_batch_versioned_views(const InspectedImage&, ScanBudget&);
 Result<FunctionScanView> scan_function_views(const InspectedImage&, uint32_t,
                                              ScanBudget* = nullptr);
 bool import_matches(const VersionedImportView&, const ImportSelector&) noexcept;
+bool import_qualifiers_match(const VersionedImportView&, const ImportSelector&) noexcept;
 Result<size_t> select_import(const VersionedScanView&, const ImportSelector&);
 bool function_reloc_acceptable(const FunctionRelocView&) noexcept;
 bool function_reloc_matches(const FunctionRelocView&, const FunctionImportSelector&) noexcept;
 Result<size_t> select_function_reloc(const FunctionScanView&, const FunctionImportSelector&);
+
+// Borrow the non-null, NUL-terminated system path for this synchronous inspection.
+Result<VersionedImportSnapshot> find_imports_at_path(const ImageView&, const char*,
+                                                     const ImportSelector*, size_t, size_t*);
+Result<FunctionImportSnapshot> find_function_imports_at_path(const ImageView&, const char*,
+                                                             const FunctionImportSelector*, size_t,
+                                                             size_t*);
 
 // Selection and owning copies finish before the inspection window closes.
 Result<std::vector<Result<VersionedImport>>> inspect_selected_imports(const ImageView&,
@@ -178,6 +203,7 @@ Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& i
                                                          uint32_t sources);
 
 // Validate a function selector (base selector rules plus non-zero masks).
+Error validate_function_sources(uint32_t) noexcept;
 Error validate_function_selector(const FunctionImportSelector& selector) noexcept;
 
 // Select one eligible record from the requested sources/types. Any matched

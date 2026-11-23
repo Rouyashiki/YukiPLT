@@ -74,6 +74,32 @@ Error save(Result<T>&& result, yukiplt_c_import_snapshot* out) {
   snapshot->value = std::move(result.value());
   return publish_to(std::move(snapshot), out);
 }
+template <typename View, typename Request, typename Call>
+Error select_batch(const View* view, const Request* requests, size_t count,
+                   yukiplt_c_import_snapshot* out, size_t* failed_index, Call call) {
+  if (!view || !requests || !out) return Error::Make(ErrorCode::kNullPointer);
+  if (out->token || count == 0 || count > 64) return invalid();
+  if constexpr (std::is_same_v<View, yukiplt_c_named_image>) {
+    if (view->struct_size != sizeof(*view) || view->image.instance_token) return invalid();
+    if (!view->path) return Error::Make(ErrorCode::kNullPointer);
+  }
+  decltype(selector(requests[0])) converted[64];
+  size_t prefix = 0;
+  for (; prefix < count && valid(requests[prefix]); ++prefix)
+    converted[prefix] = selector(requests[prefix]);
+  if (prefix > 0) {
+    auto selected = [&] {
+      if constexpr (std::is_same_v<View, yukiplt_c_named_image>)
+        return call(image(view->image), view->path, converted, prefix, failed_index);
+      else
+        return call(image(*view), converted, prefix, failed_index);
+    }();
+    if (!selected) return selected.error();
+    if (prefix == count) return save(std::move(selected), out);
+  }
+  if (failed_index) *failed_index = prefix;
+  return invalid();
+}
 Error inspect_snapshot(const ImageView& view, const NamedImage* named, uint32_t kind,
                        uint32_t sources, yukiplt_c_import_snapshot* out) {
   if (!out) return Error::Make(ErrorCode::kNullPointer);
@@ -226,6 +252,55 @@ yukiplt_c_error yukiplt_c_select_function_import(const yukiplt_c_image* view,
     return save(Result<FunctionImportSnapshot>{std::move(snapshot)}, out);
   });
 }
+yukiplt_c_error yukiplt_c_select_imports(const yukiplt_c_image* view,
+                                         const yukiplt_c_selector* requests, size_t count,
+                                         yukiplt_c_import_snapshot* out,
+                                         size_t* failed_index) noexcept {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return converted(guard.error());
+  return boundary(
+      [&] { return select_batch(view, requests, count, out, failed_index, &find_imports); });
+}
+
+yukiplt_c_error yukiplt_c_select_imports_named(const yukiplt_c_named_image* view,
+                                               const yukiplt_c_selector* requests, size_t count,
+                                               yukiplt_c_import_snapshot* out,
+                                               size_t* failed_index) noexcept {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return converted(guard.error());
+  return boundary([&] {
+    return select_batch(view, requests, count, out, failed_index, &detail::find_imports_at_path);
+  });
+}
+
+yukiplt_c_error yukiplt_c_select_function_imports(const yukiplt_c_image* view,
+                                                  const yukiplt_c_function_selector* requests,
+                                                  size_t count, yukiplt_c_import_snapshot* out,
+                                                  size_t* failed_index) noexcept {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return converted(guard.error());
+  return boundary([&] {
+    return select_batch(view, requests, count, out, failed_index, &find_function_imports);
+  });
+}
+
+yukiplt_c_error yukiplt_c_select_function_imports_named(const yukiplt_c_named_image* view,
+                                                        const yukiplt_c_function_selector* requests,
+                                                        size_t count,
+                                                        yukiplt_c_import_snapshot* out,
+                                                        size_t* failed_index) noexcept {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return converted(guard.error());
+  return boundary([&] {
+    return select_batch(view, requests, count, out, failed_index,
+                        &detail::find_function_imports_at_path);
+  });
+}
+
 yukiplt_c_error yukiplt_c_import_snapshot_destroy(yukiplt_c_import_snapshot* value) noexcept {
   yukiplt::detail::OperationGuard admission;
   if (admission.error())

@@ -54,6 +54,11 @@ static int exercise(int functions) {
     error = yukiplt_c_build_function_plan(&target, 1, &plan, &failed);
   }
   if (error.code || failed != SIZE_MAX) return 3;
+  size_t count = 0, bytes = 0;
+  if (!yukiplt_c_has_feature(YUKIPLT_C_FEATURE_BULK_TARGETS) ||
+      yukiplt_c_plan_targets_copy(&plan, NULL, 0, NULL, 0, &count, &bytes).code || count != 1 ||
+      !bytes)
+    return 41;
   if (yukiplt_c_prepare_session(&plan, &session).code || yukiplt_c_plan_destroy(&plan).code)
     return 4;
   yukiplt_c_maps_cache cache = {0};
@@ -65,6 +70,16 @@ static int exercise(int functions) {
   if (call(1) != 111 || yukiplt_c_session_destroy(&session).code != YUKIPLT_C_INVALID_ARGUMENT ||
       yukiplt_c_maps_cache_destroy(&cache).code != YUKIPLT_C_INVALID_ARGUMENT)
     return 6;
+  yukiplt_c_target_record row = {0};
+  char text[128] = {0};
+  if (bytes > sizeof(text) ||
+      yukiplt_c_session_targets_copy(&session, &row, 1, text, bytes - 1, &count, &bytes).code !=
+          YUKIPLT_C_OUT_OF_BOUNDS ||
+      row.original || text[0] ||
+      yukiplt_c_session_targets_copy(&session, &row, 1, text, sizeof(text), &count, &bytes).code ||
+      row.original != originals[functions] || row.install_report.status != YUKIPLT_C_INSTALLED ||
+      strcmp(text + row.selected.symbol.offset, "sample_add"))
+    return 42;
   if (yukiplt_c_session_unhook_cached(&cache, &session, &summary).code || summary.retained ||
       call(1) != 11)
     return 7;

@@ -10,6 +10,7 @@
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 
 #include "common.hpp"
 #include "elf.hpp"
@@ -266,11 +267,12 @@ Error plan_selected_requests(const InspectedImage& img, const SelectedHookReques
   std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
     matches.emplace();
-    matches->prepare(count, [&](size_t i) { return reqs[i].target.symbol; });
+    const auto name = [&](size_t i) { return reqs[i].target.symbol; };
+    matches->prepare(count, name);
     for (size_t record = 0; record < snapshot.value().imports.size(); ++record) {
       const auto& entry = snapshot.value().imports[record];
-      matches->visit(entry.import.symbol, [&](size_t i) {
-        if (detail::import_matches(entry, reqs[i].target)) matches->choose(i, record);
+      matches->visit(entry.import.symbol, count, name, [&](size_t i) {
+        if (detail::import_qualifiers_match(entry, reqs[i].target)) matches->choose(i, record);
       });
     }
   }
@@ -544,10 +546,11 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
   std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
     matches.emplace();
-    matches->prepare(count, [&](size_t i) { return reqs[i].target.base.symbol; });
+    const auto name = [&](size_t i) { return reqs[i].target.base.symbol; };
+    matches->prepare(count, name);
     for (size_t record = 0; record < scan.value().records.size(); ++record) {
       const auto& entry = scan.value().records[record];
-      matches->visit(entry.entry.base.import.symbol, [&](size_t i) {
+      matches->visit(entry.entry.base.import.symbol, count, name, [&](size_t i) {
         if (detail::function_reloc_matches(entry, reqs[i].target))
           matches->choose(i, record, detail::function_reloc_acceptable(entry));
       });
@@ -1587,14 +1590,18 @@ Result<FunctionImport> find_function_import(const ImageView& image,
 }
 
 namespace {
-Error validate_named_image(const NamedImage& image,
-                           detail::CauseContext* cause = nullptr) noexcept {
-  if (image.image.instance_token != 0 || image.path.find('\0') != std::string::npos)
+Error validate_named_view(const ImageView& image, std::string_view sized_path = {},
+                          detail::CauseContext* cause = nullptr) noexcept {
+  if (image.instance_token != 0 || sized_path.find('\0') != std::string_view::npos)
     return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kInvalidRequest,
                               cause);
-  if (image.image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
-  if (image.image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
+  if (image.phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
+  if (image.phdr_count == 0) return Error::Make(ErrorCode::kInvalidArgument);
   return Error::Ok();
+}
+Error validate_named_image(const NamedImage& image,
+                           detail::CauseContext* cause = nullptr) noexcept {
+  return validate_named_view(image.image, image.path, cause);
 }
 }  // namespace
 
@@ -1820,9 +1827,10 @@ HookResult hook_function_imports_diagnosed_named(const NamedImage& image,
 }
 
 namespace {
-template <typename Owned, typename Scan, typename Selector>
-std::vector<Result<Owned>> select_owned_requests(const Scan& scan, const Selector* selectors,
-                                                 size_t count) {
+template <typename Owned, typename Scan, typename Selector, typename Emit>
+Error visit_selected_requests(const Scan& scan, const Selector* selectors, size_t count, Emit emit,
+                              size_t* failed_index, bool same_sources,
+                              detail::ScanBudget* budget = nullptr) {
   constexpr bool functions = std::is_same_v<Owned, FunctionImport>;
   const auto& records = [&]() -> const auto& {
     if constexpr (functions)
@@ -1831,9 +1839,11 @@ std::vector<Result<Owned>> select_owned_requests(const Scan& scan, const Selecto
       return scan.imports;
   }();
   auto invalid = [&](size_t i) {
-    if constexpr (functions)
+    if constexpr (functions) {
+      if (same_sources && selectors[i].sources != selectors[0].sources)
+        return Error::Make(ErrorCode::kInvalidArgument);
       return detail::validate_function_selector(selectors[i]);
-    else
+    } else
       return detail::validate_selector(selectors[i]);
   };
   auto select = [&](size_t i) {
@@ -1844,62 +1854,197 @@ std::vector<Result<Owned>> select_owned_requests(const Scan& scan, const Selecto
   };
   std::optional<detail::SelectedRequests> matches;
   if (count > 8) {
+    if (budget) {
+      if (auto error = budget->take_objects<detail::SelectedRequests>(1)) return error;
+    }
     matches.emplace();
-    matches->prepare(count, [&](size_t i) {
-      if (invalid(i)) return "";
+    const auto request_name = [&](size_t i) {
       if constexpr (functions)
         return selectors[i].base.symbol;
       else
         return selectors[i].symbol;
-    });
-    for (size_t r = 0; r < records.size(); ++r) {
-      const auto& record = records[r];
-      auto name = [&] {
-        if constexpr (functions)
-          return record.entry.base.import.symbol;
-        else
-          return record.import.symbol;
-      }();
-      matches->visit(name, [&](size_t i) {
+    };
+    matches->prepare(count, [&](size_t i) { return invalid(i) ? "" : request_name(i); });
+    auto name_at = [&](size_t r) {
+      if constexpr (functions)
+        return records[r].entry.base.import.symbol;
+      else
+        return records[r].import.symbol;
+    };
+    for (size_t r = 0; r < records.size();) {
+      const auto name = name_at(r);
+      size_t end = r + 1;
+      while (end < records.size() && name_at(end).data() == name.data()) ++end;
+      matches->visit(name, count, request_name, [&](size_t i) {
         if (invalid(i)) return;
-        if constexpr (functions) {
-          if (detail::function_reloc_matches(record, selectors[i]))
-            matches->choose(i, r, detail::function_reloc_acceptable(record));
-        } else if (detail::import_matches(record, selectors[i]))
-          matches->choose(i, r);
+        for (size_t j = r; j < end; ++j) {
+          const auto& record = records[j];
+          if constexpr (functions) {
+            if (detail::function_reloc_matches(record, selectors[i]))
+              matches->choose(i, j, detail::function_reloc_acceptable(record));
+          } else if (detail::import_qualifiers_match(record, selectors[i]))
+            matches->choose(i, j);
+        }
       });
+      r = end;
     }
   }
+  for (size_t i = 0; i < count; ++i) {
+    const auto invalid_request = (matches || functions) ? invalid(i) : Error{};
+    auto selected = invalid_request ? Result<size_t>(invalid_request)
+                    : matches       ? matches->result(i)
+                                    : select(i);
+    if (!selected) {
+      if (failed_index) *failed_index = i;
+      return selected.error();
+    }
+    if (auto error = emit(i, records[selected.value()])) return error;
+  }
+  return {};
+}
+template <typename Owned, typename Scan, typename Selector>
+std::vector<Result<Owned>> select_owned_requests(const Scan& scan, const Selector* selectors,
+                                                 size_t count) {
   std::vector<Result<Owned>> result;
   result.reserve(count);
   uintptr_t slots[64]{};
-  for (size_t i = 0; i < count; ++i) {
-    auto error = invalid(i);
-    auto selected = error ? Result<size_t>(error) : matches ? matches->result(i) : select(i);
-    if (!selected) {
-      result.emplace_back(selected.error());
-      break;
-    }
-    slots[i] = [&] {
-      if constexpr (functions)
-        return records[selected.value()].entry.base.import.slot_address;
-      else
-        return records[selected.value()].import.slot_address;
-    }();
-    bool duplicate = false;
-    for (size_t j = 0; j < i; ++j) duplicate |= slots[j] == slots[i];
-    if (duplicate) {
-      result.emplace_back(Error::Make(ErrorCode::kInvalidArgument));
-      break;
-    }
-    if constexpr (functions)
-      result.emplace_back(detail::own_import(records[selected.value()].entry));
-    else
-      result.emplace_back(detail::own_import(records[selected.value()]));
-  }
+  auto error = visit_selected_requests<Owned>(
+      scan, selectors, count,
+      [&](size_t i, const auto& record) -> Error {
+        const auto& entry = [&]() -> const auto& {
+          if constexpr (std::is_same_v<Owned, FunctionImport>)
+            return record.entry;
+          else
+            return record;
+        }();
+        if constexpr (std::is_same_v<Owned, FunctionImport>)
+          slots[i] = entry.base.import.slot_address;
+        else
+          slots[i] = entry.import.slot_address;
+        for (size_t j = 0; j < i; ++j)
+          if (slots[j] == slots[i]) return Error::Make(ErrorCode::kInvalidArgument);
+        result.emplace_back(detail::own_import(entry));
+        return {};
+      },
+      nullptr, false);
+  if (error) result.emplace_back(error);
   return result;
 }
+
+template <typename Snapshot, typename Selector>
+Result<Snapshot> find_batch(const ImageView& image, const char* path, const Selector* requests,
+                            size_t count, size_t* failed_index) {
+  if (!requests) return Error::Make(ErrorCode::kNullPointer);
+  if (!count || count > 64) return Error::Make(ErrorCode::kInvalidArgument);
+  constexpr bool functions = std::is_same_v<Selector, FunctionImportSelector>;
+  if constexpr (functions) {
+    if (auto e = detail::validate_function_sources(requests[0].sources)) {
+      if (failed_index) *failed_index = 0;
+      return e;
+    }
+  }
+  return inspect_metadata<Snapshot>(
+      image,
+      [&](const InspectedImage& inspected) -> Result<Snapshot> {
+        using Owned = typename decltype(Snapshot::imports)::value_type;
+        detail::ScanBudget budget;
+        if constexpr (!functions) {
+          if (auto e = budget.take_records(inspected.jmprel_count)) return e;
+        }
+        auto scan = [&] {
+          if constexpr (functions)
+            return detail::scan_function_views(inspected, requests[0].sources, &budget);
+          else
+            return detail::scan_batch_versioned_views(inspected, budget);
+        }();
+        if (!scan) return scan.error();
+        if (auto e = budget.take_objects<Owned>(count)) return e;
+        Snapshot out;
+        out.skipped_relocations = scan.value().skipped_relocations;
+        out.imports.reserve(count);
+        auto error = visit_selected_requests<Owned>(
+            scan.value(), requests, count,
+            [&](size_t, const auto& record) -> Error {
+              const auto& entry = [&]() -> const auto& {
+                if constexpr (functions)
+                  return record.entry;
+                else
+                  return record;
+              }();
+              const auto& v = [&]() -> const auto& {
+                if constexpr (functions)
+                  return entry.base;
+                else
+                  return entry;
+              }();
+              for (auto text : {v.import.symbol, v.version.name, v.version.dependency}) {
+                if (auto e = budget.take_bytes(text.size() + 1)) return e;
+              }
+              out.imports.emplace_back(detail::own_import(entry));
+              return {};
+            },
+            failed_index, true, &budget);
+        if (error) return error;
+        return out;
+      },
+      path);
+}
 }  // namespace
+
+Result<VersionedImportSnapshot> detail::find_imports_at_path(const ImageView& image,
+                                                             const char* path,
+                                                             const ImportSelector* selectors,
+                                                             size_t count, size_t* failed_index) {
+  if (Error e = validate_named_view(image)) return e;
+  return find_batch<VersionedImportSnapshot>(image, path, selectors, count, failed_index);
+}
+
+Result<FunctionImportSnapshot> detail::find_function_imports_at_path(
+    const ImageView& image, const char* path, const FunctionImportSelector* selectors, size_t count,
+    size_t* failed_index) {
+  if (Error e = validate_named_view(image)) return e;
+  return find_batch<FunctionImportSnapshot>(image, path, selectors, count, failed_index);
+}
+
+Result<VersionedImportSnapshot> find_imports(const ImageView& image,
+                                             const ImportSelector* selectors, size_t count,
+                                             size_t* failed_index) {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return guard.error();
+  return find_batch<VersionedImportSnapshot>(image, nullptr, selectors, count, failed_index);
+}
+
+Result<VersionedImportSnapshot> find_imports_named(const NamedImage& image,
+                                                   const ImportSelector* selectors, size_t count,
+                                                   size_t* failed_index) {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return guard.error();
+  if (Error e = validate_named_image(image)) return e;
+  return find_batch<VersionedImportSnapshot>(image.image, image.path.c_str(), selectors, count,
+                                             failed_index);
+}
+
+Result<FunctionImportSnapshot> find_function_imports(const ImageView& image,
+                                                     const FunctionImportSelector* selectors,
+                                                     size_t count, size_t* failed_index) {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return guard.error();
+  return find_batch<FunctionImportSnapshot>(image, nullptr, selectors, count, failed_index);
+}
+
+Result<FunctionImportSnapshot> find_function_imports_named(const NamedImage& image,
+                                                           const FunctionImportSelector* selectors,
+                                                           size_t count, size_t* failed_index) {
+  if (failed_index) *failed_index = SIZE_MAX;
+  detail::OperationGuard guard;
+  if (guard.error()) return guard.error();
+  if (Error e = validate_named_image(image)) return e;
+  return find_batch<FunctionImportSnapshot>(image.image, image.path.c_str(), selectors, count,
+                                            failed_index);
+}
 
 Result<std::vector<Result<VersionedImport>>> detail::inspect_selected_imports(
     const ImageView& image, const ImportSelector* selectors, size_t count) {

@@ -127,10 +127,64 @@ Result<size_t> symbol_count(const InspectedImage& image) {
 Result<size_t> dynamic_symbol_count(const InspectedImage& image) { return symbol_count(image); }
 
 namespace {
-template <bool Own>
+struct BatchImportScan {
+  ScanBudget& budget;
+  size_t eager_bytes;
+  std::string_view previous{};
+  const char* furthest_nul = nullptr;
+  bool group_long_names = false;
+
+  const char* name_end(const char* name, size_t remaining) {
+    if (name == previous.data()) return name + previous.size();
+    const char* end;
+    if (furthest_nul && name <= furthest_nul) {
+      // A previously verified NUL bounds this name, even at a suffix offset.
+      // One string table's worth of eager reads lets disjoint names arrive in any order.
+      const size_t limit = std::max(eager_bytes, SelectedRequests::kShortNameBytes);
+      end = static_cast<const char*>(std::memchr(name, 0, std::min(remaining, limit)));
+      if (end) {
+        eager_bytes -= std::min(eager_bytes, static_cast<size_t>(end - name) + 1);
+      } else {
+        eager_bytes = 0;
+        end = furthest_nul;
+        group_long_names = true;
+      }
+    } else {
+      end = static_cast<const char*>(std::memchr(name, 0, remaining));
+      if (!end) return nullptr;
+      furthest_nul = end;
+    }
+    previous = {name, static_cast<size_t>(end - name)};
+    return end;
+  }
+
+  void finish_names(std::vector<VersionedImportView>& records) const {
+    if (!group_long_names) return;
+    // All relocation and version errors have been checked in table order. Reuse
+    // the batch's scratch records to group long names by their string-table offset.
+    auto first = std::partition(records.begin(), records.end(), [](const auto& record) {
+      return record.import.symbol.size() < SelectedRequests::kShortNameBytes;
+    });
+    std::sort(first, records.end(), [](const auto& a, const auto& b) {
+      return a.import.symbol.data() < b.import.symbol.data();
+    });
+    const char* end = nullptr;
+    for (; first != records.end(); ++first) {
+      auto& name = first->import.symbol;
+      if (!end || name.data() > end) {
+        // name.end() is a verified terminator. An earlier NUL shortens the name.
+        end = name.data() + std::min(name.find('\0'), name.size());
+      }
+      name = {name.data(), static_cast<size_t>(end - name.data())};
+    }
+  }
+};
+
+template <bool Own, bool Budgeted = false>
 Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
                                          void (*visit)(void*, const ImportView&) = nullptr,
-                                         void* context = nullptr) {
+                                         void* context = nullptr,
+                                         BatchImportScan* batch = nullptr) {
   ImportSnapshot snapshot;
   if (image.jmprel_count == 0) return snapshot;
   auto count = symbol_count(image);
@@ -142,6 +196,7 @@ Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
   // the function-import scan applies to the tables it reads.  (This legacy
   // path reads only DT_JMPREL and has no scan budget; see yukiplt.h.)
   std::vector<uintptr_t> addresses;
+  const bool collect_addresses = !Budgeted || image.jmprel_count > 1;
   for (size_t i = 0; i < image.jmprel_count; ++i) {
     auto record = read<NativeElfRelocation>(image, image.jmprel, i);
     if (!record) return record.error();
@@ -154,7 +209,9 @@ Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
         uintptr_t destination;
         if (!safe_add(image.load_bias, static_cast<uintptr_t>(rela.r_offset), destination))
           return Error::Make(ErrorCode::kIntegerOverflow);
-        addresses.push_back(destination);
+        if constexpr (Budgeted)
+          if (auto error = batch->budget.take_objects<uintptr_t>(1)) return error;
+        if (collect_addresses) addresses.push_back(destination);
       }
       continue;
     }
@@ -164,7 +221,12 @@ Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
     const auto name_offset = symbol.value().st_name;
     if (name_offset >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
     const char* name = reinterpret_cast<const char*>(image.strtab + name_offset);
-    const auto* end = static_cast<const char*>(std::memchr(name, 0, image.strsz - name_offset));
+    const size_t remaining = image.strsz - name_offset;
+    const char* end;
+    if constexpr (Budgeted)
+      end = batch->name_end(name, remaining);
+    else
+      end = static_cast<const char*>(std::memchr(name, 0, remaining));
     if (end == nullptr) return Error::Make(ErrorCode::kCorruptedElf);
 
     uintptr_t address;
@@ -173,6 +235,10 @@ Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
     if (address % kNativeSlotSize != 0 || !image.addr_in_writable_load(address, kNativeSlotSize))
       return Error::Make(ErrorCode::kCorruptedElf);
 
+    if constexpr (Budgeted) {
+      if (auto error = batch->budget.take_objects<VersionedImportView>(1)) return error;
+      if (auto error = batch->budget.take_objects<uintptr_t>(1)) return error;
+    }
     if constexpr (Own) {
       snapshot.imports.push_back(
           {std::string(name, static_cast<size_t>(end - name)), symbol_index, i, address});
@@ -180,7 +246,7 @@ Result<ImportSnapshot> walk_imports_impl(const InspectedImage& image,
       visit(context,
             {std::string_view(name, static_cast<size_t>(end - name)), symbol_index, i, address});
     }
-    addresses.push_back(address);
+    if (collect_addresses) addresses.push_back(address);
   }
   // Preserve table order in the snapshot; sort a separate address list so
   // thousands of imports do not require quadratic duplicate detection.
@@ -519,9 +585,8 @@ Error validate_selector(const ImportSelector& selector) noexcept {
 }
 
 template <typename Entry>
-bool import_matches_impl(const Entry& entry, const ImportSelector& selector) noexcept {
+bool qualifiers_match(const Entry& entry, const ImportSelector& selector) noexcept {
   return !(
-      entry.import.symbol != selector.symbol ||
       (selector.relocation_index != ~size_t{0} &&
        entry.import.relocation_index != selector.relocation_index) ||
       (selector.version_match == VersionMatch::kUnversioned && entry.version.index >= 2) ||
@@ -535,10 +600,19 @@ template <typename Snapshot>
 Result<size_t> select_import_impl(const Snapshot& snapshot, const ImportSelector& selector) {
   auto invalid = validate_selector(selector);
   if (invalid) return invalid;
+  const std::string_view requested(selector.symbol);
+  const char* previous = nullptr;
+  bool same_name = false;
   size_t selected = ~size_t{0};
   for (size_t i = 0; i < snapshot.imports.size(); ++i) {
     const auto& entry = snapshot.imports[i];
-    if (!import_matches(entry, selector)) continue;
+    const std::string_view name = entry.import.symbol;
+    if (name.size() != requested.size()) continue;
+    if (name.data() != previous) {
+      previous = name.data();
+      same_name = name == requested;
+    }
+    if (!same_name || !qualifiers_match(entry, selector)) continue;
     if (selected != ~size_t{0}) return Error::Make(ErrorCode::kAmbiguousSymbol);
     selected = i;
   }
@@ -547,10 +621,14 @@ Result<size_t> select_import_impl(const Snapshot& snapshot, const ImportSelector
 }
 
 bool import_matches(const VersionedImport& entry, const ImportSelector& selector) noexcept {
-  return import_matches_impl(entry, selector);
+  return entry.import.symbol == selector.symbol && qualifiers_match(entry, selector);
 }
 bool import_matches(const VersionedImportView& entry, const ImportSelector& selector) noexcept {
-  return import_matches_impl(entry, selector);
+  return entry.import.symbol == selector.symbol && qualifiers_match(entry, selector);
+}
+bool import_qualifiers_match(const VersionedImportView& entry,
+                             const ImportSelector& selector) noexcept {
+  return qualifiers_match(entry, selector);
 }
 Result<size_t> select_import(const VersionedImportSnapshot& scan, const ImportSelector& selector) {
   return select_import_impl(scan, selector);
@@ -570,23 +648,35 @@ FunctionImport own_import(const FunctionImportView& entry) {
   return {own_import(entry.base), entry.source, entry.relocation_type, entry.symbol_type};
 }
 
-Result<VersionedScanView> scan_versioned_views(const InspectedImage& image, CauseContext* cause) {
+static Result<VersionedScanView> scan_versioned_views_impl(const InspectedImage& image,
+                                                           ScanBudget& budget,
+                                                           BatchImportScan* batch) {
   VersionedScanView result;
-  auto error = walk_imports(
-      image,
-      [](void* context, const ImportView& entry) {
-        static_cast<VersionedScanView*>(context)->imports.push_back({entry, {}});
-      },
-      &result, result.skipped_relocations);
-  if (error) return error;
-  ScanBudget budget;
-  budget.cause = cause;
-  error = resolve_versions_impl<SymbolVersionView>(
+  auto visit = [](void* context, const ImportView& entry) {
+    static_cast<VersionedScanView*>(context)->imports.push_back({entry, {}});
+  };
+  auto raw = batch ? walk_imports_impl<false, true>(image, visit, &result, batch)
+                   : walk_imports_impl<false>(image, visit, &result);
+  if (!raw) return raw.error();
+  result.skipped_relocations = raw.value().skipped_relocations;
+  auto error = resolve_versions_impl<SymbolVersionView>(
       image, result.imports.size(),
       [&](size_t i) -> ImportView& { return result.imports[i].import; }, [](size_t) {},
       [&](size_t i, SymbolVersionView version) { result.imports[i].version = version; }, budget);
   if (error) return error;
+  if (batch) batch->finish_names(result.imports);
   return result;
+}
+
+Result<VersionedScanView> scan_versioned_views(const InspectedImage& image, CauseContext* cause) {
+  ScanBudget budget;
+  budget.cause = cause;
+  return scan_versioned_views_impl(image, budget, nullptr);
+}
+Result<VersionedScanView> scan_batch_versioned_views(const InspectedImage& image,
+                                                     ScanBudget& budget) {
+  BatchImportScan batch{budget, image.strsz};
+  return scan_versioned_views_impl(image, budget, &batch);
 }
 
 namespace {
@@ -1054,6 +1144,8 @@ Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& i
   for (auto& record : scan.value().records) result.imports.push_back(std::move(record.entry));
   return result;
 }
+
+Error validate_function_sources(uint32_t sources) noexcept { return validate_sources(sources); }
 
 Error validate_function_selector(const FunctionImportSelector& selector) noexcept {
   if (Error e = validate_selector(selector.base)) return e;

@@ -80,36 +80,55 @@ yukiplt_c_recovery_diagnostic diagnostic(const RecoveryDiagnostic& d) noexcept {
           d.image_invalidated,
           d.residual_page_count};
 }
-template <typename T>
-Error target_copy(const T& target, yukiplt_c_target_record* out, char* text, size_t capacity,
-                  size_t* required, void* original = nullptr, SlotReport installed = {},
-                  SlotReport restored = {}) {
-  auto selected = record(target.selected);
-  size_t bytes = 0;
-  const auto empty = empty_text();
-  if (!append_size(bytes, selected.import.symbol) ||
-      !append_size(bytes, selected.version ? selected.version->name : empty) ||
-      !append_size(bytes, selected.version ? selected.version->dependency : empty))
-    return Error::Make(ErrorCode::kIntegerOverflow);
-  size_t count = 0;
-  bool sizes_only = false;
-  if (auto e = buffers(1, bytes, out, out ? 1 : 0, text, capacity, &count, required, sizes_only))
-    return e;
-  if (sizes_only) return Error::Ok();
+template <typename Row>
+constexpr bool is_session_row =
+    std::is_same_v<Row, SessionTargetResult> || std::is_same_v<Row, FunctionSessionTargetResult>;
+template <typename Row>
+const auto& planned(const Row& row) noexcept {
+  if constexpr (is_session_row<Row>)
+    return row.target;
+  else
+    return row;
+}
+template <typename Row>
+yukiplt_c_target_record write_target(const Row& row, char* text, size_t& offset) noexcept {
+  const auto& target = planned(row);
   yukiplt_c_target_record result{};
   result.image = image(target.image);
-  size_t offset = 0;
-  result.selected = copy_import(selected, text, offset);
+  result.selected = copy_import(record(target.selected), text, offset);
   result.replacement = target.replacement;
   result.out_original = target.out_original;
-  if constexpr (std::is_same_v<T, FunctionPlannedTarget>) {
+  if constexpr (std::is_same_v<std::decay_t<decltype(target)>, FunctionPlannedTarget>) {
     result.require_current = target.require_current;
     result.expected_current = target.expected_current;
   }
-  result.original = original;
-  result.install_report = report(installed);
-  result.restore_report = report(restored);
-  *out = result;
+  if constexpr (is_session_row<Row>) {
+    result.original = row.original;
+    result.install_report = report(row.install_report);
+    result.restore_report = report(row.restore_report);
+  }
+  return result;
+}
+template <typename Row>
+Error targets_copy(const Row* source, size_t count, yukiplt_c_target_record* rows, size_t capacity,
+                   char* text, size_t text_capacity, size_t* required_count,
+                   size_t* required_text) {
+  size_t bytes = 0;
+  const auto& empty = empty_text();
+  for (size_t i = 0; i < count; ++i) {
+    const auto selected = record(planned(source[i]).selected);
+    if (!append_size(bytes, selected.import.symbol) ||
+        !append_size(bytes, selected.version ? selected.version->name : empty) ||
+        !append_size(bytes, selected.version ? selected.version->dependency : empty))
+      return Error::Make(ErrorCode::kIntegerOverflow);
+  }
+  bool sizes_only = false;
+  if (auto e = buffers(count, bytes, rows, capacity, text, text_capacity, required_count,
+                       required_text, sizes_only))
+    return e;
+  if (sizes_only) return Error::Ok();
+  size_t offset = 0;
+  for (size_t i = 0; i < count; ++i) rows[i] = write_target(source[i], text, offset);
   return Error::Ok();
 }
 enum class Action { kInstall, kUnhook, kAbandon };
@@ -239,6 +258,25 @@ yukiplt_c_error yukiplt_c_plan_size(const yukiplt_c_plan* h, size_t* size) noexc
     return Error::Ok();
   });
 }
+yukiplt_c_error yukiplt_c_plan_targets_copy(const yukiplt_c_plan* h, yukiplt_c_target_record* rows,
+                                            size_t capacity, char* text, size_t text_capacity,
+                                            size_t* required_count,
+                                            size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return converted(admission.error());
+  return boundary([&]() -> Error {
+    if (!h) return Error::Make(ErrorCode::kNullPointer);
+    auto owned = get<Plan>(h, Kind::kPlan);
+    if (!owned) return invalid();
+    return std::visit(
+        [&](const auto& value) {
+          const auto& targets = value.targets();
+          return targets_copy(targets.data(), targets.size(), rows, capacity, text, text_capacity,
+                              required_count, required_text);
+        },
+        owned->value);
+  });
+}
 yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan* h, size_t index,
                                       yukiplt_c_target_record* out, char* text, size_t capacity,
                                       size_t* required) noexcept {
@@ -253,7 +291,9 @@ yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan* h, size_t index,
     return std::visit(
         [&](const auto& v) -> Error {
           if (index >= v.targets().size()) return Error::Make(ErrorCode::kOutOfBounds);
-          return target_copy(v.targets()[index], out, text, capacity, required);
+          size_t count;
+          return targets_copy(&v.targets()[index], 1, out, out ? 1 : 0, text, capacity, &count,
+                              required);
         },
         p->value);
   });
@@ -344,6 +384,26 @@ yukiplt_c_error yukiplt_c_session_size(const yukiplt_c_session* h, size_t* targe
     return Error::Ok();
   });
 }
+yukiplt_c_error yukiplt_c_session_targets_copy(const yukiplt_c_session* h,
+                                               yukiplt_c_target_record* rows, size_t capacity,
+                                               char* text, size_t text_capacity,
+                                               size_t* required_count,
+                                               size_t* required_text) noexcept {
+  yukiplt::detail::OperationGuard admission;
+  if (admission.error()) return converted(admission.error());
+  return boundary([&]() -> Error {
+    if (!h) return Error::Make(ErrorCode::kNullPointer);
+    auto owned = get<Session>(h, Kind::kSession);
+    if (!owned) return invalid();
+    return std::visit(
+        [&](const auto& value) {
+          const auto& targets = value.targets();
+          return targets_copy(targets.data(), targets.size(), rows, capacity, text, text_capacity,
+                              required_count, required_text);
+        },
+        owned->value);
+  });
+}
 yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session* h, size_t index,
                                          yukiplt_c_target_record* out, char* text, size_t capacity,
                                          size_t* required) noexcept {
@@ -355,9 +415,9 @@ yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session* h, size_t inde
     return std::visit(
         [&](const auto& v) -> Error {
           if (index >= v.targets().size()) return Error::Make(ErrorCode::kOutOfBounds);
-          const auto& t = v.targets()[index];
-          return target_copy(t.target, out, text, capacity, required, t.original, t.install_report,
-                             t.restore_report);
+          size_t count;
+          return targets_copy(&v.targets()[index], 1, out, out ? 1 : 0, text, capacity, &count,
+                              required);
         },
         s.value);
   });

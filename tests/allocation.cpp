@@ -106,6 +106,29 @@ struct AllocationFixture {
 };
 }  // namespace
 
+TEST(ImportAllocation, NamedBatchRejectsPathMismatchWithoutAllocating) {
+  auto main = yukiplt::image_from_soname(nullptr);
+  ASSERT_TRUE(main);
+  const auto& view = main.value();
+  const yukiplt_c_named_image named{sizeof(named),
+                                    {view.load_bias, view.phdr_table, view.phdr_count, 0},
+                                    "/wrong/path/longer/than/short/string/storage.so"};
+  const yukiplt_c_selector selector = YUKIPLT_C_SELECTOR("target");
+  const yukiplt_c_function_selector function = YUKIPLT_C_FUNCTION_SELECTOR("target");
+  for (bool functions : {false, true}) {
+    size_t failed = 0;
+    yukiplt_c_import_snapshot out{};
+    fail_after = 0;
+    auto error = functions
+                     ? yukiplt_c_select_function_imports_named(&named, &function, 1, &out, &failed)
+                     : yukiplt_c_select_imports_named(&named, &selector, 1, &out, &failed);
+    fail_after = -1;
+    EXPECT_EQ(error.code, YUKIPLT_C_IMAGE_INVALIDATED);
+    EXPECT_EQ(out.token, 0U);
+    EXPECT_EQ(failed, SIZE_MAX);
+  }
+}
+
 TEST(ImportAllocation, FailedInstallNeverStrandsOwnershipOrPublishesOriginals) {
   for (bool selected : {true, false}) {
     AllocationFixture fixture;

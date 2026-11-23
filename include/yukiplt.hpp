@@ -1116,6 +1116,25 @@ YUKIPLT_API Result<FunctionImportSnapshot> inspect_function_imports_named(const 
                                                                           uint32_t sources);
 YUKIPLT_API Result<FunctionImport> find_function_import_named(
     const NamedImage& image, const FunctionImportSelector& selector);
+/// Select 1–64 requests in order under one image inspection. Repeated requests
+/// produce independent owned rows. Function selectors share their source mask.
+/// skipped_relocations counts records skipped while scanning the requested sources.
+/// Global failures (including allocation failure) and success set failed_index to SIZE_MAX. A
+/// selector error reports the first failing request. No partial snapshot is returned.
+YUKIPLT_API Result<VersionedImportSnapshot> find_imports(const ImageView& image,
+                                                         const ImportSelector* selectors,
+                                                         size_t count,
+                                                         size_t* failed_index = nullptr);
+YUKIPLT_API Result<VersionedImportSnapshot> find_imports_named(const NamedImage& image,
+                                                               const ImportSelector* selectors,
+                                                               size_t count,
+                                                               size_t* failed_index = nullptr);
+YUKIPLT_API Result<FunctionImportSnapshot> find_function_imports(
+    const ImageView& image, const FunctionImportSelector* selectors, size_t count,
+    size_t* failed_index = nullptr);
+YUKIPLT_API Result<FunctionImportSnapshot> find_function_imports_named(
+    const NamedImage& image, const FunctionImportSelector* selectors, size_t count,
+    size_t* failed_index = nullptr);
 YUKIPLT_API HookResult hook_named(const NamedImage& image, const char* symbol_name,
                                   void* replacement, void** out_original,
                                   SlotReport* report = nullptr);

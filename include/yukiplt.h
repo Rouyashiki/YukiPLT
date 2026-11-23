@@ -217,7 +217,9 @@ enum {
   YUKIPLT_C_FEATURE_IDLE_STORAGE = 16,
   YUKIPLT_C_FEATURE_CACHED_MAPS = 17,
   YUKIPLT_C_FEATURE_CONTROLLED_FORK = 18,
-  YUKIPLT_C_FEATURE_MT_FORK = 19
+  YUKIPLT_C_FEATURE_MT_FORK = 19,
+  YUKIPLT_C_FEATURE_BATCH_SELECT = 20,
+  YUKIPLT_C_FEATURE_BULK_TARGETS = 21
 };
 
 enum {
@@ -606,6 +608,25 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_select_import(const yukiplt_c_image*,
 YUKIPLT_API yukiplt_c_error
 yukiplt_c_select_function_import(const yukiplt_c_image*, const yukiplt_c_function_selector*,
                                  yukiplt_c_import_snapshot*) YUKIPLT_C_NOEXCEPT;
+// Ordered selections over one image. Repeated requests are allowed. Function
+// selectors share one source mask. failed_index is optional and set to SIZE_MAX
+// on success and global errors including allocation failure. Errors publish no snapshot.
+// skipped_relocations counts records skipped while scanning the requested sources.
+YUKIPLT_API yukiplt_c_error yukiplt_c_select_imports(const yukiplt_c_image* image,
+                                                     const yukiplt_c_selector* selectors,
+                                                     size_t count, yukiplt_c_import_snapshot* out,
+                                                     size_t* failed_index) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_select_imports_named(const yukiplt_c_named_image* image,
+                                                           const yukiplt_c_selector* selectors,
+                                                           size_t count,
+                                                           yukiplt_c_import_snapshot* out,
+                                                           size_t* failed_index) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_select_function_imports(
+    const yukiplt_c_image* image, const yukiplt_c_function_selector* selectors, size_t count,
+    yukiplt_c_import_snapshot* out, size_t* failed_index) YUKIPLT_C_NOEXCEPT;
+YUKIPLT_API yukiplt_c_error yukiplt_c_select_function_imports_named(
+    const yukiplt_c_named_image* image, const yukiplt_c_function_selector* selectors, size_t count,
+    yukiplt_c_import_snapshot* out, size_t* failed_index) YUKIPLT_C_NOEXCEPT;
 YUKIPLT_API yukiplt_c_error yukiplt_c_import_snapshot_destroy(yukiplt_c_import_snapshot*)
     YUKIPLT_C_NOEXCEPT;
 // Same buffer contract as image_list_copy. kind and skipped are mandatory output
@@ -688,6 +709,11 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_plan_target(const yukiplt_c_plan*, size_t 
                                                   yukiplt_c_target_record*, char* text,
                                                   size_t capacity,
                                                   size_t* required_text) YUKIPLT_C_NOEXCEPT;
+// Copies every target in input order, using the image-list two-buffer protocol.
+YUKIPLT_API yukiplt_c_error yukiplt_c_plan_targets_copy(
+    const yukiplt_c_plan*, yukiplt_c_target_record* rows, size_t capacity, char* text,
+    size_t text_capacity, size_t* required_count, size_t* required_text) YUKIPLT_C_NOEXCEPT;
+
 YUKIPLT_API yukiplt_c_error yukiplt_c_prepare_session(const yukiplt_c_plan*,
                                                       yukiplt_c_session*) YUKIPLT_C_NOEXCEPT;
 // Destroy refuses any live/recovery handle with INVALID_ARGUMENT and retains
@@ -710,6 +736,11 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_session_target(const yukiplt_c_session*, s
                                                      yukiplt_c_target_record*, char* text,
                                                      size_t capacity,
                                                      size_t* required_text) YUKIPLT_C_NOEXCEPT;
+// Copies every target in input order, using the image-list two-buffer protocol.
+YUKIPLT_API yukiplt_c_error yukiplt_c_session_targets_copy(
+    const yukiplt_c_session*, yukiplt_c_target_record* rows, size_t capacity, char* text,
+    size_t text_capacity, size_t* required_count, size_t* required_text) YUKIPLT_C_NOEXCEPT;
+
 // group is required; indices NULL/capacity zero is count-only. On insufficient
 // capacity only required_indices is updated. No core handle is exposed.
 YUKIPLT_API yukiplt_c_error yukiplt_c_session_group_copy(

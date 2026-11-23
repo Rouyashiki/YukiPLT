@@ -20,6 +20,7 @@
 #include "overrides.hpp"
 #include "registry.hpp"
 #include "versioned_elf.hpp"
+#include "yukiplt.h"
 #include "yukiplt.hpp"
 
 namespace elf_inspector_checks {
@@ -533,15 +534,12 @@ TEST_F(FuncInstallFixture, LegacyBatchKeepsRequestOrderAndValidatesUnselectedImp
 }
 
 TEST_F(FuncInstallFixture, IndexedSelectorsPreserveCollisionsChainsAndErrorOrder) {
-  auto bucket = [](const std::string& name) {
-    size_t value = 2166136261u;
-    for (unsigned char c : name) value = (value ^ c) * 16777619u;
-    return value & 127;
-  };
+  const auto bucket = detail::SelectedRequests::initial_bucket;
   std::vector<std::string> names{"same_name", "same_name"};
+  const size_t collision_bucket = bucket(names[0]);
   for (size_t i = 0; names.size() < 64; ++i) {
     auto name = "collision_" + std::to_string(i);
-    if (bucket(name) == bucket(names[0])) names.push_back(std::move(name));
+    if (bucket(name) == collision_bucket) names.push_back(std::move(name));
   }
   for (size_t count : {8u, 9u, 64u}) {
     for (bool invalid_tail : {false, true}) {
@@ -712,6 +710,152 @@ TEST(Plans, LargeGroupsKeepIdentityOrderAndCrossImageRejections) {
 namespace versions_checks {
 using namespace yukiplt;
 using namespace yukiplt::test;
+
+TEST(Versions, BatchReportsSkippedRelocationsFromScannedSources) {
+  ElfBuilder builder;
+  auto image = builder.add_symbol("target", 1)
+                   .set_symbol_undefined(1)
+                   .add_jump_slot(1)
+                   .add_custom_rela(0, kNativeRelative)
+                   .add_rela(0, kNativeRelative)
+                   .build();
+  const ImageView view{image.load_bias(), image.phdr_table(), image.phdr_count, 1};
+  const ImportSelector selector{"target"};
+  auto versioned = find_imports(view, &selector, 1);
+  ASSERT_TRUE(versioned);
+  EXPECT_EQ(versioned.value().skipped_relocations, 1U);
+
+  const yukiplt_c_image c_view{view.load_bias, view.phdr_table, view.phdr_count,
+                               view.instance_token};
+  yukiplt_c_function_selector function = YUKIPLT_C_FUNCTION_SELECTOR("target");
+  function.sources = YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC;
+  yukiplt_c_import_snapshot snapshot{};
+  ASSERT_EQ(yukiplt_c_select_function_imports(&c_view, &function, 1, &snapshot, nullptr).code,
+            YUKIPLT_C_SUCCESS);
+  size_t count = 0, bytes = 0, skipped = 0;
+  uint32_t kind = 0;
+  EXPECT_EQ(yukiplt_c_import_snapshot_copy(&snapshot, nullptr, 0, nullptr, 0, &count, &bytes, &kind,
+                                           &skipped)
+                .code,
+            YUKIPLT_C_SUCCESS);
+  EXPECT_EQ(count, 1U);
+  EXPECT_EQ(skipped, 2U);
+  EXPECT_EQ(yukiplt_c_import_snapshot_destroy(&snapshot).code, YUKIPLT_C_SUCCESS);
+}
+
+TEST(Versions, BatchOwnsRepeatedResultsAndReturnsTheFirstInvalidRequest) {
+  VersionedElf fixture;
+  const ImportSelector exact{"versioned", VersionMatch::kExact, "VERSION_1"};
+  std::array<ImportSelector, 12> requests;
+  requests.fill(exact);
+  size_t failed = 0;
+  auto result = find_imports(fixture.view(), requests.data(), requests.size(), &failed);
+  ASSERT_TRUE(result);
+  EXPECT_EQ(failed, SIZE_MAX);
+  ASSERT_EQ(result.value().imports.size(), requests.size());
+  result.value().imports.front().version.name.clear();
+  EXPECT_EQ(result.value().imports.back().version.name, "VERSION_1");
+
+  const auto v = fixture.view();
+  const yukiplt_c_image c_image{v.load_bias, v.phdr_table, v.phdr_count, v.instance_token};
+  yukiplt_c_selector invalid[] = {YUKIPLT_C_SELECTOR("missing"), YUKIPLT_C_SELECTOR("versioned")};
+  invalid[1].version_match = UINT32_MAX;
+  yukiplt_c_import_snapshot out{};
+  EXPECT_EQ(yukiplt_c_select_imports(&c_image, invalid, 2, &out, &failed).code,
+            YUKIPLT_C_SYMBOL_NOT_FOUND);
+  EXPECT_EQ(failed, 0U);
+  invalid[0] = {exact.symbol, YUKIPLT_C_VERSION_EXACT, exact.version,
+                nullptr,      YUKIPLT_C_HIDDEN_ANY,    SIZE_MAX};
+  EXPECT_EQ(yukiplt_c_select_imports(&c_image, invalid, 2, &out, &failed).code,
+            YUKIPLT_C_INVALID_ARGUMENT);
+  EXPECT_EQ(failed, 1U);
+  EXPECT_EQ(out.token, 0U);
+}
+
+TEST(Versions, BatchChargesTheRequestIndexOnlyWhenUsed) {
+  for (size_t count : {8U, 9U}) {
+    const size_t records = sizeof(detail::VersionedImportView) + sizeof(uintptr_t) +
+                           (count + 1) * sizeof(VersionedImport);
+    // Leave fewer bytes than an index after copying all three strings per row.
+    const size_t length = (detail::ScanBudget{}.bytes - records) / count - 3;
+    const std::string name(length, 'a');
+    ElfBuilder builder;
+    auto image =
+        builder.add_symbol(name.c_str(), 1).set_symbol_undefined(1).add_jump_slot(1).build();
+    std::array<ImportSelector, 9> requests;
+    requests.fill({name.c_str()});
+    size_t failed = 0;
+    auto result = find_imports({image.load_bias(), image.phdr_table(), image.phdr_count, 1},
+                               requests.data(), count, &failed);
+    EXPECT_EQ(failed, SIZE_MAX);
+    if (count == 8) {
+      ASSERT_TRUE(result);
+      EXPECT_EQ(result.value().imports.size(), count);
+    } else {
+      ASSERT_FALSE(result);
+      EXPECT_EQ(result.error().code, ErrorCode::kOutOfBounds);
+    }
+  }
+}
+
+TEST(Versions, BatchResolvesSharedOffsetsAndSuffixesInRequestOrder) {
+  const std::string first(192, 'a'), second(192, 'b');
+  ElfBuilder builder;
+  builder.add_symbol(first.c_str(), 1)
+      .add_symbol(second.c_str(), 2)
+      .add_symbol("alias", 3)
+      .add_symbol("suffix", 4)
+      .add_symbol("tail", 5);
+  for (uint32_t symbol : {2U, 1U, 2U, 3U, 4U, 5U}) builder.add_jump_slot(symbol);
+  auto image = builder.build();
+  const ImageView view{image.load_bias(), image.phdr_table(), image.phdr_count, 1};
+  auto parsed = detail::inspect(view.load_bias, view.phdr_table, view.phdr_count);
+  ASSERT_TRUE(parsed);
+  auto* symbols = reinterpret_cast<NativeElfSym*>(parsed.value().symtab);
+  symbols[3].st_name = symbols[1].st_name;
+  symbols[4].st_name = symbols[1].st_name + 8;
+
+  for (size_t count : {2U, 9U}) {
+    std::array<ImportSelector, 9> requests;
+    requests.fill({first.c_str()});
+    for (auto& request : requests) request.relocation_index = 3;
+    requests[0].symbol = first.c_str() + 8;
+    requests[0].relocation_index = 4;
+    requests[1].symbol = second.c_str();
+    requests[1].relocation_index = 2;
+    size_t failed = 0;
+    auto result = find_imports(view, requests.data(), count, &failed);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(failed, SIZE_MAX);
+    ASSERT_EQ(result.value().imports.size(), count);
+    for (size_t i = 0; i < count; ++i) {
+      const auto& row = result.value().imports[i].import;
+      EXPECT_EQ(row.symbol, requests[i].symbol);
+      EXPECT_EQ(row.symbol_index, i == 0 ? 4U : i == 1 ? 2U : 3U);
+      EXPECT_EQ(row.relocation_index, requests[i].relocation_index);
+      EXPECT_EQ(row.slot_address, image.got_slot_addr(requests[i].relocation_index));
+    }
+    requests[count - 1].relocation_index = SIZE_MAX;
+    result = find_imports(view, requests.data(), count, &failed);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ErrorCode::kAmbiguousSymbol);
+    EXPECT_EQ(failed, count - 1);
+    requests[count - 1] = {};
+    result = find_imports(view, requests.data(), count, &failed);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error().code, ErrorCode::kNullPointer);
+    EXPECT_EQ(failed, count - 1);
+  }
+
+  auto* strings = reinterpret_cast<char*>(parsed.value().strtab);
+  std::memset(strings + symbols[5].st_name, 'x', parsed.value().strsz - symbols[5].st_name);
+  const ImportSelector invalid{};
+  size_t failed = 0;
+  auto damaged = find_imports(view, &invalid, 1, &failed);
+  ASSERT_FALSE(damaged);
+  EXPECT_EQ(damaged.error().code, ErrorCode::kCorruptedElf);
+  EXPECT_EQ(failed, SIZE_MAX);
+}
 
 TEST(Versions, VersymCannotAliasNamedVersionRecordsOrChangeSelection) {
   for (bool definitions : {false, true}) {

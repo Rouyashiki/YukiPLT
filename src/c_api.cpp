@@ -419,7 +419,9 @@ yukiplt_c_error yukiplt_c_trim_idle_storage(void) noexcept {
 }
 
 int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
-  return feature_id == YUKIPLT_C_FEATURE_CACHED_MAPS ||
+  return feature_id == YUKIPLT_C_FEATURE_BATCH_SELECT ||
+         feature_id == YUKIPLT_C_FEATURE_BULK_TARGETS ||
+         feature_id == YUKIPLT_C_FEATURE_CACHED_MAPS ||
          feature_id == YUKIPLT_C_FEATURE_CONTROLLED_FORK ||
          feature_id == YUKIPLT_C_FEATURE_MT_FORK ||
          feature_id == YUKIPLT_C_FEATURE_FUNCTION_IMPORTS ||

@@ -258,6 +258,38 @@ TEST(Txn, SixteenKPageGroupsSlotsFourKApart) {
   EXPECT_EQ(fp.protect_calls, 2);
 }
 
+TEST(Txn, ReadOnlyPreparationRejectsWritesAcrossBatchSizes) {
+  for (size_t count : {1u, 65u}) {
+    FakePlatform fp;
+    fp.map_page(kPageA, kRO);
+    std::vector<uintptr_t> slots;
+    std::vector<SlotOp> writes;
+    for (size_t i = 0; i < count; ++i) {
+      auto slot = kPageA + i * sizeof(uintptr_t);
+      slots.push_back(slot);
+      fp.set(slot, i);
+      writes.push_back(op(slot, i, i + 1));
+    }
+    Txn read(fp.ops(), 0x1000);
+    ASSERT_TRUE(read.prepare_read_only(slots.data(), count).ok());
+    uintptr_t value = 0;
+    ASSERT_TRUE(read.load(slots.back(), value));
+    EXPECT_EQ(value, count - 1);
+    EXPECT_TRUE(read.commit(writes.data(), count, CommitMode::kAllOrNothing).invalid);
+    EXPECT_EQ(read.protect_page(kPageA, kRW), EINVAL);
+
+    Txn write(fp.ops(), 0x1000);
+    ASSERT_TRUE(write.prepare(slots.data(), count).ok());
+    writes.push_back(writes.back());
+    EXPECT_TRUE(write.commit(writes.data(), writes.size(), CommitMode::kAllOrNothing).invalid);
+    EXPECT_EQ(fp.protect_calls, 0);
+    EXPECT_EQ(fp.cas_calls, 0);
+    writes.pop_back();
+    EXPECT_TRUE(write.commit(writes.data(), count, CommitMode::kAllOrNothing).all_committed);
+    EXPECT_EQ(fp.cas_calls, static_cast<int>(count));
+  }
+}
+
 TEST(Txn, ConflictRollsBackEarlierSlotsInReverse) {
   FakePlatform fp;
   fp.map_page(kPageA, kRO);

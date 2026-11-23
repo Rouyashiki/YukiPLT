@@ -623,6 +623,7 @@ bool Registry::cache_bound(const MapsCacheState* cache) const noexcept {
   return false;
 }
 Error Registry::prepare_cache_update(const MapsCacheState* cache, MapsCacheState& next) const {
+  if (free_list_.size() == records_.size()) return Error::Ok();
   for (const auto& record : records_) {
     if (!record.in_use || record.image.invalidated) continue;
     if (!cache || record.cache.get() != cache) {

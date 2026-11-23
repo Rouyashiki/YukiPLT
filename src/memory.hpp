@@ -195,7 +195,10 @@ class Txn {
   ///
   /// May throw std::bad_alloc; call it before any write.
   Error prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* extra_pages = nullptr,
-                size_t extra_count = 0, CauseContext* cause = nullptr);
+                size_t extra_count = 0, CauseContext* cause = nullptr, bool read_only = false);
+  Error prepare_read_only(const uintptr_t* slots, size_t count) {
+    return prepare(slots, count, nullptr, 0, nullptr, true);
+  }
 
   /// Atomically load a prepared slot.  Returns false if `slot` was not
   /// prepared (its page has not been confirmed mapped and readable).
@@ -260,6 +263,7 @@ class Txn {
   SmallVec<Page, 4> pages_;
   SmallVec<uintptr_t, 8> slots_;    ///< Prepared slots, sorted.
   SmallVec<uint8_t, 8> slot_seen_;  ///< Scratch for commit's duplicate check.
+  bool read_only_ = false;
   bool prepared_ = false;
   bool committed_ = false;
 };

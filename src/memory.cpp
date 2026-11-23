@@ -369,7 +369,7 @@ int prot_of(const VmaInfo& vma) noexcept {
 }
 
 Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* extra_pages,
-                   size_t extra_count, CauseContext* cause) {
+                   size_t extra_count, CauseContext* cause, bool read_only) {
   if (prepared_) return Error::Make(ErrorCode::kInvalidArgument);
   if (page_size_ == 0 || (page_size_ & (page_size_ - 1)) != 0)
     return Error::Make(ErrorCode::kInvalidArgument);
@@ -450,9 +450,12 @@ Error Txn::prepare(const uintptr_t* slots, size_t slot_count, const uintptr_t* e
     pages_.push_back(p);
   }
   slot_seen_.clear();
-  slot_seen_.reserve(slots_.size());
-  for (size_t i = 0; i < slots_.size(); ++i) slot_seen_.push_back(0);
+  if (!read_only) {
+    slot_seen_.reserve(slots_.size());
+    for (size_t i = 0; i < slots_.size(); ++i) slot_seen_.push_back(0);
+  }
 
+  read_only_ = read_only;
   prepared_ = true;
   return Error::Ok();
 }
@@ -507,7 +510,7 @@ int Txn::protect(uintptr_t page, int prot) noexcept {
 }
 
 int Txn::protect_page(uintptr_t page, int prot) noexcept {
-  if (!prepared_) return EINVAL;
+  if (!prepared_ || read_only_) return EINVAL;
   size_t i = find_page(page);
   if (i == pages_.size() || pages_[i].base != page) return EINVAL;
   return protect(page, prot);
@@ -547,7 +550,7 @@ void Txn::restore_pages(CommitResult& result) noexcept {
 CommitResult Txn::commit(SlotOp* ops, size_t count, CommitMode mode, void (*before_cas)(void*),
                          void* ctx) noexcept {
   CommitResult result;
-  if (!prepared_ || committed_ || ops == nullptr || count == 0) {
+  if (!prepared_ || read_only_ || committed_ || ops == nullptr || count == 0) {
     result.invalid = true;
     return result;
   }

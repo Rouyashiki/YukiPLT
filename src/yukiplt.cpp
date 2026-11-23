@@ -164,6 +164,26 @@ struct PlannedSlot {
   uintptr_t expected_current = 0;
 };
 
+class BatchAddresses {
+ public:
+  bool insert(uintptr_t address) noexcept {
+    auto& stored = entries_[position(address)];
+    if (stored) return false;
+    stored = address;
+    return true;
+  }
+  bool contains(uintptr_t address) const noexcept { return entries_[position(address)] != 0; }
+
+ private:
+  size_t position(uintptr_t address) const noexcept {
+    size_t bucket = ((address / sizeof(uintptr_t)) ^ (address >> 9) ^ (address >> 17)) & 127;
+    while (entries_[bucket] && entries_[bucket] != address) bucket = (bucket + 1) & 127;
+    return bucket;
+  }
+  // At most 64 aligned, nonzero addresses in a batch.
+  uintptr_t entries_[128]{};
+};
+
 /// Every non-null original-pointer output must be pointer-aligned (the release
 /// store is an atomic access) and distinct within one transaction, so one
 /// target's original can never overwrite another's.  Checked before any lock
@@ -171,12 +191,20 @@ struct PlannedSlot {
 template <typename Request>
 Error validate_outputs(const Request* reqs, size_t count,
                        detail::CauseContext* cause = nullptr) noexcept {
+  std::optional<BatchAddresses> outputs;
   for (size_t i = 0; i < count; ++i) {
     void** out = reqs[i].out_original;
     if (out == nullptr) continue;
     if (reinterpret_cast<uintptr_t>(out) % alignof(void*) != 0)
       return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
                                 ErrorCause::kInvalidRequest, cause);
+    if (count >= 16) {
+      if (!outputs) outputs.emplace();
+      if (!outputs->insert(reinterpret_cast<uintptr_t>(out)))
+        return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
+                                  ErrorCause::kOutputAlias, cause);
+      continue;
+    }
     for (size_t j = 0; j < i; ++j) {
       if (reqs[j].out_original == out)
         return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
@@ -341,14 +369,23 @@ HookResult install_planned(const ImageView& view, SlotReport* reports, size_t re
   // update. Reject aliasing a transaction target or another live owner before
   // claiming slots, touching page permissions, or publishing any original.
   Registry& reg = Registry::instance();
+  std::optional<BatchAddresses> target_addresses;
   for (const auto& slot : planned) {
     const uintptr_t output = reinterpret_cast<uintptr_t>(slot.out_original);
     if (output == 0) continue;
     const Error alias = detail::with_cause(Error::Make(ErrorCode::kInvalidArgument),
                                            ErrorCause::kOutputAlias, cause);
     if (reg.owns_slot(output)) return {alias, HookHandle{}};
-    for (const auto& target : planned)
-      if (output == target.address) return {alias, HookHandle{}};
+    if (planned.size() >= 16) {
+      if (!target_addresses) {
+        target_addresses.emplace();
+        for (const auto& target : planned) target_addresses->insert(target.address);
+      }
+      if (target_addresses->contains(output)) return {alias, HookHandle{}};
+    } else {
+      for (const auto& target : planned)
+        if (output == target.address) return {alias, HookHandle{}};
+    }
   }
 
   if (reg.ids_exhausted()) return {Error::Make(ErrorCode::kIntegerOverflow), HookHandle{}};
@@ -1312,25 +1349,12 @@ Error do_restore(uint64_t id, HookHandle& handle, bool image_live, SlotReport* r
   return Error::Make(ErrorCode::kSlotModifiedExternally);
 }
 
-/// Read a group's image token under the op lock, without changing its state.
-/// Returns kInvalidArgument for a bad id.  Used to route unhook to the system
-/// (linker-lock) or custom path before touching registry state.
-Error peek_image(uint64_t id, ImageIdentity& out) {
-  ImageIdentity image;
-  SlotRecord recs[1];
-  size_t n = 0;
-  Error e = Registry::instance().snapshot(id, image, recs, 1, &n);
-  if (e) return e;
-  out = image;
-  return Error::Ok();
-}
-
 }  // namespace
 
 namespace {
 Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
                   RecoveryDiagnostic* diagnostic, detail::CauseContext* cause = nullptr,
-                  MapsCache* cache = nullptr) {
+                  MapsCache* cache = nullptr, size_t* report_count = nullptr) {
   if (Error e = detail::process_entry()) return e;
   if (!handle.valid())
     return detail::with_cause(Error::Make(ErrorCode::kInvalidArgument), ErrorCause::kHandleInvalid,
@@ -1342,7 +1366,7 @@ Error unhook_impl(HookHandle& handle, SlotReport* reports, size_t cap,
     std::string system_path;
     {
       std::lock_guard<std::mutex> lock(detail::op_mutex());
-      Error peek = peek_image(id, image);
+      Error peek = Registry::instance().snapshot(id, image, nullptr, 0, report_count);
       if (peek)
         return peek.code == ErrorCode::kInvalidArgument
                    ? detail::with_cause(peek, ErrorCause::kHandleInvalid, cause)
@@ -1417,6 +1441,20 @@ HookResult diagnosed_install(OperationDiagnostic* diagnostic, Call&& call) {
   return result;
 }
 }  // namespace
+
+Error detail::unhook_for_c(const AdmittedOperation& admission, MapsCache* cache, HookHandle& handle,
+                           SlotReport* reports, size_t cap, size_t& count,
+                           OperationDiagnostic* diagnostic) {
+  if (admission.error()) return admission.error();
+  if (!diagnostic) return unhook_impl(handle, reports, cap, nullptr, nullptr, cache, &count);
+  CauseContext cause;
+  RecoveryDiagnostic recorded;
+  const bool held = handle.valid();
+  const Error error = unhook_impl(handle, reports, cap, &recorded, &cause, cache, &count);
+  finish_diagnostic(diagnostic, recorded, error, &cause);
+  diagnostic->handle_consumed = held && !handle.valid();
+  return error;
+}
 
 Error unhook(HookHandle& handle, SlotReport* reports, size_t cap) {
   yukiplt::detail::OperationGuard admission;
@@ -2215,7 +2253,7 @@ Error detail::verify_installed_bindings(InstalledBindingVerification* entries, s
         prepared = Error::Make(ErrorCode::kUnsupportedFormat);
       } else {
         if (statistics && !cache) ++statistics->maps_reads;
-        prepared = transaction.prepare(addresses.data(), addresses.size());
+        prepared = transaction.prepare_read_only(addresses.data(), addresses.size());
       }
       if (prepared.code == ErrorCode::kOutOfMemory) return prepared;
       for (size_t i = found->begin; i < found->end; ++i) {
@@ -2305,7 +2343,7 @@ Error fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* 
   uintptr_t addrs[kMaxBatch];
   for (size_t i = 0; i < filled; ++i) addrs[i] = recs[i].address;
   Txn all(detail::active_ops(), ps, cache);
-  Error prepared = all.prepare(addrs, filled);
+  Error prepared = all.prepare_read_only(addrs, filled);
   if (!prepared) {
     for (size_t i = 0; i < filled; ++i) {
       uintptr_t cur = 0;
@@ -2320,7 +2358,7 @@ Error fill_query(const SlotRecord* recs, size_t n, bool live_image, SlotReport* 
   for (size_t i = 0; i < filled; ++i) {
     Txn txn(detail::active_ops(), ps, cache);
     uintptr_t one = recs[i].address;
-    if (!txn.prepare(&one, 1)) {
+    if (!txn.prepare_read_only(&one, 1)) {
       uintptr_t cur = 0;
       if (txn.load(recs[i].address, cur)) {
         out[i].value_observed = cur;

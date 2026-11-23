@@ -71,6 +71,8 @@ struct PageResidueRecord {
 // randomness blocks claims. The salt detects misuse, not a security boundary.
 struct MapsCacheState;
 struct CachedPage;
+Error unhook_for_c(const AdmittedOperation&, MapsCache*, HookHandle&, SlotReport*, size_t, size_t&,
+                   OperationDiagnostic*);
 class Registry {
  public:
   static constexpr uint64_t kInvalidId = ~uint64_t(0);

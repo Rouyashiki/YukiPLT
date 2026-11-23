@@ -2005,7 +2005,15 @@ class OriginalSlot {
   OriginalSlot& operator=(const OriginalSlot&) = delete;
   OriginalSlot(OriginalSlot&&) = delete;
   OriginalSlot& operator=(OriginalSlot&&) = delete;
-  [[nodiscard]] Fn load() const noexcept { return reinterpret_cast<Fn>(load_original(&value_)); }
+  [[nodiscard]] Fn load() const noexcept {
+#if defined(__clang__) || defined(__GNUC__)
+    // Order the caller's preceding GOT read as well as the original pointer load.
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return reinterpret_cast<Fn>(__atomic_load_n(&value_, __ATOMIC_ACQUIRE));
+#else
+    return reinterpret_cast<Fn>(load_original(&value_));
+#endif
+  }
   [[nodiscard]] void** output_address() noexcept { return &value_; }
   [[nodiscard]] FunctionHookRequest request(const FunctionImportSelector& selector,
                                             Fn replacement) noexcept {

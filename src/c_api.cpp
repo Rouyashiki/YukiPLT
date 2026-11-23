@@ -349,13 +349,11 @@ yukiplt_c_error yukiplt_c_unhook(yukiplt_c_handle* handle, yukiplt_c_slot_report
     BorrowedHandle borrowed(handle->token);
     SlotReport reports[kLimit];
     size_t count = 0;
-    // Count-only query does not touch GOT or allocate transaction pages.
-    Error queried = query(borrowed.value, nullptr, 0, &count);
-    if (queried) return queried;
-    const size_t n = std::min({count, capacity, kLimit});
-    Error result = unhook(borrowed.value, reports, n);
+    const size_t cap = output ? std::min(capacity, kLimit) : 0;
+    Error result = detail::unhook_for_c(admission.context(), nullptr, borrowed.value,
+                                        output ? reports : nullptr, cap, count, nullptr);
     handle->token = token(borrowed.value);
-    copy_reports(output, reports, n);
+    copy_reports(output, reports, std::min(count, cap));
     return result;
   });
 }
@@ -586,17 +584,11 @@ yukiplt_c_error yukiplt_c_unhook_diagnosed(yukiplt_c_handle* handle, yukiplt_c_s
         BorrowedHandle borrowed(handle->token);
         SlotReport reports[kLimit];
         size_t count = 0;
-        // Count-only query does not touch GOT or allocate transaction pages.
-        Error queried = query(borrowed.value, nullptr, 0, &count);
-        if (queried) {
-          if (queried.code == ErrorCode::kInvalidArgument)
-            operation.cause = ErrorCause::kHandleInvalid;
-          return queried;
-        }
-        const size_t n = std::min({count, capacity, kLimit});
-        Error result = unhook_diagnosed(borrowed.value, reports, n, &operation);
+        const size_t cap = output ? std::min(capacity, kLimit) : 0;
+        Error result = detail::unhook_for_c(admission.context(), nullptr, borrowed.value,
+                                            output ? reports : nullptr, cap, count, &operation);
         handle->token = token(borrowed.value);
-        copy_reports(output, reports, n);
+        copy_reports(output, reports, std::min(count, cap));
         return result;
       },
       &operation);
@@ -1153,17 +1145,11 @@ yukiplt_c_error yukiplt_c_unhook_diagnosed_cached(
         BorrowedHandle borrowed(handle->token);
         SlotReport reports[kLimit];
         size_t count = 0;
-        // Count-only query does not touch GOT or allocate transaction pages.
-        Error queried = query(borrowed.value, nullptr, 0, &count);
-        if (queried) {
-          if (queried.code == ErrorCode::kInvalidArgument)
-            operation.cause = ErrorCause::kHandleInvalid;
-          return queried;
-        }
-        const size_t n = std::min({count, capacity, kLimit});
-        Error result = unhook_cached(lease->value, borrowed.value, reports, n, &operation);
+        const size_t cap = output ? std::min(capacity, kLimit) : 0;
+        Error result = detail::unhook_for_c(admission.context(), &lease->value, borrowed.value,
+                                            output ? reports : nullptr, cap, count, &operation);
         handle->token = token(borrowed.value);
-        copy_reports(output, reports, n);
+        copy_reports(output, reports, std::min(count, cap));
         return result;
       },
       &operation);

@@ -7,9 +7,12 @@ JNI, Java, daemon or private linker dependency.
 | ABI | Support | Native relocations |
 | --- | --- | --- |
 | `arm64-v8a` | Official, guaranteed | ELF64 RELA, APS2 RELA |
-| `armeabi-v7a` | Official, guaranteed; low-SDK runtime verification pending | ELF32 REL, APS2 REL |
+| `armeabi-v7a` | Official, guaranteed | ELF32 REL, APS2 REL |
 | `x86_64` | Official, environment-dependent | ELF64 RELA, APS2 RELA |
 | `x86` | Official, environment-dependent | ELF32 REL, APS2 REL |
+
+The `armeabi-v7a` build passed runtime tests on a Samsung Galaxy Note5 (SM-N9200)
+running Android 7.0 (API 24), both from `adb shell` and in a regular app.
 
 Each artifact handles only its process's native ABI. Other architectures and
 API 21–22 are unsupported. Page size is detected at runtime; shared artifacts

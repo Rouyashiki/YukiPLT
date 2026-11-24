@@ -20,9 +20,9 @@
 
 /// \brief Portable ELF type definitions for YukiPLT.
 ///
-/// On Linux/Android, <elf.h> provides these.  On other hosts (Windows, macOS)
-/// portable definitions are provided for other hosts.
-/// Values come from the ELF specification and supported architecture ELF ABIs.
+/// On Linux/Android, <elf.h> provides these.  On other hosts (Windows, macOS),
+/// portable definitions are provided from the ELF specification and the
+/// supported architecture ELF psABIs.
 
 #if defined(__linux__) || defined(__ANDROID__)
 #include <elf.h>
@@ -182,7 +182,11 @@ struct Elf64_Rela {
 #define ET_DYN 3
 
 // --- e_machine ---
+#define EM_386 3
+#define EM_ARM 40
+#define EM_X86_64 62
 #define EM_AARCH64 183
+#define EM_RISCV 243
 
 // --- p_type ---
 #define PT_NULL 0
@@ -256,25 +260,59 @@ using Elf32_Verdef = Elf64_Verdef;
 using Elf32_Verdaux = Elf64_Verdaux;
 
 // --- Relocation info macros ---
+#define ELF32_R_SYM(info) ((info) >> 8)
+#define ELF32_R_TYPE(info) ((unsigned char)(info))
+#define ELF32_R_INFO(sym, type) (((Elf32_Word)(sym) << 8) + (unsigned char)(type))
 #define ELF64_R_SYM(info) ((info) >> 32)
 #define ELF64_R_TYPE(info) ((info) & 0xffffffffULL)
 #define ELF64_R_INFO(sym, type) (((Elf64_Xword)(sym) << 32) | ((type) & 0xffffffffULL))
 
-// --- AArch64 relocation types ---
+// --- Supported architecture relocation types ---
+#define R_AARCH64_NONE 0
+#define R_AARCH64_ABS64 257
 #define R_AARCH64_GLOB_DAT 1025
 #define R_AARCH64_JUMP_SLOT 1026
 #define R_AARCH64_RELATIVE 1027
 #define R_AARCH64_IRELATIVE 1032
+#define R_ARM_NONE 0
+#define R_ARM_ABS32 2
+#define R_ARM_GLOB_DAT 21
+#define R_ARM_JUMP_SLOT 22
+#define R_ARM_RELATIVE 23
+#define R_ARM_IRELATIVE 160
+#define R_X86_64_NONE 0
+#define R_X86_64_64 1
+#define R_X86_64_GLOB_DAT 6
+#define R_X86_64_JUMP_SLOT 7
+#define R_X86_64_RELATIVE 8
+#define R_X86_64_IRELATIVE 37
+#define R_386_NONE 0
+#define R_386_32 1
+#define R_386_GLOB_DAT 6
+#define R_386_JMP_SLOT 7
+#define R_386_RELATIVE 8
+#define R_386_IRELATIVE 42
+#define R_RISCV_NONE 0
+#define R_RISCV_64 2
+#define R_RISCV_RELATIVE 3
+#define R_RISCV_JUMP_SLOT 5
+#define R_RISCV_IRELATIVE 58
 
 // --- Symbol binding / type macros ---
+#define ELF32_ST_BIND(info) ((info) >> 4)
+#define ELF32_ST_TYPE(info) ((info) & 0xf)
+#define ELF32_ST_INFO(bind, type) (((bind) << 4) + ((type) & 0xf))
 #define ELF64_ST_BIND(info) ((info) >> 4)
 #define ELF64_ST_TYPE(info) ((info) & 0xf)
 #define ELF64_ST_INFO(bind, type) (((bind) << 4) | ((type) & 0xf))
 
 #define STB_GLOBAL 1
 #define STB_WEAK 2
-#define STT_FUNC 2
+#define STT_NOTYPE 0
 #define STT_OBJECT 1
+#define STT_FUNC 2
+#define STT_TLS 6
+#define STT_GNU_IFUNC 10
 
 #define SHN_UNDEF 0
 
@@ -315,9 +353,12 @@ using NativeElfHalf = uint16_t;
 using NativeElfWord = uint32_t;
 
 inline constexpr bool kNativeUsesRela = YUKIPLT_USES_RELA != 0;
+inline constexpr bool kNativeHasGlobDat = YUKIPLT_HAS_GLOB_DAT != 0;
+inline constexpr bool kNativeHasRiscv64FunctionAddress = YUKIPLT_HAS_RISCV64_FUNCTION_ADDRESS;
 inline constexpr size_t kNativeSlotSize = YUKIPLT_ELF_BITS / 8;
 inline constexpr uint16_t kNativeMachine = YUKIPLT_ELF_MACHINE;
 inline constexpr uint32_t kNativeJumpSlot = YUKIPLT_RELOC_JUMP_SLOT;
+// Zero placeholder when !kNativeHasGlobDat (matches R_*_NONE); guard with kNativeHasGlobDat.
 inline constexpr uint32_t kNativeGlobDat = YUKIPLT_RELOC_GLOB_DAT;
 inline constexpr uint32_t kNativeRelative = YUKIPLT_RELOC_RELATIVE;
 inline constexpr uint32_t kNativeIRelative = YUKIPLT_RELOC_IRELATIVE;
@@ -694,11 +735,11 @@ class [[nodiscard]] Expected<void, E> {
 namespace yukiplt {
 // Read non-null, aligned, stable and live out_original storage with an acquire
 // fence before the acquire load. An acquire load alone does not order an earlier
-// ARM GOT read. No validation, allocation or locking. The stored value may be
+// ARM or RISC-V GOT read. No validation, allocation or locking. The stored value may be
 // null; a non-null value proves neither installation, provider identity nor quiescence.
 YUKIPLT_API void* load_original(void* const* storage) noexcept;
 
-// Android API23+ PLT/GOT hooks. Bind imports first; keep images, original
+// Android API23+ (RISC-V64 API37+) PLT/GOT hooks. Bind imports first; keep images, original
 // outputs and replacement code/context alive through recovery and quiescence.
 // Read originals with load_original or OriginalSlot::load; never clear or reuse them.
 // Select one slot explicitly; duplicate records are corrupt. Hooks affect future
@@ -950,9 +991,11 @@ YUKIPLT_API HookResult hook_import(const ImageView& image, const ImportSelector&
                                    SlotReport* report = nullptr);
 YUKIPLT_API HookResult hook_imports(const ImageView& image, const SelectedHookRequest* reqs,
                                     size_t count, SlotReport* reports = nullptr);
-// Explicit function sources/types extend the JUMP_SLOT APIs with GLOB_DAT.
-// Every match must be an undefined STT_FUNC with zero effective addend; only
-// GLOB_DAT also requires a nonzero current value. Any ineligible match rejects
+// Explicit function sources/types extend JUMP_SLOT with GLOB_DAT where
+// kNativeHasGlobDat holds (UnsupportedFormat on RISC-V64).
+// Every match must be an undefined STT_FUNC with zero effective addend.
+// GLOB_DAT and explicitly requested R_RISCV_64 function addresses also require
+// a nonzero current value. Any ineligible match rejects
 // the whole operation. RELA uses r_addend; Android REL binding uses no addend.
 // Scanned function records validate versions; legacy name-only APIs do not.
 // Import STT_FUNC cannot exclude an IFUNC provider. Cached pointers remain valid
@@ -974,8 +1017,14 @@ inline constexpr uint32_t kSourceNativeAndroidPacked =
 /// Which relocation types to accept (a bitmask over these bits).
 enum RelocationTypeBit : uint32_t {
   kTypeJumpSlot = 1u << 0,  ///< YUKIPLT_RELOC_JUMP_SLOT.
-  kTypeGlobDat = 1u << 1,   ///< YUKIPLT_RELOC_GLOB_DAT (function, addend 0, UND FUNC).
+  kTypeGlobDat = 1u << 1,   ///< YUKIPLT_RELOC_GLOB_DAT (where distinct; UnsupportedFormat on RV64).
+  /// Opt in to R_RISCV_64 function addresses in GOT or ordinary data slots on RV64.
+  /// Synchronize ordinary data accesses with installation, unhook and recovery.
+  kTypeRiscv64FunctionAddress = 1u << 2,
 };
+
+inline constexpr uint32_t kTypeNativeFunctions =
+    kNativeHasGlobDat ? (kTypeJumpSlot | kTypeGlobDat) : kTypeJumpSlot;
 
 /// The table a decoded function import came from.
 enum class RelocationSource : uint8_t {
@@ -998,11 +1047,9 @@ struct FunctionImport {
 
 struct FunctionImportSnapshot {
   std::vector<FunctionImport> imports;
-  /// Records in a scanned source that are neither JUMP_SLOT nor GLOB_DAT, or
-  /// have symbol index 0.  A JUMP_SLOT or GLOB_DAT is listed in `imports`
-  /// whichever scanned table holds it (labelled with its real source and type),
-  /// so a GLOB_DAT inside DT_JMPREL is listed, not skipped.  This differs from
-  /// inspect_imports(), which counts such a record as skipped.
+  /// Records outside the scanned function types or with symbol index zero.
+  /// A source-only snapshot scans native JUMP_SLOT/GLOB_DAT in every requested
+  /// table. A selector can additionally enable R_RISCV_64 for its own sources.
   size_t skipped_relocations = 0;
 };
 
@@ -1037,7 +1084,7 @@ YUKIPLT_API Result<FunctionImport> find_function_import(const ImageView& image,
 
 /// Install one / several function hooks on one image, same transaction,
 /// ownership, recovery and original-pointer contract as hook_import()/
-/// hook_imports().  A batch mixing JUMP_SLOT and GLOB_DAT slots on one image
+/// hook_imports(). A batch mixing eligible function relocation types on one image
 /// runs as a single transaction and is limited to 64 distinct slots.
 YUKIPLT_API HookResult hook_function_import(const ImageView& image,
                                             const FunctionImportSelector& selector,
@@ -1971,7 +2018,7 @@ struct CandidateSelection {
 /// text; empty exact matches only empty text.
 /// A kAny match requires empty text. Duplicate image instances/selected slots
 /// are errors. A matched ineligible relocation fails rather than being skipped;
-/// GLOB_DAT current-value conditions are deferred to installation.
+/// Current-value conditions for GLOB_DAT and R_RISCV_64 are deferred to installation.
 /// Limits may only be lowered. Text counts path+symbol bytes once per examined
 /// source/type record. These are not total snapshot/process/host memory limits.
 /// Snapshot acquisition additionally shares the function scanner's 2^22-record

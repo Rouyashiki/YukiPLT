@@ -23,6 +23,13 @@
 #include "yukiplt.h"
 #include "yukiplt.hpp"
 
+namespace {
+template <typename T>
+yukiplt::ErrorCode result_code(const yukiplt::Result<T>& result) {
+  return result ? yukiplt::ErrorCode::kSuccess : result.error().code;
+}
+}  // namespace
+
 namespace elf_inspector_checks {
 using namespace yukiplt;
 using namespace yukiplt::detail;
@@ -83,6 +90,24 @@ TEST(ElfInspector, ProgramHeaderViewMustMatchTheElfHeader) {
   ASSERT_FALSE(moved_view.has_value());
   EXPECT_EQ(moved_view.error().code, ErrorCode::kCorruptedElf);
 }
+
+#if defined(__riscv)
+TEST(ElfInspector, RequiresNativeRiscvCallingConvention) {
+  auto image = ElfBuilder().with_elf_header().build();
+  NativeElfEhdr header;
+  std::memcpy(&header, image.buffer.data(), sizeof(header));
+  constexpr uint32_t abi_mask = EF_RISCV_FLOAT_ABI | EF_RISCV_RVE;
+  const uint32_t native_abi = header.e_flags & abi_mask;
+  for (uint32_t flags = 0; flags <= (abi_mask | EF_RISCV_RVC); ++flags) {
+    header.e_flags = flags;
+    std::memcpy(image.buffer.data(), &header, sizeof(header));
+    auto result = inspect(image.load_bias(), image.phdr_table(), image.phdr_count);
+    const auto expected =
+        (flags & abi_mask) == native_abi ? ErrorCode::kSuccess : ErrorCode::kUnsupportedFormat;
+    EXPECT_EQ(result_code(result), expected) << flags;
+  }
+}
+#endif
 
 TEST(ElfInspector, MissingDtNull) {
   ElfBuilder b;
@@ -227,7 +252,8 @@ constexpr uint32_t kAll = kSourceJmprel | kSourceNativeDynamic | kSourceNativeAn
 
 namespace {
 
-constexpr uint64_t kGlobDatSym1 = yukiplt::native_reloc_info(1, YUKIPLT_RELOC_GLOB_DAT);
+constexpr uint64_t kGlobDatSym1 = yukiplt::native_reloc_info(
+    1, YUKIPLT_HAS_GLOB_DAT ? YUKIPLT_RELOC_GLOB_DAT : YUKIPLT_RELOC_JUMP_SLOT);
 
 struct RawAps2 {
   std::vector<uint8_t> bytes;
@@ -320,7 +346,7 @@ TEST(FunctionImportsAps2, OverlongOrOutOfRangeSlebRejected) {
 
 namespace {
 FunctionImportSelector sel(const char* symbol, uint32_t sources = kAll,
-                           uint32_t types = kTypeJumpSlot | kTypeGlobDat) {
+                           uint32_t types = kTypeNativeFunctions) {
   FunctionImportSelector s;
   s.base.symbol = symbol;
   s.sources = sources;
@@ -421,6 +447,14 @@ void* const kReplB = reinterpret_cast<void*>(uintptr_t{0xB000});
 
 }  // namespace
 
+TEST(FunctionImportsFeature, GlobDatFeatureMatchesNativeAbi) {
+  EXPECT_NE(yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS), 0);
+  EXPECT_EQ(yukiplt_c_has_feature(YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS) != 0, kNativeHasGlobDat);
+  EXPECT_EQ(yukiplt_c_has_feature(YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES) != 0,
+            kNativeHasRiscv64FunctionAddress);
+}
+
+#if YUKIPLT_HAS_GLOB_DAT
 TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModification) {
   ElfBuilder b;
   b.add_symbol("gfunc", 1).set_symbol_undefined(1);
@@ -429,6 +463,9 @@ TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModificat
   wr(image.rela_slot_addr(0), 0);
 
   const size_t baseline = live_groups();
+  EXPECT_EQ(
+      result_code(find_function_import(view(), sel("gfunc", kAll, kTypeRiscv64FunctionAddress))),
+      ErrorCode::kUnsupportedFormat);
   auto result = hook_function_import(view(), sel("gfunc"), kReplA, &outputs[0]);
   EXPECT_EQ(result.error.code, ErrorCode::kUnsupportedRelocation);
   EXPECT_FALSE(result.handle.valid());
@@ -437,13 +474,221 @@ TEST_F(FuncInstallFixture, ZeroValuedGlobDatSlotIsRefusedWholeBatchZeroModificat
   EXPECT_EQ(outputs[0], nullptr);
   EXPECT_EQ(live_groups(), baseline);
 }
+#else
+TEST_F(FuncInstallFixture, GlobDatTypeRejectedAndAbsoluteFunctionPointerSkipped) {
+  ElfBuilder b;
+  b.add_symbol("target", 1).set_symbol_undefined(1);
+  b.add_jump_slot(1);
+  b.add_rela(1, YUKIPLT_RELOC_ABSOLUTE, 0);
+  set_backing(b.build());
+  wr(image.got_slot_addr(0), 0x1111);
+  wr(image.rela_slot_addr(0), 0x2222);
+
+  EXPECT_EQ(result_code(find_function_import(view(), sel("target", kAll, kTypeGlobDat))),
+            ErrorCode::kUnsupportedFormat);
+  EXPECT_EQ(
+      result_code(find_function_import(view(), sel("target", kAll, kTypeJumpSlot | kTypeGlobDat))),
+      ErrorCode::kUnsupportedFormat);
+  EXPECT_EQ(
+      result_code(find_function_import(view(), sel("target", kAll, (1u << 31) | kTypeGlobDat))),
+      ErrorCode::kInvalidArgument);
+
+  auto bad_hook =
+      hook_function_import(view(), sel("target", kAll, kTypeGlobDat), kReplA, &outputs[0]);
+  EXPECT_EQ(bad_hook.error.code, ErrorCode::kUnsupportedFormat);
+  EXPECT_FALSE(bad_hook.handle.valid());
+  EXPECT_EQ(outputs[0], nullptr);
+
+  FunctionHookRequestEx bad_ex{sel("target", kAll, kTypeGlobDat), kReplA, &outputs[0], false, 0};
+  OperationDiagnostic diag{};
+  auto bad_diag = hook_function_imports_diagnosed(view(), &bad_ex, 1, nullptr, &diag);
+  EXPECT_EQ(bad_diag.error.code, ErrorCode::kUnsupportedFormat);
+  EXPECT_FALSE(bad_diag.handle.valid());
+  EXPECT_EQ(diag.stage, OperationStage::kPrepare);
+  EXPECT_EQ(diag.cause, ErrorCause::kNone);
+  EXPECT_EQ(diag.error.code, ErrorCode::kUnsupportedFormat);
+
+  RuleSet rules;
+  ImageSelector main_sel{};
+  EXPECT_EQ(
+      result_code(rules.add_rule(main_sel, sel("target", kAll, kTypeGlobDat), kReplA, nullptr, 0)),
+      ErrorCode::kUnsupportedFormat);
+
+  FunctionImportSelector batch[] = {sel("target"), sel("target", kAll, kTypeGlobDat)};
+  size_t failed = 0;
+  EXPECT_EQ(result_code(find_function_imports(view(), batch, 2, &failed)),
+            ErrorCode::kUnsupportedFormat);
+  EXPECT_EQ(failed, 1u);
+  const NativeElfPhdr empty_phdr{};
+  const ImageView missing_dyn{image.load_bias(), &empty_phdr, 1, 0x99};
+  EXPECT_EQ(result_code(find_function_imports(missing_dyn, &batch[1], 1, &failed)),
+            ErrorCode::kInvalidImage);
+  EXPECT_EQ(failed, SIZE_MAX);
+
+  FunctionHookTarget target{view(), {sel("target", kAll, kTypeGlobDat), kReplA, &outputs[0]}};
+  EXPECT_EQ(result_code(build_function_hook_plan(&target, 1, &failed)),
+            ErrorCode::kUnsupportedFormat);
+  EXPECT_EQ(failed, 0u);
+
+  NamedImage named{view(), "custom.so"};
+  CandidateSelection csel;
+  csel.sources = kAll;
+  csel.types = kTypeGlobDat;
+  EXPECT_EQ(result_code(expand_function_candidates(&named, 1, csel)),
+            ErrorCode::kUnsupportedFormat);
+
+  auto snap = inspect_function_imports(view(), kAll);
+  ASSERT_TRUE(snap);
+  ASSERT_EQ(snap.value().imports.size(), 1u);
+  EXPECT_EQ(snap.value().skipped_relocations, 1u);
+
+  auto res = hook_function_import(view(), sel("target"), kReplA, &outputs[0]);
+  ASSERT_TRUE(res.ok());
+  EXPECT_EQ(rd(image.got_slot_addr(0)), reinterpret_cast<uintptr_t>(kReplA));
+  EXPECT_EQ(rd(image.rela_slot_addr(0)), 0x2222u);
+  ASSERT_FALSE(unhook(res.handle));
+
+  ElfBuilder corrupt;
+  corrupt.add_symbol("target", 1)
+      .set_symbol_undefined(1)
+      .add_rela(1, YUKIPLT_RELOC_JUMP_SLOT, 0)
+      .alias_rela(1, YUKIPLT_RELOC_ABSOLUTE, 0);
+  auto corrupt_img = corrupt.build();
+  const ImageView corrupt_view{corrupt_img.load_bias(), corrupt_img.phdr_table(),
+                               corrupt_img.phdr_count, 0x98};
+  EXPECT_EQ(result_code(inspect_function_imports(corrupt_view, kAll)), ErrorCode::kCorruptedElf);
+}
+
+TEST_F(FuncInstallFixture, RiscvFunctionAddressRejectsIneligibleMatchesBeforeWriting) {
+  ElfBuilder b;
+  b.add_symbol("target", 1).set_symbol_undefined(1);
+  b.add_symbol("target", 2).set_symbol_type(2, STT_OBJECT).set_symbol_undefined(2);
+  b.add_symbol("target", 3);
+  b.add_rela(1, kNativeAbsolute)
+      .add_rela(2, kNativeAbsolute)
+      .add_rela(3, kNativeAbsolute)
+      .add_rela(1, kNativeAbsolute, 4);
+  set_backing(b.build());
+  auto selector = sel("target", kSourceNativeDynamic, kTypeRiscv64FunctionAddress);
+  EXPECT_EQ(result_code(find_function_import(view(), selector)), ErrorCode::kUnsupportedRelocation);
+  selector.index_source = RelocationSource::kRela;
+  for (size_t i = 0; i < 4; ++i) {
+    selector.base.relocation_index = i;
+    wr(image.rela_slot_addr(i), i == 0 ? 0 : 0x1111);
+    auto selected = find_function_import(view(), selector);
+    if (i == 0) {
+      ASSERT_TRUE(selected);
+    } else {
+      EXPECT_EQ(result_code(selected), ErrorCode::kUnsupportedRelocation);
+    }
+    auto installed = hook_function_import(view(), selector, kReplA, &outputs[0]);
+    EXPECT_EQ(installed.error.code, ErrorCode::kUnsupportedRelocation);
+    EXPECT_FALSE(installed.handle.valid());
+    EXPECT_EQ(outputs[0], nullptr);
+    EXPECT_EQ(cas_calls, 0u);
+  }
+}
+
+TEST_F(FuncInstallFixture, RiscvFunctionAddressOptInIsScopedToEachRequestedTable) {
+  ElfBuilder b;
+  b.add_symbol("target", 1).set_symbol_undefined(1);
+  b.add_rela(1, kNativeJumpSlot).add_rela(0xffff, kNativeAbsolute);
+  const auto offset = b.set_android_rela({}, 2).build().android_got_offset;
+  auto bytes = aps2_header(2, static_cast<int64_t>(offset));
+  append_single(bytes, 0, native_reloc_info(1, kNativeAbsolute));
+  append_single(bytes, 9, native_reloc_info(1, kNativeAbsolute));
+  set_backing(b.set_android_rela(std::move(bytes), 3).build());
+  auto packed = sel("target", kSourceNativeAndroidPacked, kTypeRiscv64FunctionAddress);
+  EXPECT_EQ(result_code(find_function_import(view(), packed)), ErrorCode::kUnsupportedRelocation);
+  packed.index_source = RelocationSource::kAndroidRela;
+  packed.base.relocation_index = 0;
+  const uintptr_t address = image.android_slot_addr(0);
+  wr(address, 0x2222);
+  FunctionHookRequest requests[] = {{sel("target", kSourceNativeDynamic, kTypeJumpSlot), kReplA},
+                                    {packed, kReplB}};
+  auto installed = hook_function_imports(view(), requests, 2);
+  ASSERT_TRUE(installed.ok());
+  EXPECT_EQ(rd(address), reinterpret_cast<uintptr_t>(kReplB));
+  EXPECT_EQ(rd(image.rela_slot_addr(0)), reinterpret_cast<uintptr_t>(kReplA));
+  ASSERT_FALSE(unhook(installed.handle));
+  EXPECT_EQ(rd(address), 0x2222u);
+}
+
+TEST_F(FuncInstallFixture, RiscvFunctionAddressRejectsOverlappingBytesInEitherRecordOrder) {
+  const uint64_t info = native_reloc_info(1, kNativeAbsolute);
+  for (int delta : {4, -4, 8}) {
+    ElfBuilder b;
+    b.add_symbol("target", 1).set_symbol_undefined(1).set_android_rela({}, 2);
+    const auto offset = static_cast<int64_t>(b.build().android_got_offset);
+    auto bytes = aps2_header(2, offset + (delta < 0 ? 4 : 0));
+    append_single(bytes, 0, info);
+    append_single(bytes, delta, info);
+    set_backing(b.set_android_rela(std::move(bytes), 2).build());
+    auto selector = sel("target", kSourceNativeAndroidPacked, kTypeRiscv64FunctionAddress);
+    selector.index_source = RelocationSource::kAndroidRela;
+    selector.base.relocation_index = delta < 0 ? 1 : 0;
+    wr(image.android_slot_addr(0), 0x1111);
+    auto installed = hook_function_import(view(), selector, kReplA, nullptr);
+    if (delta == 8) {
+      ASSERT_TRUE(installed.ok());
+      EXPECT_FALSE(unhook(installed.handle));
+    } else {
+      EXPECT_EQ(installed.error.code, ErrorCode::kCorruptedElf);
+      EXPECT_EQ(cas_calls, 0u);
+    }
+    EXPECT_EQ(rd(image.android_slot_addr(0)), 0x1111u);
+  }
+
+  ElfBuilder b;
+  b.add_symbol("target", 1).set_symbol_undefined(1).add_rela(1, kNativeAbsolute);
+  auto bytes = aps2_header(1, static_cast<int64_t>(b.build().rela_got_offset) - 4);
+  append_single(bytes, 0, info);
+  set_backing(b.set_android_rela(std::move(bytes), 0).build());
+  auto selector = sel("target", kAll, kTypeRiscv64FunctionAddress);
+  selector.index_source = RelocationSource::kRela;
+  selector.base.relocation_index = 0;
+  EXPECT_EQ(result_code(find_function_import(view(), selector)), ErrorCode::kCorruptedElf);
+
+  const auto unnamed = sel(nullptr, kAll, kTypeJumpSlot);
+  for (const auto& batch : {std::array{unnamed, selector}, std::array{selector, unnamed}}) {
+    size_t failed = 0;
+    EXPECT_EQ(result_code(find_function_imports(view(), batch.data(), batch.size(), &failed)),
+              ErrorCode::kCorruptedElf);
+    EXPECT_EQ(failed, SIZE_MAX);
+  }
+}
+
+TEST_F(FuncInstallFixture, RiscvCopyExtentCannotOverlapTheSelectedAddress) {
+  ElfBuilder b;
+  b.add_symbol("target", 1)
+      .set_symbol_undefined(1)
+      .add_symbol("object", 2)
+      .set_symbol_type(2, STT_OBJECT);
+  b.add_rela(2, 4).add_rela(1, kNativeAbsolute);  // R_RISCV_COPY followed by R_RISCV_64.
+  set_backing(b.build());
+  auto parsed = detail::inspect(image.load_bias(), image.phdr_table(), image.phdr_count);
+  ASSERT_TRUE(parsed);
+  auto& object = reinterpret_cast<NativeElfSym*>(parsed.value().symtab)[2];
+  auto selector = sel("target", kSourceNativeDynamic, kTypeRiscv64FunctionAddress);
+  wr(image.rela_slot_addr(1), 0x1111);
+  object.st_size = 12;
+  EXPECT_EQ(hook_function_import(view(), selector, kReplA, nullptr).error.code,
+            ErrorCode::kCorruptedElf);
+  EXPECT_EQ(cas_calls, 0u);
+  EXPECT_EQ(rd(image.rela_slot_addr(1)), 0x1111u);
+  object.st_size = 8;
+  auto installed = hook_function_import(view(), selector, kReplA, nullptr);
+  ASSERT_TRUE(installed.ok());
+  EXPECT_FALSE(unhook(installed.handle));
+}
+#endif
 
 TEST_F(FuncInstallFixture, UnsupportedMatchRejectsBatchBeforeAnyWrite) {
   ElfBuilder b;
   b.add_symbol("good", 1).set_symbol_undefined(1);
   b.add_symbol("bad", 2).set_symbol_undefined(2).set_symbol_type(2, STT_OBJECT);
   b.add_jump_slot(1);
-  b.add_rela(2, YUKIPLT_RELOC_GLOB_DAT, 0);
+  b.add_rela(2, YUKIPLT_HAS_GLOB_DAT ? YUKIPLT_RELOC_GLOB_DAT : YUKIPLT_RELOC_JUMP_SLOT, 0);
   set_backing(b.build());
   wr(image.got_slot_addr(0), 0x1111);
   wr(image.rela_slot_addr(0), 0x2222);
@@ -921,11 +1166,11 @@ TEST(ScanLimits, SharedRecordAndMaterializationBudgetsHaveExactBoundaries) {
   auto image = builder.add_symbol("long_function_name_for_budget", 1)
                    .set_symbol_undefined(1)
                    .add_jump_slot(1)
-                   .add_rela(1, kNativeGlobDat)
+                   .add_rela(1, kNativeHasGlobDat ? kNativeGlobDat : kNativeJumpSlot)
                    .build();
   auto parsed = inspect(image.load_bias(), image.phdr_table(), image.phdr_count);
   ASSERT_TRUE(parsed);
-  const uint32_t sources = kSourceJmprel | kSourceNativeDynamic;
+  const FunctionScanSources sources{kSourceJmprel | kSourceNativeDynamic};
   ScanBudget baseline;
   ASSERT_TRUE(scan_function_imports(parsed.value(), sources, &baseline));
   const size_t used = ScanBudget{}.bytes - baseline.bytes;

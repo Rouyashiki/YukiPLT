@@ -4,13 +4,26 @@ YukiPLT is unreleased. Rebuild all C++ callers with matching public headers,
 compiler, NDK and standard-library configuration. Private members affect
 by-value object storage; mixing layouts can overwrite caller memory.
 
+On RISC-V64, inspection returns `UnsupportedFormat` if a readable ELF header's
+floating-point ABI or reduced-register flag (`EF_RISCV_RVE`) differs from the
+library's. Android riscv64 uses LP64D with the full integer register set. For a
+custom image supplied through program headers alone, the loader must verify the
+calling convention.
+
 The current `HookPlan`, `FunctionHookPlan`, `HookSession`,
 `FunctionHookSession` and `RuleSet` layouts are frozen. New capabilities use
 new types or entry points. Do not mix STL iterator/debug modes, and do not
 infer compatibility from equal `sizeof` alone.
 
 C ABI version 1, existing numeric values and existing C structures remain
-unchanged. Use `yukiplt_c_has_feature()` to detect additions. `struct_size`
+unchanged. Use `yukiplt_c_has_feature()` to detect additions, including
+architecture-specific relocation support such as `YUKIPLT_C_FEATURE_REL_IMPORTS`
+(feature 6) and `YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS` (feature 22, false on
+`riscv64`). Probe `YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES` (feature 23)
+before requesting the opt-in `R_RISCV_64` type. The probe returns zero on the
+other ABIs and on older RISC-V64 libraries. On the four original ABIs, older
+libraries that report feature 1 already support function `GLOB_DAT`. Clients can use the
+[combined probe](integration.md#select-an-image-and-import). `struct_size`
 validates a frozen layout; it does not permit fields to be appended in place.
 The legacy recovery diagnostic is frozen even though it has no size field.
 `OperationDiagnostic`'s version is an output identifier, not an extension slot.

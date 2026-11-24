@@ -107,6 +107,9 @@ static_assert(static_cast<uint32_t>(kSourceRel) == YUKIPLT_C_SOURCE_REL);
 static_assert(static_cast<uint32_t>(kSourceAndroidRel) == YUKIPLT_C_SOURCE_ANDROID_REL);
 static_assert(static_cast<uint32_t>(kTypeJumpSlot) == YUKIPLT_C_TYPE_JUMP_SLOT);
 static_assert(static_cast<uint32_t>(kTypeGlobDat) == YUKIPLT_C_TYPE_GLOB_DAT);
+static_assert(static_cast<uint32_t>(kTypeRiscv64FunctionAddress) ==
+              YUKIPLT_C_TYPE_RISCV64_FUNCTION_ADDRESS);
+static_assert(kTypeNativeFunctions == YUKIPLT_C_TYPE_NATIVE_FUNCTIONS);
 static_assert(static_cast<uint32_t>(RelocationSource::kJmprel) == YUKIPLT_C_RELOC_SOURCE_JMPREL);
 static_assert(static_cast<uint32_t>(RelocationSource::kRela) == YUKIPLT_C_RELOC_SOURCE_RELA);
 static_assert(static_cast<uint32_t>(RelocationSource::kAndroidRela) ==
@@ -435,7 +438,10 @@ int yukiplt_c_has_feature(uint32_t feature_id) noexcept {
          feature_id == YUKIPLT_C_FEATURE_PLANS || feature_id == YUKIPLT_C_FEATURE_SESSIONS ||
          feature_id == YUKIPLT_C_FEATURE_RULES || feature_id == YUKIPLT_C_FEATURE_CANDIDATES ||
          feature_id == YUKIPLT_C_FEATURE_IDLE_STORAGE ||
-         (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela);
+         (feature_id == YUKIPLT_C_FEATURE_REL_IMPORTS && !kNativeUsesRela) ||
+         (feature_id == YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS && kNativeHasGlobDat) ||
+         (feature_id == YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES &&
+          kNativeHasRiscv64FunctionAddress);
 }
 yukiplt_c_error yukiplt_c_hook_function(const yukiplt_c_image* image,
                                         const yukiplt_c_function_selector* target,

@@ -569,12 +569,12 @@ template <typename Request>
 Error plan_function_requests(const InspectedImage& img, const Request* reqs, size_t count,
                              detail::SmallVec<PlannedSlot, 4>& out,
                              detail::CauseContext* cause = nullptr) {
-  uint32_t sources = 0;
+  detail::FunctionScanSources sources;
   for (size_t i = 0; i < count; ++i) {
     if (reqs[i].replacement == nullptr) return Error::Make(ErrorCode::kNullPointer);
     Error invalid = detail::validate_function_selector(reqs[i].target);
     if (invalid) return invalid;
-    sources |= reqs[i].target.sources;
+    sources.include(reqs[i].target);
   }
   detail::ScanBudget budget;
   budget.cause = cause;
@@ -610,10 +610,7 @@ Error plan_function_requests(const InspectedImage& img, const Request* reqs, siz
     ps.replacement = reinterpret_cast<uintptr_t>(reqs[i].replacement);
     ps.out_original = reqs[i].out_original;
     ps.report_index = i;
-    // Only a GLOB_DAT slot must refuse a zero current value.  A JUMP_SLOT is
-    // installed whatever it holds, including 0: the caller asserted eager
-    // binding, and its original is reported as found (0 included).
-    ps.reject_zero_original = record.relocation_type == detail::kRelGlobDat;
+    ps.reject_zero_original = record.relocation_type != detail::kRelJumpSlot;
     if constexpr (std::is_same_v<Request, FunctionHookRequestEx>) {
       ps.require_current = reqs[i].require_current;
       ps.expected_current = reqs[i].expected_current;
@@ -1619,7 +1616,9 @@ Result<FunctionImport> find_function_import(const ImageView& image,
   if (invalid) return invalid;
   return inspect_metadata<FunctionImport>(
       image, [&](const InspectedImage& inspected) -> Result<FunctionImport> {
-        auto scan = detail::scan_function_views(inspected, selector.sources);
+        detail::FunctionScanSources sources;
+        sources.include(selector);
+        auto scan = detail::scan_function_views(inspected, sources);
         if (!scan) return scan.error();
         auto selected = detail::select_function_reloc(scan.value(), selector);
         if (!selected) return selected.error();
@@ -1708,7 +1707,9 @@ Result<FunctionImport> find_function_import_named(const NamedImage& image,
   return inspect_metadata<FunctionImport>(
       image.image,
       [&](const InspectedImage& inspected) -> Result<FunctionImport> {
-        auto scan = detail::scan_function_views(inspected, selector.sources);
+        detail::FunctionScanSources sources;
+        sources.include(selector);
+        auto scan = detail::scan_function_views(inspected, sources);
         if (!scan) return scan.error();
         auto selected = detail::select_function_reloc(scan.value(), selector);
         if (!selected) return selected.error();
@@ -1990,9 +1991,21 @@ Result<Snapshot> find_batch(const ImageView& image, const char* path, const Sele
           if (auto e = budget.take_records(inspected.jmprel_count)) return e;
         }
         auto scan = [&] {
-          if constexpr (functions)
-            return detail::scan_function_views(inspected, requests[0].sources, &budget);
-          else
+          if constexpr (functions) {
+            detail::FunctionScanSources sources{requests[0].sources};
+            if constexpr (kNativeHasRiscv64FunctionAddress) {
+              for (size_t i = 0; i < count; ++i) {
+                const auto& request = requests[i];
+                if (request.sources == sources.tables &&
+                    (request.types & kTypeRiscv64FunctionAddress) &&
+                    !detail::validate_function_types(request.types)) {
+                  sources.include(request);
+                  break;
+                }
+              }
+            }
+            return detail::scan_function_views(inspected, sources, &budget);
+          } else
             return detail::scan_batch_versioned_views(inspected, budget);
         }();
         if (!scan) return scan.error();
@@ -2094,7 +2107,7 @@ Result<std::vector<Result<VersionedImport>>> detail::inspect_selected_imports(
       });
 }
 Result<std::vector<Result<FunctionImport>>> detail::inspect_selected_functions(
-    const ImageView& image, uint32_t sources, const FunctionImportSelector* selectors,
+    const ImageView& image, FunctionScanSources sources, const FunctionImportSelector* selectors,
     size_t count) {
   return inspect_metadata<std::vector<Result<FunctionImport>>>(
       image, [&](const InspectedImage& inspected) -> Result<std::vector<Result<FunctionImport>>> {
@@ -2105,7 +2118,7 @@ Result<std::vector<Result<FunctionImport>>> detail::inspect_selected_functions(
 }
 
 Result<detail::RawFunctionSnapshot> detail::inspect_function_relocs(const ImageView& image,
-                                                                    uint32_t sources,
+                                                                    FunctionScanSources sources,
                                                                     ScanBudget* budget,
                                                                     const char* expected_path) {
   return inspect_metadata<detail::RawFunctionSnapshot>(

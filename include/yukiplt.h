@@ -12,6 +12,7 @@
 #if defined(__aarch64__) || defined(_M_ARM64)
 #define YUKIPLT_ELF_BITS 64
 #define YUKIPLT_ELF_MACHINE 183
+#define YUKIPLT_HAS_GLOB_DAT 1
 #define YUKIPLT_RELOC_JUMP_SLOT 1026
 #define YUKIPLT_RELOC_GLOB_DAT 1025
 #define YUKIPLT_RELOC_RELATIVE 1027
@@ -20,6 +21,7 @@
 #elif defined(__arm__) || defined(_M_ARM)
 #define YUKIPLT_ELF_BITS 32
 #define YUKIPLT_ELF_MACHINE 40
+#define YUKIPLT_HAS_GLOB_DAT 1
 #define YUKIPLT_RELOC_JUMP_SLOT 22
 #define YUKIPLT_RELOC_GLOB_DAT 21
 #define YUKIPLT_RELOC_RELATIVE 23
@@ -28,6 +30,7 @@
 #elif defined(__x86_64__) || defined(_M_X64)
 #define YUKIPLT_ELF_BITS 64
 #define YUKIPLT_ELF_MACHINE 62
+#define YUKIPLT_HAS_GLOB_DAT 1
 #define YUKIPLT_RELOC_JUMP_SLOT 7
 #define YUKIPLT_RELOC_GLOB_DAT 6
 #define YUKIPLT_RELOC_RELATIVE 8
@@ -36,14 +39,36 @@
 #elif defined(__i386__) || defined(_M_IX86)
 #define YUKIPLT_ELF_BITS 32
 #define YUKIPLT_ELF_MACHINE 3
+#define YUKIPLT_HAS_GLOB_DAT 1
 #define YUKIPLT_RELOC_JUMP_SLOT 7
 #define YUKIPLT_RELOC_GLOB_DAT 6
 #define YUKIPLT_RELOC_RELATIVE 8
 #define YUKIPLT_RELOC_IRELATIVE 42
 #define YUKIPLT_RELOC_ABSOLUTE 1
-#else
-#error "YukiPLT supports only ARM64, ARM32, x86_64 and x86"
+#elif defined(__riscv) && (__riscv_xlen == 64)
+#if defined(__ANDROID__)
+#include <android/ndk-version.h>
+#if __NDK_MAJOR__ < 30 || (__NDK_MAJOR__ == 30 && __NDK_MINOR__ == 0 && __NDK_BUILD__ < 16248370)
+#error "YukiPLT on Android RISC-V64 requires NDK r30 (30.0.16248370) or newer"
 #endif
+#if !defined(__ANDROID_MIN_SDK_VERSION__) || __ANDROID_MIN_SDK_VERSION__ < 37
+#error "YukiPLT on Android RISC-V64 requires Android API 37 or newer"
+#endif
+#endif
+#define YUKIPLT_ELF_BITS 64
+#define YUKIPLT_ELF_MACHINE 243
+#define YUKIPLT_HAS_GLOB_DAT 0
+#define YUKIPLT_RELOC_JUMP_SLOT 5
+// Zero placeholder (matches R_RISCV_NONE); always guard with YUKIPLT_HAS_GLOB_DAT.
+#define YUKIPLT_RELOC_GLOB_DAT 0
+#define YUKIPLT_RELOC_RELATIVE 3
+#define YUKIPLT_RELOC_IRELATIVE 58
+#define YUKIPLT_RELOC_ABSOLUTE 2
+#else
+#error "YukiPLT supports only ARM64, ARM32, x86_64, x86 and RISC-V64"
+#endif
+
+#define YUKIPLT_HAS_RISCV64_FUNCTION_ADDRESS (YUKIPLT_ELF_MACHINE == 243)
 
 #if YUKIPLT_ELF_BITS == 64
 #define YUKIPLT_USES_RELA 1
@@ -168,13 +193,16 @@ typedef struct yukiplt_c_slot_report {
   uint32_t status;
 } yukiplt_c_slot_report;
 
-// --- Function GLOB_DAT / APS2 (opt-in, added in ABI v1; see yukiplt.h) ---
+// --- Explicit function-import selectors (ABI v1) ---
 //
-// These extend selection/installation to GLOB_DAT function slots in
-// DT_RELA and DT_ANDROID_RELA, alongside JUMP_SLOT.  They are strictly opt-in:
-// the caller names the relocation sources and types.  v1's existing structs and
-// functions are unchanged; a caller probes availability with
-// yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS).
+// These extend selection/installation across explicit dynamic/APS2 relocation
+// sources, plus GLOB_DAT function slots on ABIs where YUKIPLT_HAS_GLOB_DAT is
+// nonzero. RISC-V64 hosts can probe YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES
+// before requesting R_RISCV_64 references in GOT entries and ordinary data.
+// Requesting YUKIPLT_C_TYPE_GLOB_DAT on RISC-V64 returns YUKIPLT_C_UNSUPPORTED_FORMAT.
+// Probe YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS with yukiplt_c_has_feature(). Libraries
+// predating feature 22 support function GLOB_DAT when YUKIPLT_HAS_GLOB_DAT
+// and the runtime YUKIPLT_C_FEATURE_FUNCTION_IMPORTS probe are both nonzero.
 enum {
   YUKIPLT_C_SOURCE_JMPREL = 1u << 0,        // DT_JMPREL (PLT).
   YUKIPLT_C_SOURCE_RELA = 1u << 1,          // DT_RELA (.rela.dyn).
@@ -188,7 +216,13 @@ enum {
 };
 enum {
   YUKIPLT_C_TYPE_JUMP_SLOT = 1u << 0,  // JUMP_SLOT.
-  YUKIPLT_C_TYPE_GLOB_DAT = 1u << 1    // GLOB_DAT (function, addend 0, UND FUNC).
+  YUKIPLT_C_TYPE_GLOB_DAT = 1u << 1,   // GLOB_DAT (function, addend 0, UND FUNC; where distinct).
+  // Explicit R_RISCV_64 reference to a function, including ordinary data pointers.
+  // Synchronize ordinary data accesses with installation, unhook and recovery.
+  YUKIPLT_C_TYPE_RISCV64_FUNCTION_ADDRESS = 1u << 2,
+  YUKIPLT_C_TYPE_NATIVE_FUNCTIONS = YUKIPLT_HAS_GLOB_DAT
+                                        ? (YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT)
+                                        : YUKIPLT_C_TYPE_JUMP_SLOT
 };
 // Scopes a relocation_index filter to one table (matches the source bits' order).
 enum {
@@ -219,7 +253,9 @@ enum {
   YUKIPLT_C_FEATURE_CONTROLLED_FORK = 18,
   YUKIPLT_C_FEATURE_MT_FORK = 19,
   YUKIPLT_C_FEATURE_BATCH_SELECT = 20,
-  YUKIPLT_C_FEATURE_BULK_TARGETS = 21
+  YUKIPLT_C_FEATURE_BULK_TARGETS = 21,
+  YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS = 22,
+  YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES = 23
 };
 
 enum {
@@ -269,19 +305,19 @@ typedef struct yukiplt_c_function_selector {
   uint32_t index_source;  // YUKIPLT_C_RELOC_SOURCE_*; scopes base.relocation_index.
   yukiplt_c_selector base;
 } yukiplt_c_function_selector;
-#define YUKIPLT_C_FUNCTION_SELECTOR(name)                                             \
-  {(uint32_t)sizeof(yukiplt_c_function_selector),                                     \
-   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC |                        \
-       YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                                        \
-   YUKIPLT_C_TYPE_JUMP_SLOT | YUKIPLT_C_TYPE_GLOB_DAT, YUKIPLT_C_RELOC_SOURCE_JMPREL, \
-   YUKIPLT_C_SELECTOR(name)}
+#define YUKIPLT_C_FUNCTION_SELECTOR(name)                      \
+  {(uint32_t)sizeof(yukiplt_c_function_selector),              \
+   YUKIPLT_C_SOURCE_JMPREL | YUKIPLT_C_SOURCE_NATIVE_DYNAMIC | \
+       YUKIPLT_C_SOURCE_NATIVE_ANDROID_PACKED,                 \
+   YUKIPLT_C_TYPE_NATIVE_FUNCTIONS, YUKIPLT_C_RELOC_SOURCE_JMPREL, YUKIPLT_C_SELECTOR(name)}
 typedef struct yukiplt_c_function_request {
   yukiplt_c_function_selector target;
   void* replacement;
   void** out_original;
 } yukiplt_c_function_request;
 
-// ABI v1 targets native ARM64/ARM32/x86_64/x86 Android API23+. No STL, allocation ownership or C++
+// ABI v1 targets native ARM64/ARM32/x86_64/x86 Android API23+ and RISC-V64 API37+. No STL,
+// allocation ownership or C++
 // exceptions cross this boundary. Error values match the C++ core. No operation
 // silently succeeds after partial commit: INDETERMINATE retains a valid token.
 // Threading: the C entry points follow the threading contract in yukiplt.h.
@@ -309,7 +345,7 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_image_from_soname(const char* name,
 // rolled-back conflict may leave a candidate original there without any hook
 // installed. Replacement must use yukiplt_c_load_original(), or an acquire
 // fence followed by an acquire load; an acquire load alone does not order the
-// preceding PLT/GOT load on ARM. They may be another hook's
+// preceding PLT/GOT load on ARM or RISC-V. They may be another hook's
 // replacement. A clean failure leaves no net GOT change, restored protections
 // and no ownership; that excludes original outputs.
 YUKIPLT_API yukiplt_c_error yukiplt_c_hook(const yukiplt_c_image*, const yukiplt_c_selector*,
@@ -354,12 +390,11 @@ YUKIPLT_API yukiplt_c_error yukiplt_c_forget_image(const yukiplt_c_image*) YUKIP
 // below are present before calling them.
 YUKIPLT_API int yukiplt_c_has_feature(uint32_t feature_id) YUKIPLT_C_NOEXCEPT;
 
-// Opt-in function-import hooks (JUMP_SLOT + function GLOB_DAT across the named
-// sources).  Same image/selector/transaction/ownership/original-output contract
-// as yukiplt_c_hook/yukiplt_c_hook_batch.  Each selector's struct_size must equal
-// sizeof(yukiplt_c_function_selector), and its sources/types masks must both be
-// nonzero. Both JUMP_SLOT and GLOB_DAT require an undefined STT_FUNC with zero
-// effective addend. Only GLOB_DAT additionally requires a nonzero current slot
+// Opt-in function-import hooks. Same image/selector/transaction/ownership/original-output
+// contract as yukiplt_c_hook/yukiplt_c_hook_batch.  Each selector's struct_size
+// must equal sizeof(yukiplt_c_function_selector), and its sources/types masks must both be
+// nonzero. Each type requires an undefined STT_FUNC with zero effective addend.
+// GLOB_DAT and explicitly requested R_RISCV_64 references require a nonzero current slot
 // value; any ineligible matched relocation fails the whole call
 // with UNSUPPORTED_RELOCATION and modifies nothing.  Unhook/abandon/query with
 // the shared yukiplt_c_unhook/abandon/query functions.

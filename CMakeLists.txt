@@ -2,6 +2,19 @@
 # Copyright 2026 Rouyashiki <https://rouyashiki.org>
 
 cmake_minimum_required(VERSION 3.22)
+
+# Capture the visible request before project() loads the NDK. A parent may
+# already have selected the effective platform with a normal variable.
+set(_yukiplt_requested_api "${ANDROID_PLATFORM}")
+if(_yukiplt_requested_api STREQUAL "")
+    foreach(_yukiplt_var IN ITEMS ANDROID_NATIVE_API_LEVEL CMAKE_ANDROID_API CMAKE_SYSTEM_VERSION)
+        set(_yukiplt_requested_api "${${_yukiplt_var}}")
+        if(NOT _yukiplt_requested_api STREQUAL "")
+            break()
+        endif()
+    endforeach()
+endif()
+
 project(YukiPLT VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -52,9 +65,13 @@ target_link_libraries(probe_host PRIVATE probe_archive)
 endif()
 
 if(ANDROID)
-    set(_yukiplt_abis arm64-v8a armeabi-v7a x86_64 x86)
-    if(NOT ANDROID_ABI IN_LIST _yukiplt_abis)
-        message(FATAL_ERROR "Unsupported Android ABI: ${ANDROID_ABI}")
+    set(_yukiplt_abis arm64-v8a armeabi-v7a x86_64 x86 riscv64)
+    set(_yukiplt_abi "${ANDROID_ABI}")
+    if(_yukiplt_abi STREQUAL "" AND DEFINED CMAKE_ANDROID_ARCH_ABI)
+        set(_yukiplt_abi "${CMAKE_ANDROID_ARCH_ABI}")
+    endif()
+    if(NOT _yukiplt_abi IN_LIST _yukiplt_abis)
+        message(FATAL_ERROR "Unsupported Android ABI: ${_yukiplt_abi}")
     endif()
     if(DEFINED ANDROID_PLATFORM_LEVEL)
         set(_yukiplt_api "${ANDROID_PLATFORM_LEVEL}")
@@ -63,11 +80,31 @@ if(ANDROID)
     else()
         set(_yukiplt_api "${CMAKE_SYSTEM_VERSION}")
     endif()
-    if(NOT _yukiplt_api MATCHES "^[0-9]+$" OR _yukiplt_api LESS 23)
-        message(FATAL_ERROR "YukiPLT requires Android API 23 or newer")
+    set(_yukiplt_min_api 23)
+    if(_yukiplt_abi STREQUAL "riscv64")
+        set(_yukiplt_min_api 37)
+    endif()
+    if(NOT _yukiplt_api MATCHES "^[0-9]+$" OR _yukiplt_api LESS _yukiplt_min_api)
+        message(FATAL_ERROR
+            "YukiPLT (${_yukiplt_abi}) requires Android API ${_yukiplt_min_api} or newer")
+    endif()
+    # At its API floor the NDK may have raised an explicit, unsupported request.
+    if(DEFINED ANDROID_NDK_REVISION AND
+       (_yukiplt_api STREQUAL "${NDK_ABI_${_yukiplt_abi}_MIN_OS_VERSION}" OR
+        _yukiplt_api STREQUAL "${NDK_MIN_PLATFORM_LEVEL}") AND
+       NOT _yukiplt_requested_api STREQUAL "" AND NOT _yukiplt_requested_api STREQUAL "latest")
+        string(REGEX REPLACE "^android-" "" _yukiplt_requested_api "${_yukiplt_requested_api}")
+        if(DEFINED NDK_PLATFORM_ALIAS_${_yukiplt_requested_api})
+            string(REGEX REPLACE "^android-" "" _yukiplt_requested_api
+                "${NDK_PLATFORM_ALIAS_${_yukiplt_requested_api}}")
+        endif()
+        if(NOT _yukiplt_requested_api MATCHES "^[0-9]+$" OR _yukiplt_requested_api LESS _yukiplt_min_api)
+            message(FATAL_ERROR
+                "YukiPLT (${_yukiplt_abi}) requires Android API ${_yukiplt_min_api} or newer, requested ${_yukiplt_requested_api}")
+        endif()
     endif()
     if("hwaddress" IN_LIST ANDROID_SANITIZE AND
-       (NOT ANDROID_ABI STREQUAL "arm64-v8a" OR _yukiplt_api LESS 34))
+       (NOT _yukiplt_abi STREQUAL "arm64-v8a" OR _yukiplt_api LESS 34))
         message(FATAL_ERROR "HWASan requires arm64-v8a and Android API 34 or newer")
     endif()
 endif()

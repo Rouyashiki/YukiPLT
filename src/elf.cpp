@@ -177,6 +177,28 @@ static Expected<DynamicInfo, Error> parse_dynamic(uintptr_t dyn_addr, size_t dyn
 }
 // Main inspection
 
+#if defined(__riscv)
+// RISC-V ELF e_flags bits 1–3 encode the floating-point and reduced-register ABIs.
+constexpr uint32_t kRiscvFloatAbiMask = 0x6;
+constexpr uint32_t kRiscvRve = 0x8;
+#if defined(__riscv_float_abi_soft)
+constexpr uint32_t kNativeRiscvFloatAbi = 0x0;
+#elif defined(__riscv_float_abi_single)
+constexpr uint32_t kNativeRiscvFloatAbi = 0x2;
+#elif defined(__riscv_float_abi_double)
+constexpr uint32_t kNativeRiscvFloatAbi = 0x4;
+#elif defined(__riscv_float_abi_quad)
+constexpr uint32_t kNativeRiscvFloatAbi = 0x6;
+#else
+#error "Unknown RISC-V floating-point ABI"
+#endif
+#if defined(__riscv_abi_rve)
+constexpr uint32_t kNativeRiscvCallingConvention = kNativeRiscvFloatAbi | kRiscvRve;
+#else
+constexpr uint32_t kNativeRiscvCallingConvention = kNativeRiscvFloatAbi;
+#endif
+#endif
+
 Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr* phdr_table,
                                         size_t phdr_count) {
   if (phdr_table == nullptr) return Error::Make(ErrorCode::kNullPointer);
@@ -260,6 +282,10 @@ Expected<InspectedImage, Error> inspect(uintptr_t load_bias, const NativeElfPhdr
     if (ident[EI_CLASS] != YUKIPLT_ELF_CLASS || ident[EI_DATA] != ELFDATA2LSB ||
         header.e_machine != kNativeMachine || header.e_type != ET_DYN)
       return Error::Make(ErrorCode::kUnsupportedFormat);
+#if defined(__riscv)
+    if ((header.e_flags & (kRiscvFloatAbiMask | kRiscvRve)) != kNativeRiscvCallingConvention)
+      return Error::Make(ErrorCode::kUnsupportedFormat);
+#endif
     if (ident[EI_VERSION] != EV_CURRENT || header.e_version != EV_CURRENT ||
         header.e_ehsize != sizeof(NativeElfEhdr) || header.e_phentsize != sizeof(NativeElfPhdr))
       return Error::Make(ErrorCode::kCorruptedElf);

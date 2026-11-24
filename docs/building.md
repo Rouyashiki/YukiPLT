@@ -1,7 +1,9 @@
 # Build and package
 
 Use Clang, CMake 3.24 or newer, Ninja and the Android NDK. Select the native ABI
-of the process that will load the library. The minimum Android API is 23.
+of the process that will load the library. The minimum Android API is 23 on ARM
+and x86. All Android `riscv64` builds, including source embedding, require NDK
+r30 (`30.0.16248370`) or newer and API 37 or newer.
 
 ```sh
 cmake -S . -B build-android -G Ninja \
@@ -20,8 +22,15 @@ integration guides. For the `c++_shared` configuration, deploy the matching NDK'
 runtime. The `c++_static` shared configuration has no such dependency.
 
 For an existing CMake project, use `add_subdirectory(path/to/YukiPLT)` and link
-your target with `yukiplt`. Configure the parent project with the same NDK,
-ABI, API and STL settings. Project warnings apply only to YukiPLT's targets.
+your target with `yukiplt`. Configure the parent with the same NDK, ABI, API
+and STL. Project warnings apply only to YukiPLT's targets.
+
+With NDK r30, `riscv64` defaults to API 37. A standalone build rejects a lower
+request visible before YukiPLT's `project()` call, such as
+`-DANDROID_PLATFORM=android-36`. If a custom toolchain or parent project sets
+the platform, the NDK can raise it to 37 before YukiPLT checks it. To reject
+the original request, check it before the custom toolchain includes the NDK
+toolchain or before the parent calls `project()`.
 
 Release builds use `YUKIPLT_RELEASE_OPTIMIZATION=Oz` and
 `YUKIPLT_LTO=ON` by default. Select `Oz`, `O2` or `O3` explicitly to
@@ -37,9 +46,11 @@ pass `-DYUKIPLT_LTO=ON` to enable it there. Measure sanitizer builds separately
 from production builds.
 
 The `Build and check` GitHub Actions workflow runs on pushes, pull requests and
-manual dispatch. It uses NDK r30 (`30.0.16248370`) and CMake 4.1.2 to build API 23
-Release packages for all four supported ABIs, with Full LTO enabled. Each job
-builds one library type, and each artifact contains only that binary at its root:
+manual dispatch. It uses NDK r30 (`30.0.16248370`) and CMake 4.1.2 to build
+Release packages for all five supported ABIs (`android-23` for `arm64-v8a`,
+`armeabi-v7a`, `x86_64` and `x86`; `android-37` for `riscv64`), with Full LTO
+enabled. Each job builds one library type, and each artifact contains only that
+binary at its root:
 
 - `yukiplt-<abi>-shared-libcxx-static`: `libyukiplt.so` with static libc++.
 - `yukiplt-<abi>-shared-libcxx-shared`: `libyukiplt.so` with shared libc++.

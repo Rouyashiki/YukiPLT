@@ -597,9 +597,7 @@ FunctionImportSelector exact_function_selector(const FunctionImport& chosen) noe
       break;
   }
   result.index_source = chosen.source;
-  result.types = chosen.relocation_type == detail::kRelJumpSlot  ? kTypeJumpSlot
-                 : chosen.relocation_type == detail::kRelGlobDat ? kTypeGlobDat
-                                                                 : 0;
+  result.types = detail::function_type_bit(chosen.relocation_type);
   return result;
 }
 Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targets, size_t count,
@@ -613,7 +611,7 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
   try {
     struct Cached {
       ImageView image;
-      uint32_t sources = 0;
+      detail::FunctionScanSources sources;
       size_t count = 0;
       bool loaded = false;
       std::vector<Result<FunctionImport>> selected;
@@ -645,9 +643,9 @@ Result<FunctionHookPlan> build_function_hook_plan(const FunctionHookTarget* targ
       if (!images.enabled())
         for (; group < cache.size(); ++group)
           if (same_image(cache[group].image, targets[i].image)) break;
-      if (group == cache.size()) cache.push_back({targets[i].image, 0, 0, false, {}, 0});
+      if (group == cache.size()) cache.push_back({targets[i].image, {}, 0, false, {}, 0});
       if (++cache[group].count > kGroupLimit) return Error::Make(ErrorCode::kInvalidArgument);
-      cache[group].sources |= request.target.sources;
+      cache[group].sources.include(request.target);
     }
     for (size_t i = 0; i < count; ++i) {
       if (failed_target) *failed_target = i;

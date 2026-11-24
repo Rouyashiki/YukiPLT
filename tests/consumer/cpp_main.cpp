@@ -25,6 +25,47 @@ yukiplt::OriginalSlot<Function> parent_original;
 yukiplt::OriginalSlot<Function> child_original;
 int parent_replacement(int x) { return parent_original.load()(x) + 100; }
 int child_replacement(int x) { return child_original.load()(x) + 200; }
+#if YUKIPLT_HAS_RISCV64_FUNCTION_ADDRESS
+int address_replacement(int x) { return x + 100; }
+bool check_function_addresses(void* library, Function plt) {
+  using namespace yukiplt;
+  auto* data = static_cast<Function*>(dlsym(library, "sample_data_pointer"));
+  auto got = reinterpret_cast<Function (*)()>(dlsym(library, "sample_got_pointer"));
+  auto image = find_image_containing(reinterpret_cast<void*>(plt));
+  if (!image || !data || !got || *data != got() || (*data)(1) != 8) return false;
+  FunctionImportSelector selector{{"sample_add"},
+                                  kSourceNativeDynamic | kSourceNativeAndroidPacked,
+                                  kTypeRiscv64FunctionAddress};
+  const auto found = find_function_import_named(image.value(), selector);
+  if (found || found.error().code != ErrorCode::kAmbiguousSymbol) return false;
+  CandidateSelection selection;
+  selection.sources = selector.sources;
+  selection.types = selector.types;
+  selection.include.symbol = {TextMatchKind::kExact, "sample_add"};
+  auto candidates = expand_function_candidates(&image.value(), 1, selection);
+  if (!candidates || candidates.value().size() != 2) return false;
+  size_t data_slots = 0;
+  for (const auto& candidate : candidates.value()) {
+    const auto exact = candidate.selector();
+    if (exact.types != kTypeRiscv64FunctionAddress) return false;
+    const bool is_data =
+        candidate.selected.base.import.slot_address == reinterpret_cast<uintptr_t>(data);
+    data_slots += is_data;
+    FunctionHookTarget target{candidate.image,
+                              {exact, reinterpret_cast<void*>(address_replacement), nullptr, true,
+                               reinterpret_cast<uintptr_t>(*data)}};
+    auto plan = build_function_hook_plan(&target, 1);
+    if (!plan) return false;
+    auto session = prepare_function_session(plan.value());
+    if (!session || !session.value().install().ok()) return false;
+    const bool isolated =
+        (*data)(1) == (is_data ? 101 : 8) && got()(1) == (is_data ? 8 : 101) && plt(1) == 11;
+    if (!session.value().unhook().ok() || !isolated || *data != got() || (*data)(1) != 8)
+      return false;
+  }
+  return data_slots == 1;
+}
+#endif
 bool deny_open() {
   // Deny every new file open in this disposable child, including maps fallbacks.
   sock_filter instructions[] = {BPF_STMT(BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr)),
@@ -84,6 +125,9 @@ int main() {
   auto call = reinterpret_cast<Function>(dlsym(library, "call_import"));
   auto image = image_from_soname("libhook_target.so");
   if (!call || !image || call(1) != 11) return 42;
+#if YUKIPLT_HAS_RISCV64_FUNCTION_ADDRESS
+  if (!check_function_addresses(library, call)) return 62;
+#endif
   HookRequest request{"sample_add", reinterpret_cast<void*>(parent_replacement),
                       parent_original.output_address()};
   auto installed = hook_batch(image.value(), &request, 1);

@@ -21,11 +21,42 @@ slots are ambiguous; repeated relocation records for one slot are malformed.
 
 The name/version APIs handle `JUMP_SLOT` only. For function imports use
 `inspect_function_imports()` and `hook_function_import(s)()` with explicit source
-and type masks. Portable source constants are `kSourceNativeDynamic` and
-`kSourceNativeAndroidPacked`; REL and RELA constants remain distinct.
-Both explicit function relocation types require an undefined `STT_FUNC` with
-effective addend zero. `GLOB_DAT` also requires a nonzero current slot; a zero
-`JUMP_SLOT` is allowed. An ineligible
+and type masks. Portable constants are `kSourceNativeDynamic`,
+`kSourceNativeAndroidPacked` and `kTypeNativeFunctions`; REL and RELA source
+constants remain distinct. On RISC-V64, the default mask and the source-only
+snapshot include only `JUMP_SLOT`. The ABI has no distinct `GLOB_DAT`, so
+`kTypeGlobDat` returns `UnsupportedFormat`. C++ callers can check `kNativeHasGlobDat`.
+
+To select RISC-V64 references to an imported function, set the selector's
+`types` to `kTypeRiscv64FunctionAddress` (C: `YUKIPLT_C_TYPE_RISCV64_FUNCTION_ADDRESS`).
+Both GOT entries and ordinary data pointers can carry `R_RISCV_64`. A unique
+match can be installed directly. If both reference the same symbol, a name-only
+selection returns `AmbiguousSymbol`, even when their current values are equal.
+Use `expand_function_candidates()` with the explicit type and symbol to see
+each slot's address, source and relocation index. After identifying the desired
+slot, pass its `selector()` to installation. C callers can use
+`yukiplt_c_expand_candidates()`, then set `index_source` and `base.relocation_index`
+from the chosen record. Each installation changes only the selected slot.
+
+For an ordinary C or C++ function-pointer variable, synchronize the program's
+reads and writes with installation, unhook and recovery. For example, hold the
+same host mutex around each access and each of these operations. If the program
+can reassign the variable, a request with `require_current` and `expected_current`
+can also check that it still holds the address the host intends to replace.
+
+C ABI v1 libraries predating feature 22 return zero for that probe. On ARM64,
+ARM32, x86_64 and x86 their function-import feature (1) already supports
+`GLOB_DAT`. A C client can use the same check with either library version.
+
+```c
+int has_glob_dat =
+    yukiplt_c_has_feature(YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS) ||
+    (YUKIPLT_HAS_GLOB_DAT && yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS));
+```
+
+All explicit function types require an undefined `STT_FUNC` with effective
+addend zero. Both `GLOB_DAT` and `R_RISCV_64` require a nonzero current value
+at installation. A zero `JUMP_SLOT` is allowed. An ineligible
 matched import rejects the entire request before modification.
 
 Use `hook_batch_nonnull_diagnosed_named()` when every replacement needs a callable
@@ -46,7 +77,8 @@ caller-established quiescence. Non-null outputs must be
 distinct and cannot alias target slots or existing owners. Use
 `OriginalSlot<FunctionPointer>` for typed storage, or `load_original()` /
 `yukiplt_c_load_original()` for raw outputs. These helpers perform an acquire
-fence before the acquire load; an acquire load alone is insufficient on ARM.
+fence before the acquire load; an acquire load alone is insufficient on ARM or
+RISC-V.
 Never clear or reuse a published original slot. Its value can be another
 framework's replacement, and a failed installation can still publish it.
 

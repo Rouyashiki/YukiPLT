@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <bitset>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <new>
@@ -345,16 +346,15 @@ struct VersionScan {
   }
 };
 
-template <typename T>
-Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionScan& scan) {
-  auto value = read_version<T>(image, address);
-  if (!value) return value.error();
-  // read_version() proved the end cannot overflow. Check both neighbours before any
-  // allocation or following a shared auxiliary chain a second time.
-  const uintptr_t end = address + sizeof(T);
-  const auto next = scan.ranges.lower_bound(address);
-  if ((next != scan.ranges.end() && next->first < end) ||
-      (next != scan.ranges.begin() && std::prev(next)->second > address))
+Error claim_range(std::map<uintptr_t, uintptr_t>& ranges, uintptr_t address, size_t size,
+                  ScanBudget& budget) {
+  uintptr_t end;
+  if (!safe_add(address, size, end)) return Error::Make(ErrorCode::kIntegerOverflow);
+  const auto next = ranges.empty() || ranges.rbegin()->first < address
+                        ? ranges.end()
+                        : ranges.lower_bound(address);
+  if ((next != ranges.end() && next->first < end) ||
+      (next != ranges.begin() && std::prev(next)->second > address))
     return Error::Make(ErrorCode::kCorruptedElf);
   // Charge a node-based map entry at its real cost: the pair plus the parent,
   // left, right links and color a red-black tree node carries (R-10).
@@ -363,8 +363,16 @@ Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionSca
     uintptr_t color;
     std::pair<uintptr_t, uintptr_t> value;
   };
-  if (Error e = scan.budget.take_objects<RangeNodeCost>(1)) return e;
-  scan.ranges.emplace_hint(next, address, end);
+  if (Error e = budget.take_objects<RangeNodeCost>(1)) return e;
+  ranges.emplace_hint(next, address, end);
+  return Error::Ok();
+}
+
+template <typename T>
+Result<T> read_record(const InspectedImage& image, uintptr_t address, VersionScan& scan) {
+  auto value = read_version<T>(image, address);
+  if (!value) return value.error();
+  if (Error e = claim_range(scan.ranges, address, sizeof(T), scan.budget)) return e;
   return value;
 }
 
@@ -949,8 +957,21 @@ Error validate_sources(uint32_t sources) noexcept {
   return Error::Ok();
 }
 
-// True if [addr, addr + size) lies entirely within one readable (PF_R) LOAD.
-// Every table this path reads must pass this, exactly as on the legacy path.
+uint32_t source_bit(RelocationSource source) noexcept {
+  switch (source) {
+    case RelocationSource::kJmprel:
+      return kSourceJmprel;
+    case RelocationSource::kRela:
+      return kSourceRela;
+    case RelocationSource::kAndroidRela:
+      return kSourceAndroidRela;
+    case RelocationSource::kRel:
+      return kSourceRel;
+    case RelocationSource::kAndroidRel:
+      return kSourceAndroidRel;
+  }
+  return 0;
+}
 
 // Per-scan state shared by every source.  The dynsym bound and the string
 // table are validated on the first record that needs a symbol, so an image
@@ -960,10 +981,12 @@ struct ScanState {
   const InspectedImage& image;
   Snapshot& result;
   ScanBudget& budget;
+  uint32_t address_tables;
   /// Destination of every non-NONE record.  Duplicates are detected as each
   /// record is decoded (AGENTS: checked early, before later records or
   /// version metadata are materialized), so this is an ordered set.
   std::set<uintptr_t> slots;
+  std::map<uintptr_t, uintptr_t> slot_ranges;
   size_t symbol_bound = 0;
   bool symbols_ready = false;
 };
@@ -980,6 +1003,12 @@ Error ensure_symbols(ScanState<Snapshot>& state) {
   return Error::Ok();
 }
 
+template <typename Snapshot>
+Result<NativeElfSym> function_symbol(const ScanState<Snapshot>& state, uint32_t index) {
+  if (index == 0 || index >= state.symbol_bound) return Error::Make(ErrorCode::kCorruptedElf);
+  return read_version<NativeElfSym>(state.image, state.image.symtab, index);
+}
+
 // Read a record's symbol name (bounded by STRSZ), ELF symbol type and whether it
 // is undefined.  An empty name is recorded as-is, as the legacy snapshot does;
 // no selector can match it, because a selector's symbol must be non-empty.
@@ -987,16 +1016,9 @@ template <typename Snapshot, typename Text>
 Error read_symbol(const ScanState<Snapshot>& state, uint32_t symbol_index, Text& name,
                   uint8_t& symbol_type, bool& undefined) {
   const InspectedImage& image = state.image;
-  if (symbol_index == 0 || symbol_index >= state.symbol_bound)
-    return Error::Make(ErrorCode::kCorruptedElf);
-  uintptr_t sym_addr;
-  uintptr_t sym_offset;
-  if (!safe_mul(symbol_index, sizeof(NativeElfSym), sym_offset) ||
-      !safe_add(image.symtab, sym_offset, sym_addr))
-    return Error::Make(ErrorCode::kIntegerOverflow);
-  if (!readable(image, sym_addr, sizeof(NativeElfSym))) return Error::Make(ErrorCode::kOutOfBounds);
-  NativeElfSym sym;
-  std::memcpy(&sym, reinterpret_cast<const void*>(sym_addr), sizeof(sym));
+  auto symbol = function_symbol(state, symbol_index);
+  if (!symbol) return symbol.error();
+  const auto& sym = symbol.value();
   if (sym.st_name >= image.strsz) return Error::Make(ErrorCode::kCorruptedElf);
   const char* begin = reinterpret_cast<const char*>(image.strtab + sym.st_name);
   const auto* end = static_cast<const char*>(std::memchr(begin, 0, image.strsz - sym.st_name));
@@ -1008,37 +1030,75 @@ Error read_symbol(const ScanState<Snapshot>& state, uint32_t symbol_index, Text&
   return Error::Ok();
 }
 
-// Keep one record from any source.  Only JUMP_SLOT and GLOB_DAT with a non-zero
-// symbol index are materialized, whichever table holds them (labelled with their
-// real source and type); every other record is only counted, so a large table
-// of RELATIVE or other relocations retains only its address for alias checking.
+// Byte widths of fixed-size dynamic relocations from the RISC-V ELF psABI.
+// Other non-NONE records still participate by their destination address.
+constexpr size_t riscv64_relocation_width(uint32_t type) noexcept {
+  switch (type) {
+    case 1:   // R_RISCV_32
+    case 6:   // TLS_DTPMOD32
+    case 8:   // TLS_DTPREL32
+    case 10:  // TLS_TPREL32
+      return 4;
+    case 2:   // R_RISCV_64
+    case 3:   // RELATIVE
+    case 5:   // JUMP_SLOT
+    case 7:   // TLS_DTPMOD64
+    case 9:   // TLS_DTPREL64
+    case 11:  // TLS_TPREL64
+    case 58:  // IRELATIVE
+      return 8;
+    case 12:  // TLSDESC (resolver and argument)
+      return 16;
+    default:
+      return 1;
+  }
+}
+
+template <typename Snapshot>
+Error remember_destination(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
+  if (reloc.type == 0) return Error::Ok();
+  // A tree node contains three links and a color in addition to its value.
+  constexpr size_t node_overhead = sizeof(void*) * 4;
+  if (kNativeHasRiscv64FunctionAddress && state.address_tables != 0) {
+    size_t width = riscv64_relocation_width(reloc.type);
+    if (reloc.type == 4) {  // R_RISCV_COPY occupies the destination symbol's size.
+      if (Error e = ensure_symbols(state)) return e;
+      auto symbol = function_symbol(state, reloc.symbol_index);
+      if (!symbol) return symbol.error();
+      width = std::max<size_t>(1, symbol.value().st_size);
+    }
+    return claim_range(state.slot_ranges, reloc.slot_address, width, state.budget);
+  }
+  auto& slots = state.slots;
+  const auto position = slots.empty() || *slots.rbegin() < reloc.slot_address
+                            ? slots.end()
+                            : slots.lower_bound(reloc.slot_address);
+  if (position != slots.end() && *position == reloc.slot_address)
+    return Error::Make(ErrorCode::kCorruptedElf);
+  if (Error e = state.budget.take_bytes(node_overhead + sizeof(uintptr_t))) return e;
+  slots.emplace_hint(position, reloc.slot_address);
+  return Error::Ok();
+}
+
+// Keep function records with their actual source and type. R_RISCV_64 needs
+// explicit opt-in for this table because it also describes ordinary data.
 template <typename Snapshot>
 Error keep(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
-  // NONE has no destination. Every other record participates even when it is
-  // not a supported function import or has symbol index zero.
-  if (reloc.type != 0) {
-    auto& slots = state.slots;
-    const auto position = slots.empty() || *slots.rbegin() < reloc.slot_address
-                              ? slots.end()
-                              : slots.lower_bound(reloc.slot_address);
-    if (position != slots.end() && *position == reloc.slot_address)
-      return Error::Make(ErrorCode::kCorruptedElf);
-    // Charge the set entry at its node size, not just the 8-byte key (R-10):
-    // a red-black node carries parent/left/right links and a color.
-    struct SlotNodeCost {
-      void* links[3];
-      uintptr_t color;
-      uintptr_t key;
-    };
-    if (Error e = state.budget.template take_objects<SlotNodeCost>(1)) return e;
-    slots.emplace_hint(position, reloc.slot_address);
-  }
-  if ((reloc.type != kRelJumpSlot && reloc.type != kRelGlobDat) || reloc.symbol_index == 0) {
+  if (Error e = remember_destination(state, reloc)) return e;
+  const auto source = to_public_source(reloc.source);
+  const uint32_t type = function_type_bit(reloc.type);
+  const bool address = type == kTypeRiscv64FunctionAddress;
+  if (type == 0 || reloc.symbol_index == 0 ||
+      (address && !(state.address_tables & source_bit(source)))) {
     ++state.result.skipped_relocations;
     return Error::Ok();
   }
-  if (reloc.slot_address % kNativeSlotSize != 0 ||
-      !state.image.addr_in_writable_load(reloc.slot_address, kNativeSlotSize))
+  const bool slot_eligible = reloc.slot_address % kNativeSlotSize == 0 &&
+                             state.image.addr_in_writable_load(reloc.slot_address, kNativeSlotSize);
+  // Absolute relocations can legally refer to packed data. Such a destination
+  // can never be installed, but unrelated selections can still use this image.
+  if (!slot_eligible &&
+      (!address || !state.image.addr_in_load(reloc.slot_address, kNativeSlotSize)))
     return Error::Make(ErrorCode::kCorruptedElf);
   if (Error e = ensure_symbols(state)) return e;
   if (Error e = state.budget.template take_objects<FunctionReloc>(1)) return e;
@@ -1049,9 +1109,10 @@ Error keep(ScanState<Snapshot>& state, const DecodedReloc& reloc) {
   record.entry.base.import.symbol_index = reloc.symbol_index;
   record.entry.base.import.relocation_index = reloc.index;
   record.entry.base.import.slot_address = reloc.slot_address;
-  record.entry.source = to_public_source(reloc.source);
+  record.entry.source = source;
   record.entry.relocation_type = reloc.type;
   record.addend = reloc.addend;
+  record.slot_eligible = slot_eligible;
   state.result.records.push_back(std::move(record));
   return Error::Ok();
 }
@@ -1064,8 +1125,9 @@ Error visit_record(void* context, const DecodedReloc& reloc) {
 }  // namespace
 
 template <typename Snapshot, typename Version>
-Result<Snapshot> scan_functions_impl(const InspectedImage& image, uint32_t sources,
+Result<Snapshot> scan_functions_impl(const InspectedImage& image, FunctionScanSources scan_sources,
                                      ScanBudget* shared_budget) {
+  const uint32_t sources = scan_sources.tables;
   if (Error e = validate_sources(sources)) return e;
   // Scanning DT_RELA or DT_ANDROID_RELA refuses an image whose relocation tags
   // are unusable (a repeated tag, a pointer without its size, an overflowing
@@ -1078,7 +1140,7 @@ Result<Snapshot> scan_functions_impl(const InspectedImage& image, uint32_t sourc
   Snapshot result;
   ScanBudget local_budget;
   ScanBudget& budget = shared_budget ? *shared_budget : local_budget;
-  ScanState<Snapshot> state{image, result, budget, {}};
+  ScanState<Snapshot> state{image, result, budget, scan_sources.address_tables, {}, {}};
 
   if ((sources & kSourceJmprel) != 0 && image.jmprel_count != 0) {
     if (Error e = budget.take_records(image.jmprel_count)) return e;
@@ -1111,6 +1173,7 @@ Result<Snapshot> scan_functions_impl(const InspectedImage& image, uint32_t sourc
     if (Error e = decode_android_packed(image, visit_record<Snapshot>, &state, &budget)) return e;
   }
   state.slots = {};
+  state.slot_ranges = {};
 
   // Preserve the logical budget and its order while attaching versions in place.
   if (Error e = budget.take_objects<ImportInfo>(result.records.size())) return e;
@@ -1123,19 +1186,19 @@ Result<Snapshot> scan_functions_impl(const InspectedImage& image, uint32_t sourc
   return result;
 }
 
-Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
-                                                  ScanBudget* budget) {
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image,
+                                                  FunctionScanSources sources, ScanBudget* budget) {
   return scan_functions_impl<RawFunctionSnapshot, SymbolVersion>(image, sources, budget);
 }
-Result<FunctionScanView> scan_function_views(const InspectedImage& image, uint32_t sources,
-                                             ScanBudget* budget) {
+Result<FunctionScanView> scan_function_views(const InspectedImage& image,
+                                             FunctionScanSources sources, ScanBudget* budget) {
   return scan_functions_impl<FunctionScanView, SymbolVersionView>(image, sources, budget);
 }
 
 Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& image,
                                                          uint32_t sources) {
   ScanBudget budget;
-  auto scan = scan_function_imports(image, sources, &budget);
+  auto scan = scan_function_imports(image, {sources}, &budget);
   if (!scan) return scan.error();
   FunctionImportSnapshot result;
   result.skipped_relocations = scan.value().skipped_relocations;
@@ -1147,47 +1210,31 @@ Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& i
 
 Error validate_function_sources(uint32_t sources) noexcept { return validate_sources(sources); }
 
+Error validate_function_types(uint32_t types) noexcept {
+  constexpr uint32_t known = kTypeJumpSlot | kTypeGlobDat | kTypeRiscv64FunctionAddress;
+  constexpr uint32_t supported =
+      kTypeNativeFunctions |
+      (kNativeHasRiscv64FunctionAddress ? static_cast<uint32_t>(kTypeRiscv64FunctionAddress) : 0u);
+  if (types == 0 || (types & ~known) != 0) return Error::Make(ErrorCode::kInvalidArgument);
+  if ((types & ~supported) != 0) return Error::Make(ErrorCode::kUnsupportedFormat);
+  return Error::Ok();
+}
+
 Error validate_function_selector(const FunctionImportSelector& selector) noexcept {
   if (Error e = validate_selector(selector.base)) return e;
   if (static_cast<uint8_t>(selector.index_source) >
       static_cast<uint8_t>(RelocationSource::kAndroidRel))
     return Error::Make(ErrorCode::kInvalidArgument);
   if (Error e = validate_sources(selector.sources)) return e;
-  if (selector.types == 0 || (selector.types & ~(kTypeJumpSlot | kTypeGlobDat)) != 0)
-    return Error::Make(ErrorCode::kInvalidArgument);
-  return Error::Ok();
+  return validate_function_types(selector.types);
 }
 
 namespace {
 
-uint32_t source_bit(RelocationSource source) noexcept {
-  switch (source) {
-    case RelocationSource::kJmprel:
-      return kSourceJmprel;
-    case RelocationSource::kRela:
-      return kSourceRela;
-    case RelocationSource::kAndroidRela:
-      return kSourceAndroidRela;
-    case RelocationSource::kRel:
-      return kSourceRel;
-    case RelocationSource::kAndroidRel:
-      return kSourceAndroidRel;
-  }
-  return 0;
-}
-
-uint32_t type_bit(uint32_t relocation_type) noexcept {
-  if (relocation_type == kRelJumpSlot) return kTypeJumpSlot;
-  if (relocation_type == kRelGlobDat) return kTypeGlobDat;
-  return 0;
-}
-
-// Both explicit function relocation types require an undefined STT_FUNC.
 template <typename Record>
 bool is_acceptable(const Record& record) noexcept {
-  if (record.entry.relocation_type != kRelJumpSlot && record.entry.relocation_type != kRelGlobDat)
-    return false;
-  return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined;
+  return record.addend == 0 && record.entry.symbol_type == kSttFunc && record.symbol_undefined &&
+         record.slot_eligible;
 }
 
 // Does the base (name/version/hidden/index) selector match this record?
@@ -1215,7 +1262,7 @@ bool base_matches(const Record& record, const FunctionImportSelector& selector) 
 template <typename Record>
 bool function_matches_impl(const Record& record, const FunctionImportSelector& selector) noexcept {
   return (source_bit(record.entry.source) & selector.sources) != 0 &&
-         (type_bit(record.entry.relocation_type) & selector.types) != 0 &&
+         (function_type_bit(record.entry.relocation_type) & selector.types) != 0 &&
          base_matches(record, selector);
 }
 
@@ -1326,7 +1373,9 @@ static Result<std::vector<FunctionCandidate>> expand_impl(const NamedImage* imag
     return Error::Make(ErrorCode::kInvalidArgument);
   const auto predicate = selection.predicate;
   void* const context = selection.context;
-  const uint32_t sources = selection.sources, types = selection.types;
+  detail::FunctionScanSources sources;
+  sources.include(validation);
+  const uint32_t types = selection.types;
   try {
     auto include = copy_pattern(selection.include, budget);
     if (!include) return include.error();

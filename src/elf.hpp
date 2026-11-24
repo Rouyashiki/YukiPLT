@@ -154,7 +154,7 @@ constexpr int64_t kDtForeignRelEnt = kNativeUsesRela ? kDtRelEnt : kDtRelaEnt;
 constexpr int64_t kDtForeignAndroidRel = kNativeUsesRela ? kDtAndroidRel : kDtAndroidRela;
 constexpr int64_t kDtForeignAndroidRelSz = kNativeUsesRela ? kDtAndroidRelSz : kDtAndroidRelaSz;
 
-// AArch64 dynamic relocation types.
+// Native dynamic relocation types.
 constexpr uint32_t kRelAbsolute = kNativeAbsolute;
 constexpr uint32_t kRelGlobDat = kNativeGlobDat;
 constexpr uint32_t kRelJumpSlot = kNativeJumpSlot;
@@ -162,6 +162,13 @@ constexpr uint32_t kRelRelative = kNativeRelative;
 constexpr uint32_t kRAarch64TlsTprel = 1030;
 constexpr uint32_t kRAarch64TlsDesc = 1031;
 constexpr uint32_t kRelIRelative = kNativeIRelative;
+
+constexpr uint32_t function_type_bit(uint32_t type) noexcept {
+  if (type == kRelJumpSlot) return kTypeJumpSlot;
+  if (kNativeHasGlobDat && type == kRelGlobDat) return kTypeGlobDat;
+  if (kNativeHasRiscv64FunctionAddress && type == kRelAbsolute) return kTypeRiscv64FunctionAddress;
+  return 0;
+}
 
 // ELF symbol types (st_info low nibble).
 constexpr uint8_t kSttNotype = 0;

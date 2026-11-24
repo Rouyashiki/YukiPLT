@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86, riscv64]
         variant:
           - {name: shared-libcxx-static, type: SHARED, stl: c++_static}
           - {name: shared-libcxx-shared, type: SHARED, stl: c++_shared}
@@ -76,10 +76,14 @@ jobs:
 
       - name: Build selected library
         run: |
+          platform=android-23
+          if [ "$ABI" = riscv64 ]; then
+            platform=android-37
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI="$ABI" \
-            -DANDROID_PLATFORM=android-23 \
+            -DANDROID_PLATFORM="$platform" \
             -DANDROID_STL="$STL" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS_RELEASE="-Oz -DNDEBUG -g0" \

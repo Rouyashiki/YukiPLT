@@ -112,6 +112,7 @@ struct FunctionRelocView {
   FunctionImportView entry;
   int64_t addend = 0;
   bool symbol_undefined = false;
+  bool slot_eligible = true;
 };
 struct FunctionScanView {
   std::vector<FunctionRelocView> records;
@@ -122,7 +123,17 @@ FunctionImport own_import(const FunctionImportView&);
 Result<VersionedScanView> scan_versioned_views(const InspectedImage&, CauseContext* = nullptr);
 // Batch scratch records may be grouped by name after validating them in relocation order.
 Result<VersionedScanView> scan_batch_versioned_views(const InspectedImage&, ScanBudget&);
-Result<FunctionScanView> scan_function_views(const InspectedImage&, uint32_t,
+struct FunctionScanSources {
+  uint32_t tables = 0;
+  uint32_t address_tables = 0;
+
+  void include(const FunctionImportSelector& selector) noexcept {
+    tables |= selector.sources;
+    if (kNativeHasRiscv64FunctionAddress && (selector.types & kTypeRiscv64FunctionAddress))
+      address_tables |= selector.sources;
+  }
+};
+Result<FunctionScanView> scan_function_views(const InspectedImage&, FunctionScanSources,
                                              ScanBudget* = nullptr);
 bool import_matches(const VersionedImportView&, const ImportSelector&) noexcept;
 bool import_qualifiers_match(const VersionedImportView&, const ImportSelector&) noexcept;
@@ -143,7 +154,7 @@ Result<std::vector<Result<VersionedImport>>> inspect_selected_imports(const Imag
                                                                       const ImportSelector*,
                                                                       size_t);
 Result<std::vector<Result<FunctionImport>>> inspect_selected_functions(
-    const ImageView&, uint32_t, const FunctionImportSelector*, size_t);
+    const ImageView&, FunctionScanSources, const FunctionImportSelector*, size_t);
 // Views expire when the caller's image stability window ends. The visitor
 // cannot stop validation of later records or the final duplicate-slot check.
 Error walk_imports(const InspectedImage&, void (*visit)(void*, const ImportView&), void*,
@@ -174,12 +185,12 @@ struct FunctionReloc {
   FunctionImport entry;
   int64_t addend = 0;
   bool symbol_undefined = false;
+  bool slot_eligible = true;
 };
 
 /// All scanned function relocations with full acceptance metadata, in scan
-/// order (JMPREL, then RELA, then APS2).  skipped_relocations counts records in
-/// a scanned source that are neither JUMP_SLOT nor GLOB_DAT, or have symbol
-/// index 0.  Duplicate slot addresses across any scanned source fail.
+/// order (JMPREL, then native dynamic, then APS2). Records outside the scanned
+/// types or with symbol index zero are counted as skipped.
 struct RawFunctionSnapshot {
   std::vector<FunctionReloc> records;
   size_t skipped_relocations = 0;
@@ -187,7 +198,7 @@ struct RawFunctionSnapshot {
 
 // Owning acceptance metadata acquired through the normal lifetime-protected
 // inspection path. No GOT read and no retained image pointer is dereferenced.
-Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, uint32_t sources,
+Result<RawFunctionSnapshot> inspect_function_relocs(const ImageView&, FunctionScanSources sources,
                                                     ScanBudget* budget = nullptr,
                                                     const char* expected_path = nullptr);
 bool function_reloc_acceptable(const FunctionReloc&) noexcept;
@@ -195,7 +206,8 @@ bool function_reloc_matches(const FunctionReloc&, const FunctionImportSelector&)
 
 // `sources` is a non-zero subset of RelocationSourceBit.  Validates RELA/APS2
 // metadata lazily (inspect() never fails on it).
-Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image, uint32_t sources,
+Result<RawFunctionSnapshot> scan_function_imports(const InspectedImage& image,
+                                                  FunctionScanSources sources,
                                                   ScanBudget* budget = nullptr);
 
 // Build the public, owning snapshot from a scan.
@@ -204,6 +216,7 @@ Result<FunctionImportSnapshot> snapshot_function_imports(const InspectedImage& i
 
 // Validate a function selector (base selector rules plus non-zero masks).
 Error validate_function_sources(uint32_t) noexcept;
+Error validate_function_types(uint32_t) noexcept;
 Error validate_function_selector(const FunctionImportSelector& selector) noexcept;
 
 // Select one eligible record from the requested sources/types. Any matched

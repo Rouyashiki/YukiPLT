@@ -256,8 +256,74 @@ static int rules_and_candidates(void) {
   return 0;
 }
 
+static int check_function_features(void) {
+  if (!yukiplt_c_has_feature(YUKIPLT_C_FEATURE_FUNCTION_IMPORTS) ||
+      (yukiplt_c_has_feature(YUKIPLT_C_FEATURE_GLOB_DAT_IMPORTS) != 0) != YUKIPLT_HAS_GLOB_DAT ||
+      (yukiplt_c_has_feature(YUKIPLT_C_FEATURE_RISCV64_FUNCTION_ADDRESSES) != 0) !=
+          YUKIPLT_HAS_RISCV64_FUNCTION_ADDRESS)
+    return 45;
+  void* library = dlopen("./libhook_target.so", RTLD_NOW | RTLD_LOCAL);
+  if (!library) return 46;
+  yukiplt_c_image image;
+  if (yukiplt_c_image_containing(dlsym(library, "call_import"), &image).code) {
+    dlclose(library);
+    return 47;
+  }
+  yukiplt_c_function_selector native_sel = YUKIPLT_C_FUNCTION_SELECTOR("sample_add");
+  yukiplt_c_import_snapshot snapshot = {0};
+  size_t failed = 0;
+  int rc = 0;
+  if (yukiplt_c_select_function_imports(&image, &native_sel, 1, &snapshot, &failed).code ||
+      failed != SIZE_MAX || yukiplt_c_import_snapshot_destroy(&snapshot).code)
+    rc = 48;
+#if !YUKIPLT_HAS_GLOB_DAT
+  if (!rc) {
+    yukiplt_c_function_selector glob_sel = native_sel;
+    glob_sel.types = YUKIPLT_C_TYPE_GLOB_DAT;
+    yukiplt_c_function_selector invalid_sel = native_sel;
+    invalid_sel.types = (1u << 31) | YUKIPLT_C_TYPE_GLOB_DAT;
+    yukiplt_c_function_selector address_sel = native_sel;
+    address_sel.types = YUKIPLT_C_TYPE_RISCV64_FUNCTION_ADDRESS;
+    yukiplt_c_handle handle = {0};
+    yukiplt_c_function_request_ex ex = {0};
+    ex.struct_size = (uint32_t)sizeof(ex);
+    ex.base.target = glob_sel;
+    ex.base.replacement = (void*)replacement0;
+    yukiplt_c_operation_diagnostic diag = {0};
+    diag.struct_size = (uint32_t)sizeof(diag);
+    yukiplt_c_rules rules = {0};
+    yukiplt_c_image_selector img_sel = {(uint32_t)sizeof(yukiplt_c_image_selector),
+                                        YUKIPLT_C_IMAGE_MAIN, NULL, 0};
+    uint64_t rule_id = 0;
+    if (yukiplt_c_select_function_imports(&image, &address_sel, 1, &snapshot, &failed).code !=
+            YUKIPLT_C_AMBIGUOUS_SYMBOL ||
+        failed != 0 || snapshot.token != 0 ||
+        yukiplt_c_select_function_imports(&image, &glob_sel, 1, &snapshot, &failed).code !=
+            YUKIPLT_C_UNSUPPORTED_FORMAT ||
+        failed != 0 || snapshot.token != 0 ||
+        yukiplt_c_select_function_import(&image, &invalid_sel, &snapshot).code !=
+            YUKIPLT_C_INVALID_ARGUMENT ||
+        yukiplt_c_hook_function(&image, &glob_sel, (void*)replacement0, NULL, &handle, NULL).code !=
+            YUKIPLT_C_UNSUPPORTED_FORMAT ||
+        handle.token != 0 ||
+        yukiplt_c_hook_functions_diagnosed(&image, &ex, 1, &handle, NULL, &diag).code !=
+            YUKIPLT_C_UNSUPPORTED_FORMAT ||
+        diag.stage != YUKIPLT_C_STAGE_PREPARE || diag.cause != YUKIPLT_C_CAUSE_NONE ||
+        diag.error.code != YUKIPLT_C_UNSUPPORTED_FORMAT || yukiplt_c_rules_create(&rules).code ||
+        yukiplt_c_rules_add_function(&rules, &img_sel, &glob_sel, (void*)replacement0, NULL, 0,
+                                     &rule_id)
+                .code != YUKIPLT_C_UNSUPPORTED_FORMAT ||
+        rule_id != 0 || yukiplt_c_rules_destroy(&rules).code)
+      rc = 49;
+  }
+#endif
+  if (dlclose(library) && !rc) rc = 50;
+  return rc;
+}
+
 int run_c_scenarios(void) {
-  int result = invalidation();
+  int result = check_function_features();
+  if (!result) result = invalidation();
   if (!result) result = exercise(0);
   if (!result) result = exercise(1);
   if (!result && retained_library && dlclose(retained_library)) result = 17;

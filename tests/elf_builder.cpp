@@ -8,6 +8,9 @@
 #include <cstring>
 
 namespace yukiplt::test {
+#if defined(__riscv)
+extern "C" const NativeElfEhdr __ehdr_start;
+#endif
 // GNU Hash helpers
 
 /// Compute GNU hash of a symbol name (dl_new_hash).
@@ -99,6 +102,9 @@ ElfBuilder::BuiltImage ElfBuilder::build() const {
     header.e_ident[EI_DATA] = ELFDATA2LSB;
     header.e_ident[EI_VERSION] = EV_CURRENT;
     header.e_machine = kNativeMachine;
+#if defined(__riscv)
+    header.e_flags = __ehdr_start.e_flags;
+#endif
     header.e_type = ET_DYN;
     header.e_version = EV_CURRENT;
     header.e_ehsize = sizeof(header);
